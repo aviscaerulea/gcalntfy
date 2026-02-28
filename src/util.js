@@ -1,0 +1,61 @@
+// vi: ts=2 sw=2 ff=unix fenc=utf-8
+
+/**
+ * JSON 成功レスポンスの生成
+ */
+function createJsonResponse(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * JSON エラーレスポンスの生成
+ * GAS Web App では HTTP ステータスコードを制御できないため、
+ * レスポンスボディの error フィールドでエラーを表現する。
+ */
+function createErrorResponse(message) {
+  return createJsonResponse({ error: message });
+}
+
+/**
+ * 日付文字列から JST 基準の当日開始・翌日開始の UTC RFC3339 ペアを生成
+ *
+ * @param {string} dateStr - "YYYY-MM-DD" 形式の日付文字列
+ * @returns {{startTime: string, endTime: string}|null} - 無効な日付の場合は null
+ */
+function getDateRange(dateStr) {
+  const date = new Date(dateStr + "T00:00:00+09:00");
+  if (isNaN(date.getTime())) {
+    return null;
+  }
+  const nextDate = new Date(date.getTime() + 24 * 60 * 60 * 1000);
+  return {
+    startTime: date.toISOString(),
+    endTime: nextDate.toISOString()
+  };
+}
+
+/**
+ * 現在のユーザーの Chat API 用ユーザーID取得
+ *
+ * Google OAuth2 userinfo エンドポイントから数値 ID を取得し
+ * "users/{id}" 形式で返す。Chat API の sender.name との照合に使用する。
+ *
+ * @returns {string} "users/{id}" 形式のユーザーID
+ */
+function getMyUserId() {
+  const token = ScriptApp.getOAuthToken();
+  const response = UrlFetchApp.fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    headers: { Authorization: "Bearer " + token },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) {
+    throw new Error("ユーザー情報の取得に失敗した: " + response.getContentText());
+  }
+  const info = JSON.parse(response.getContentText());
+  if (!info.id) {
+    throw new Error("ユーザーIDが取得できなかった");
+  }
+  return "users/" + info.id;
+}
