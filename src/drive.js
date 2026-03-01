@@ -96,7 +96,6 @@ function buildDriveActivity(file, startTime, endTime) {
 
     return {
         datetime,
-        media: MEDIA_DRIVE,
         content: file.name,
         sender: "me",
         permalink,

@@ -18,7 +18,7 @@
  *   YYYY-MM-DD HH:MM 指定時刻から当日終わりまで
  *
  * レスポンス:
- *   個別成功時: { "<media>": [ { datetime, media, content, permalink, ... }, ... ] }
+ *   個別成功時: { "<media>": [ { datetime, content, permalink, ... }, ... ] }
  *   全体成功時: { "chat": [...], "calendar": [...], "mail": [...], "drive": [...] }
  *   失敗時:     { "error": "エラーメッセージ" }
  *

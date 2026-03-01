@@ -249,7 +249,6 @@ function buildGmailActivity(message, cache) {
 
     return {
         datetime: new Date(Number(message.internalDate)).toISOString(),
-        media: MEDIA_MAIL,
         content,
         sender: "me",
         permalink: "https://mail.google.com/mail/u/0/#all/" + message.id,

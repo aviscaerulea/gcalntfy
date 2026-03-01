@@ -106,7 +106,6 @@ function resolveOrganizerName(event, cache) {
 function buildCalendarActivity(event, nameCache) {
     return {
         datetime: resolveEventDatetime(event),
-        media: MEDIA_CALENDAR,
         content: event.summary || "",
         sender: resolveOrganizerName(event, nameCache),
         permalink: event.htmlLink || "",
