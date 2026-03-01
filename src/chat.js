@@ -2,9 +2,9 @@
 /**
  * Chat アクティビティ取得モジュール
  *
- * 指定日に自分が送信した Google Chat メッセージを全スペースから収集する。
+ * 指定日に自分がメッセージを送信したスペースの全 Chat メッセージを収集する。
  * fetchAll による並列バッチ取得でメッセージとスペース名（DM の場合はメンバー名）を
- * 効率的に取得する。自分が返信したスレッドの親メッセージ（別日の投稿を含む）も
+ * 効率的に取得する。返信のスレッド親メッセージ（別日の投稿を含む）も
  * 結果に追加して文脈を保持する。
  */
 
@@ -132,7 +132,6 @@ function buildActivity(msg, opts) {
     const threadName = msg.thread && msg.thread.name;
     return {
         datetime: msg.createTime,
-        media: MEDIA_CHAT,
         content: msg.text || "",
         sender: opts.sender,
         spaceName: opts.spaceName,
@@ -322,11 +321,11 @@ function fetchThreadHeads(threadInfos) {
 }
 
 /**
- * 指定日に自分が送信した Chat アクティビティの取得
+ * 指定日に自分がメッセージを送信したスペースの全 Chat アクティビティの取得
  *
  * fetchAll による並列バッチ取得で全スペースのメッセージを効率的に収集する。
- * 自分が返信したスレッドの親メッセージ（他人・自分問わず）も結果に含める。
- * Chat API はサーバー側での sender フィルタに非対応のため、クライアント側で照合する。
+ * 自分が送信したスペースを対象として全メッセージ（他者含む）を出力する。
+ * 返信のスレッド親メッセージ（別日投稿を含む）も結果に含めて文脈を保持する。
  *
  * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
@@ -360,49 +359,29 @@ function getChatActivities(dateStr) {
 
     for (const space of spaces) {
         const allMessages = messagesMap.get(space.name) || [];
-        const myMessages = allMessages.filter(msg => msg.sender && msg.sender.name === myUserId);
-        if (myMessages.length === 0) continue;
+        // スペース選別: 自分がメッセージを送信したスペースに限定
+        if (!allMessages.some(msg => msg.sender && msg.sender.name === myUserId)) continue;
 
         const spaceName = nameMap.get(space.name) || space.name;
         const spaceType = space.spaceType || "UNKNOWN";
         const activityOpts = { spaceName, spaceType };
 
-        // 自分が参加しているスレッドの thread.name セット
-        const myThreadNames = new Set(
-            myMessages.map(msg => msg.thread && msg.thread.name).filter(Boolean)
-        );
-
-        // 当日メッセージ内のスレッド先頭インデックス: thread.name セット
+        // 当日メッセージ内のスレッド先頭を記録しつつ全メッセージをアクティビティに追加
         const threadHeadInDay = new Set();
         for (const msg of allMessages) {
-            if (!msg.threadReply && msg.thread && msg.thread.name) {
+            const isThreadHead = !msg.threadReply;
+            if (isThreadHead && msg.thread && msg.thread.name) {
                 threadHeadInDay.add(msg.thread.name);
             }
-        }
-
-        // 自分のメッセージをアクティビティに追加
-        for (const msg of myMessages) {
-            activities.push(buildActivity(msg, {
-                ...activityOpts, sender: "me", isThreadHead: !msg.threadReply
-            }));
-        }
-
-        // 他人のスレッド先頭メッセージ（同日分・自分が参加しているスレッドの親）
-        for (const msg of allMessages) {
-            if (msg.threadReply) continue;
-            if (!msg.sender || msg.sender.name === myUserId) continue;
-            const threadName = msg.thread && msg.thread.name;
-            if (!threadName || !myThreadNames.has(threadName)) continue;
-
             activities.push(buildActivity(msg, {
                 ...activityOpts,
-                sender: msg.sender.displayName || msg.sender.name,
-                isThreadHead: true
+                sender: resolveSenderName(msg, myUserId),
+                isThreadHead
             }));
         }
 
         // 当日データにないスレッド先頭（別日に投稿された親）を後で取得するためリスト化
-        for (const msg of myMessages) {
+        for (const msg of allMessages) {
             if (!msg.threadReply) continue;
             const threadName = msg.thread && msg.thread.name;
             if (!threadName || threadHeadInDay.has(threadName)) continue;
