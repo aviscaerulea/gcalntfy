@@ -12,12 +12,22 @@ const FETCH_BATCH_SIZE = 50;
 // 1リクエストあたりのカレンダーイベント取得最大件数（API上限: 2500）
 const PAGE_SIZE_EVENTS = 2500;
 
+// 1リクエストあたりの Gmail メッセージ取得最大件数（API上限: 500）
+const PAGE_SIZE_GMAIL = 500;
+
 // People API のベース URL
 const PEOPLE_API_BASE = "https://people.googleapis.com/v1";
+
+// Gmail API のベース URL
+const GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1";
+
+// Calendar API のベース URL
+const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 
 // グループ展開の最大再帰深度
 const MAX_GROUP_DEPTH = 3;
 
 // アクティビティのメディア種別識別子
-const MEDIUM_CHAT = "chat";
-const MEDIUM_CALENDAR = "calendar";
+const MEDIA_CHAT = "chat";
+const MEDIA_CALENDAR = "calendar";
+const MEDIA_MAIL = "mail";
