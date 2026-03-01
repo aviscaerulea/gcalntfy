@@ -18,4 +18,11 @@ GAS エディタで `doGet` を選択し、イベントパラメータに以下�
 
 ```json
 {"parameter": {"date": "YYYY-MM-DD"}}
+{"parameter": {"date": "YYYY-MM-DD", "medium": "calendar"}}
 ```
+
+## 実装上の注意点
+
+- Calendar API の `start.dateTime` は `+09:00` 形式で返る。Chat の `Z` 形式と混在すると `localeCompare` ソートが壊れるため `toISOString()` で UTC 正規化する
+- Calendar API の `eventTypes` クエリパラメータは繰り返しキーが必要で、GAS の単純クエリ構築（`Object.entries`）では使えない → クライアント側フィルタで対応
+- 新規 API モジュール追加時は `util.js` の `callApi(baseUrl, path, params)` を使う
