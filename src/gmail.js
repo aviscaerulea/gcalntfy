@@ -152,7 +152,7 @@ function extractBodyBeforeSignature(message) {
   if (!message.payload) return "";
   const plainText = findPlainTextBody(message.payload);
   if (!plainText) return "";
-  return plainText.split(/^-- $/m)[0].trim();
+  return plainText.split(/^-- $/m)[0].replace(/\r\n/g, "\n").trim();
 }
 
 /**
@@ -209,6 +209,22 @@ function resolveRecipients(headers, cache) {
 }
 
 /**
+ * Message リソースからヘッダ配列と content（件名＋本文）を抽出する
+ *
+ * buildGmailActivity / buildParent の共通処理。
+ *
+ * @param {Object} message - Message リソース（format=FULL）
+ * @returns {{ headers: Array, content: string }}
+ */
+function extractMessageContent(message) {
+  const headers = (message.payload && message.payload.headers) || [];
+  const subject = getHeader(headers, "Subject");
+  const body = extractBodyBeforeSignature(message);
+  const content = body ? subject + "\n\n" + body : subject;
+  return { headers, content };
+}
+
+/**
  * Gmail メッセージからアクティビティオブジェクトを構築する
  *
  * content は件名と本文（署名前）を結合した文字列。
@@ -220,10 +236,7 @@ function resolveRecipients(headers, cache) {
  * @returns {Object} アクティビティオブジェクト
  */
 function buildGmailActivity(message, cache) {
-  const headers = (message.payload && message.payload.headers) || [];
-  const subject = getHeader(headers, "Subject");
-  const body = extractBodyBeforeSignature(message);
-  const content = body ? subject + "\n\n" + body : subject;
+  const { headers, content } = extractMessageContent(message);
 
   return {
     datetime: new Date(Number(message.internalDate)).toISOString(),
@@ -234,6 +247,101 @@ function buildGmailActivity(message, cache) {
     recipients: resolveRecipients(headers, cache),
     threadId: message.threadId,
     isThreadHead: !getHeader(headers, "In-Reply-To")
+  };
+}
+
+/**
+ * 返信メッセージのうち、アクティビティ内にスレッド先頭が存在しない threadId を収集する
+ *
+ * 自分がスレッドを開始した場合は先頭がアクティビティ内に存在するため除外される。
+ * 他人のメールへの返信のみが対象となる。
+ *
+ * @param {Object[]} activities - buildGmailActivity で構築済みのアクティビティ配列
+ * @returns {string[]} 外部スレッド親が必要な threadId の配列（重複なし）
+ */
+function collectMissingThreadIds(activities) {
+  const headsInDay = new Set(
+    activities.filter(a => a.isThreadHead).map(a => a.threadId)
+  );
+  const missing = new Set();
+  for (const a of activities) {
+    if (!a.isThreadHead && !headsInDay.has(a.threadId)) {
+      missing.add(a.threadId);
+    }
+  }
+  return [...missing];
+}
+
+/**
+ * スレッド ID リストから先頭メッセージ ID を fetchAll で一括取得する
+ *
+ * threads.get（format=MINIMAL）でスレッド構造だけを取得し、messages[0].id を抽出する。
+ * FETCH_BATCH_SIZE 単位で分割して並列処理する。
+ *
+ * @param {string[]} threadIds - スレッド ID の配列
+ * @returns {Map<string, string>} threadId → 先頭メッセージ ID のマップ
+ */
+function fetchThreadHeadMessageIds(threadIds) {
+  const token = ScriptApp.getOAuthToken();
+  const result = new Map();
+  const pending = [...threadIds];
+
+  while (pending.length > 0) {
+    const batch = pending.splice(0, FETCH_BATCH_SIZE);
+    console.log(`スレッド先頭取得: ${batch.length} 件（残り ${pending.length}）`);
+
+    const responses = UrlFetchApp.fetchAll(batch.map(threadId => ({
+      url: `${GMAIL_API_BASE}/users/me/threads/${threadId}?format=MINIMAL`,
+      headers: { Authorization: "Bearer " + token },
+      muteHttpExceptions: true
+    })));
+
+    for (let i = 0; i < responses.length; i++) {
+      const status = responses[i].getResponseCode();
+      if (status < 200 || status >= 300) {
+        console.error(`スレッド取得失敗 (${batch[i]}, ${status}): ${responses[i].getContentText()}`);
+        continue;
+      }
+      try {
+        const thread = JSON.parse(responses[i].getContentText());
+        if (thread.messages && thread.messages.length > 0) {
+          result.set(batch[i], thread.messages[0].id);
+        }
+      } catch (e) {
+        console.error(`スレッド解析失敗 (${batch[i]}): ${e.message}`);
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * 親メッセージから parent オブジェクト（datetime / content / sender）を構築する
+ *
+ * SENT ラベルの有無で自分が送ったメールかどうかを判定する。
+ * 他人のメールは From ヘッダから氏名解決する。
+ *
+ * @param {Object} message - Message リソース（format=FULL）
+ * @param {Map<string, string>} cache - 氏名解決キャッシュ
+ * @returns {{datetime: string, content: string, sender: string}}
+ */
+function buildParent(message, cache) {
+  const { headers, content } = extractMessageContent(message);
+
+  let sender;
+  if (message.labelIds && message.labelIds.includes("SENT")) {
+    sender = "me";
+  } else {
+    const from = parseAddressHeader(getHeader(headers, "From"));
+    const { email, displayName } = from[0] || {};
+    sender = email ? resolveEmail(email, displayName || "", cache) : (displayName || "unknown");
+  }
+
+  return {
+    datetime: new Date(Number(message.internalDate)).toISOString(),
+    content,
+    sender
   };
 }
 
@@ -254,6 +362,7 @@ function debugGetGmailActivities() {
  *
  * Gmail API の q パラメータで from:me + epoch 秒フィルタを行い、
  * サーバー側で絞り込んでから fetchAll で並列バッチ取得する。
+ * 返信メールには外部スレッド親メッセージを parent オブジェクトとして付与する。
  *
  * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
@@ -270,5 +379,24 @@ function getGmailActivities(dateStr) {
 
   // 氏名解決キャッシュをメッセージ間で共有して重複 API 呼び出しを防ぐ
   const cache = new Map();
-  return messages.map(msg => buildGmailActivity(msg, cache));
+  const activities = messages.map(msg => buildGmailActivity(msg, cache));
+
+  // 返信メッセージの外部スレッド親を取得して parent を付与
+  const missingThreadIds = collectMissingThreadIds(activities);
+  if (missingThreadIds.length > 0) {
+    console.log(`外部スレッド親取得: ${missingThreadIds.length} スレッド`);
+    const threadHeadMap = fetchThreadHeadMessageIds(missingThreadIds);
+    const headMessages = getMessageDetails([...threadHeadMap.values()]);
+    const parentMap = new Map();
+    for (const msg of headMessages) {
+      parentMap.set(msg.threadId, buildParent(msg, cache));
+    }
+    for (const activity of activities) {
+      if (!activity.isThreadHead && parentMap.has(activity.threadId)) {
+        activity.parent = parentMap.get(activity.threadId);
+      }
+    }
+  }
+
+  return activities;
 }

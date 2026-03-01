@@ -108,7 +108,12 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
   "permalink": "https://mail.google.com/mail/u/0/#all/18f9a2b3c4d5e6f7",
   "recipients": ["田中 一郎", "鈴木 花子"],
   "threadId": "18f9a2b3c4d5e6f7",
-  "isThreadHead": false
+  "isThreadHead": false,
+  "parent": {
+    "datetime": "2026-02-26T09:00:00.000Z",
+    "content": "週次報告の件\n\n来週の報告をお願いします。",
+    "sender": "田中 一郎"
+  }
 }
 ```
 
@@ -122,6 +127,7 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | `recipients` | To 宛先の氏名配列（氏名解決済み） |
 | `threadId` | スレッド識別子（`message.threadId`） |
 | `isThreadHead` | `true`: スレッド先頭メール、`false`: 返信（`In-Reply-To` ヘッダの有無で判定） |
+| `parent` | 返信メールのみ。スレッド先頭メッセージの `{ datetime, content, sender }`。自分がスレッドを開始した場合は省略 |
 
 ## 実装詳細
 
@@ -166,6 +172,7 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 - 宛先解決: To ヘッダをパースしてメールアドレス抽出後、People API / ContactsApp で氏名解決
 - パーマリンク: `https://mail.google.com/mail/u/0/#all/{messageId}` 形式
 - スレッド構造: `message.threadId` を `threadId` として格納。`In-Reply-To` ヘッダが存在しない場合を `isThreadHead: true` とする
+- 外部スレッド親: 返信メール（`isThreadHead: false`）のうち、スレッド先頭が当日の自分の送信メール内にない場合、`threads.get（format=MINIMAL）` でスレッド先頭メッセージ ID を取得後、`messages.get（format=FULL）` で本文を取得して `parent` オブジェクトとして付与する。自分が開始したスレッドへの返信には `parent` を付与しない
 
 ### 参加者・宛先解決の仕様（ Calendar/Gmail 共通）
 

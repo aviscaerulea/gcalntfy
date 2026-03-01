@@ -78,7 +78,12 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=
       "permalink": "https://mail.google.com/mail/u/0/#all/18f9a2b3c4d5e6f7",
       "recipients": ["田中 一郎", "鈴木 花子"],
       "threadId": "18f9a2b3c4d5e6f7",
-      "isThreadHead": false
+      "isThreadHead": false,
+      "parent": {
+        "datetime": "2026-02-26T09:00:00.000Z",
+        "content": "週次報告の件\n\n来週の報告をお願いします。",
+        "sender": "田中 一郎"
+      }
     }
   ]
 }
