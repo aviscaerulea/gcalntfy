@@ -1,6 +1,6 @@
 ## 概要
 
-指定日に自分が発信した Google Workspace 上のアクティビティ（ Chat メッセージ・ Calendar イベント・ Gmail 送信メール）を JSON で返す GAS Web App。
+指定日に自分が発信した Google Workspace 上のアクティビティ（ Chat メッセージ・ Calendar イベント・ Gmail 送信メール・ Drive 更新ファイル）を JSON で返す GAS Web App。
 活動の振り返りや週次報告の材料収集（「誰と何をしたか」）を主な用途とする。
 
 ## エンドポイント
@@ -11,29 +11,49 @@ GAS Web App として公開。`executeAs: USER_ACCESSING` でアクセス者自�
 GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=chat
 GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=calendar
 GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=mail
+GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=drive
+GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=all
 ```
 
 ### クエリパラメータ
 
 | パラメータ | 必須 | 説明 |
 |---|---|---|
-| `date` | 必須 | 取得対象日（`YYYY-MM-DD` 形式、JST 基準） |
-| `media` | 必須 | 取得対象メディア。`chat` / `calendar` / `mail` のいずれか |
+| `date` | 必須 | 取得対象日時（JST 基準）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
+| `media` | 必須 | 取得対象メディア。`chat` / `calendar` / `mail` / `drive` / `all` のいずれか |
 
-`media` パラメータは必須。1 回のリクエストで取得できるのは 1 メディア種別のみ。
-GAS の実行時間制限（ 6 分）を考慮した分割設計とする。
+`media` パラメータは必須。`all` を指定すると全メディアをまとめて取得する。
+GAS の実行時間制限（ 6 分）を考慮し、全メディア同時取得（`media=all`）は個別取得より時間がかかる。
+
+`date` パラメータの時刻指定について:
+- `YYYY-MM-DD` のみ: JST 00:00:00 〜 翌日 00:00:00（当日全体）
+- `YYYY-MM-DD HH:MM`: JST 指定時刻 〜 翌日 00:00:00（日付は跨がない）
 
 ## レスポンス
 
-### 成功時
+### 個別取得成功時（例: media=chat）
 
 ```json
 {
-  "activities": [...]
+  "chat": [...]
 }
 ```
 
+メディア名をキーとし、アクティビティオブジェクトの配列を値として返す。
 必須フィールドは `datetime`、`media`、`content`、`permalink` の 4 つ。その他はメディア別の固有フィールド。
+
+### 全体取得成功時（media=all）
+
+```json
+{
+  "chat": [...],
+  "calendar": [...],
+  "mail": [...],
+  "drive": [...]
+}
+```
+
+全メディアの結果をひとつの JSON で返す。各メディアの配列は datetime 昇順でソート済み。
 
 ### エラー時
 
@@ -129,6 +149,30 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | `isThreadHead` | `true`: スレッド先頭メール、`false`: 返信（`In-Reply-To` ヘッダの有無で判定） |
 | `parent` | 返信メールのみ。スレッド先頭メッセージの `{ datetime, content, sender }`。自分がスレッドを開始した場合は省略 |
 
+### Drive
+
+```json
+{
+  "datetime": "2026-02-27T10:30:00.000Z",
+  "media": "drive",
+  "content": "週次報告書",
+  "sender": "me",
+  "permalink": "https://docs.google.com/document/d/xxx/edit",
+  "mimeType": "application/vnd.google-apps.document",
+  "isNew": true
+}
+```
+
+| フィールド | 説明 |
+|---|---|
+| `datetime` | ファイル更新日時（ UTC RFC3339 形式。`modifiedByMeTime` 優先、なければ `modifiedTime`） |
+| `media` | `"drive"` |
+| `content` | ファイル名 |
+| `sender` | 常に `"me"` |
+| `permalink` | `webViewLink`（なければ `https://drive.google.com/file/d/{id}/view`） |
+| `mimeType` | ファイルの MIME タイプ |
+| `isNew` | `true`: 対象日に自分が作成、`false`: 既存ファイルの更新 |
+
 ## 実装詳細
 
 ### 対応メディア
@@ -138,6 +182,7 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | Google Chat | 実装済み | 全スペース（ DM, グループ, スペース）対象 |
 | Google Calendar | 実装済み | プライマリカレンダー対象 |
 | Gmail | 実装済み | 送信メール（ SENT ラベル相当）対象 |
+| Google Drive | 実装済み | マイドライブ・共有ドライブ対象 |
 
 ### Chat アクティビティ取得の仕様
 
@@ -174,6 +219,16 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 - スレッド構造: `message.threadId` を `threadId` として格納。`In-Reply-To` ヘッダが存在しない場合を `isThreadHead: true` とする
 - 外部スレッド親: 返信メール（`isThreadHead: false`）のうち、スレッド先頭が当日の自分の送信メール内にない場合、`threads.get（format=MINIMAL）` でスレッド先頭メッセージ ID を取得後、`messages.get（format=FULL）` で本文を取得して `parent` オブジェクトとして付与する。自分が開始したスレッドへの返信には `parent` を付与しない
 
+### Drive アクティビティ取得の仕様
+
+- 対象: マイドライブ・共有ドライブのすべてのファイル（フォルダ・ゴミ箱を除く）
+- サーバー側フィルタ: `modifiedTime` の範囲・フォルダ除外・ゴミ箱除外を `q` パラメータで指定
+- クライアント側フィルタ: `modifiedByMeTime` が期間内、または `modifiedByMeTime` 未設定かつ `lastModifyingUser.me === true`
+- datetime: `modifiedByMeTime` を優先し、なければ `modifiedTime` を使用
+- isNew 判定: `createdTime` が対象日範囲内 かつ `owners[].me === true`
+- パーマリンク: `webViewLink` を優先し、なければ `https://drive.google.com/file/d/{id}/view`
+- 氏名解決: 不要（ sender は常に `"me"`）
+
 ### 参加者・宛先解決の仕様（ Calendar/Gmail 共通）
 
 - 氏名解決の優先順:
@@ -201,6 +256,7 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 - `contacts.readonly`（ People API 個人連絡先）
 - `directory.readonly`（ People API 組織ディレクトリ）
 - `groups`（ GroupsApp グループ展開）
+- `drive.metadata.readonly`（ Drive ファイルメタデータ読み取り）
 
 ## ファイル構成
 
@@ -211,6 +267,7 @@ src/
 ├── chat.js           Chat アクティビティ取得モジュール
 ├── calendar.js       Calendar アクティビティ取得モジュール
 ├── gmail.js          Gmail アクティビティ取得モジュール
+├── drive.js          Drive アクティビティ取得モジュール
 ├── members.js        参加者・宛先の氏名解決モジュール
 ├── config.js         定数定義
 └── util.js           共通ユーティリティ

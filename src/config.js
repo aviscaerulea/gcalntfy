@@ -1,4 +1,10 @@
-// vi: ts=2 sw=2 ff=unix fenc=utf-8
+// vi: ts=4 sw=4 ff=unix fenc=utf-8
+/**
+ * 定数定義モジュール
+ *
+ * API のベース URL、ページサイズ、メディア種別識別子など
+ * アプリケーション全体で使用する定数を一括定義する。
+ */
 
 // 1リクエストあたりのスペース取得最大件数（API上限: 1000）
 const PAGE_SIZE_SPACES = 1000;
@@ -27,7 +33,15 @@ const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 // グループ展開の最大再帰深度
 const MAX_GROUP_DEPTH = 3;
 
+// Drive API のベース URL
+const DRIVE_API_BASE = "https://www.googleapis.com/drive/v3";
+
+// Drive API の 1 ページあたりの最大取得件数（API 上限: 1000）
+const PAGE_SIZE_DRIVE = 1000;
+
 // アクティビティのメディア種別識別子
 const MEDIA_CHAT = "chat";
 const MEDIA_CALENDAR = "calendar";
 const MEDIA_MAIL = "mail";
+const MEDIA_DRIVE = "drive";
+const MEDIA_ALL = "all";

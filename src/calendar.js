@@ -1,4 +1,12 @@
-// vi: ts=2 sw=2 ff=unix fenc=utf-8
+// vi: ts=4 sw=4 ff=unix fenc=utf-8
+/**
+ * Calendar アクティビティ取得モジュール
+ *
+ * 指定日のプライマリカレンダーのイベントを収集する。
+ * 不在・勤務場所・サイレントモードのイベントタイプと欠席した予定を除外し、
+ * 主催者・参加者の氏名を People API で解決して返す。
+ * dateTime のタイムゾーンオフセットは toISOString() で UTC に正規化する。
+ */
 
 // タスク・不在・勤務場所・サイレントモードに対応する除外イベントタイプ
 const EXCLUDED_EVENT_TYPES = new Set(["outOfOffice", "workingLocation", "focusTime"]);
@@ -11,7 +19,7 @@ const EXCLUDED_EVENT_TYPES = new Set(["outOfOffice", "workingLocation", "focusTi
  * @returns {Object} パース済みのレスポンス JSON
  */
 function callCalendarApi(path, params) {
-  return callApi(CALENDAR_API_BASE, path, params);
+    return callApi(CALENDAR_API_BASE, path, params);
 }
 
 /**
@@ -19,8 +27,8 @@ function callCalendarApi(path, params) {
  * GAS エディタから直接実行して確認する（本番では使用しない）
  */
 function debugCalendarApi() {
-  const data = callCalendarApi("/calendars/primary/events", { maxResults: 5, singleEvents: true });
-  console.log("Response:", JSON.stringify(data, null, 2));
+    const data = callCalendarApi("/calendars/primary/events", { maxResults: 5, singleEvents: true });
+    console.log("Response:", JSON.stringify(data, null, 2));
 }
 
 /**
@@ -34,25 +42,25 @@ function debugCalendarApi() {
  * @returns {Object[]} Calendar Event リソースの配列
  */
 function listPrimaryCalendarEvents(startTime, endTime) {
-  const events = [];
-  let pageToken = null;
+    const events = [];
+    let pageToken = null;
 
-  do {
-    const params = {
-      timeMin: startTime,
-      timeMax: endTime,
-      maxResults: PAGE_SIZE_EVENTS,
-      singleEvents: true,
-      orderBy: "startTime"
-    };
-    if (pageToken) params.pageToken = pageToken;
+    do {
+        const params = {
+            timeMin: startTime,
+            timeMax: endTime,
+            maxResults: PAGE_SIZE_EVENTS,
+            singleEvents: true,
+            orderBy: "startTime"
+        };
+        if (pageToken) params.pageToken = pageToken;
 
-    const data = callCalendarApi("/calendars/primary/events", params);
-    if (data.items) events.push(...data.items);
-    pageToken = data.nextPageToken;
-  } while (pageToken);
+        const data = callCalendarApi("/calendars/primary/events", params);
+        if (data.items) events.push(...data.items);
+        pageToken = data.nextPageToken;
+    } while (pageToken);
 
-  return events;
+    return events;
 }
 
 /**
@@ -67,8 +75,8 @@ function listPrimaryCalendarEvents(startTime, endTime) {
  * @returns {string} UTC RFC3339 形式（Z 末尾）の日時文字列
  */
 function resolveEventDatetime(event) {
-  const raw = event.start.dateTime || event.start.date + "T00:00:00+09:00";
-  return new Date(raw).toISOString();
+    const raw = event.start.dateTime || event.start.date + "T00:00:00+09:00";
+    return new Date(raw).toISOString();
 }
 
 /**
@@ -81,11 +89,11 @@ function resolveEventDatetime(event) {
  * @returns {string} "me" または解決済み氏名
  */
 function resolveOrganizerName(event, cache) {
-  if (event.creator && event.creator.self) return "me";
-  const organizer = event.organizer || event.creator;
-  if (!organizer) return "unknown";
-  if (!organizer.email) return organizer.displayName || "unknown";
-  return resolveEmail(organizer.email, organizer.displayName || "", cache);
+    if (event.creator && event.creator.self) return "me";
+    const organizer = event.organizer || event.creator;
+    if (!organizer) return "unknown";
+    if (!organizer.email) return organizer.displayName || "unknown";
+    return resolveEmail(organizer.email, organizer.displayName || "", cache);
 }
 
 /**
@@ -96,14 +104,14 @@ function resolveOrganizerName(event, cache) {
  * @returns {Object} アクティビティオブジェクト
  */
 function buildCalendarActivity(event, nameCache) {
-  return {
-    datetime: resolveEventDatetime(event),
-    media: MEDIA_CALENDAR,
-    content: event.summary || "",
-    sender: resolveOrganizerName(event, nameCache),
-    permalink: event.htmlLink || "",
-    attendees: resolveAttendees(event.attendees || [])
-  };
+    return {
+        datetime: resolveEventDatetime(event),
+        media: MEDIA_CALENDAR,
+        content: event.summary || "",
+        sender: resolveOrganizerName(event, nameCache),
+        permalink: event.htmlLink || "",
+        attendees: resolveAttendees(event.attendees || [])
+    };
 }
 
 /**
@@ -111,11 +119,11 @@ function buildCalendarActivity(event, nameCache) {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetCalendarActivities() {
-  const result = getCalendarActivities("2026-02-27");
-  console.log(`取得件数: ${result.length}`);
-  for (const activity of result) {
-    console.log(JSON.stringify(activity));
-  }
+    const result = getCalendarActivities("2026-02-27");
+    console.log(`取得件数: ${result.length}`);
+    for (const activity of result) {
+        console.log(JSON.stringify(activity));
+    }
 }
 
 /**
@@ -130,21 +138,21 @@ function debugGetCalendarActivities() {
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
 function getCalendarActivities(dateStr) {
-  const range = getDateRange(dateStr);
-  if (!range) throw new Error("無効な日付形式: " + dateStr);
+    const range = getDateRange(dateStr);
+    if (!range) throw new Error("無効な日付形式: " + dateStr);
 
-  const events = listPrimaryCalendarEvents(range.startTime, range.endTime);
-  console.log(`カレンダーイベント: ${events.length} 件取得`);
+    const events = listPrimaryCalendarEvents(range.startTime, range.endTime);
+    console.log(`カレンダーイベント: ${events.length} 件取得`);
 
-  // イベントタイプによる除外 + 欠席（declined）の除外
-  const filtered = events.filter(e => {
-    if (EXCLUDED_EVENT_TYPES.has(e.eventType)) return false;
-    const me = e.attendees && e.attendees.find(a => a.self);
-    return !me || me.responseStatus !== "declined";
-  });
-  console.log(`フィルタ後: ${filtered.length} 件（${events.length - filtered.length} 件除外）`);
+    // イベントタイプによる除外 + 欠席（declined）の除外
+    const filtered = events.filter(e => {
+        if (EXCLUDED_EVENT_TYPES.has(e.eventType)) return false;
+        const me = e.attendees && e.attendees.find(a => a.self);
+        return !me || me.responseStatus !== "declined";
+    });
+    console.log(`フィルタ後: ${filtered.length} 件（${events.length - filtered.length} 件除外）`);
 
-  // 主催者の氏名解決キャッシュをイベント間で共有して重複 API 呼び出しを防ぐ
-  const nameCache = new Map();
-  return filtered.map(event => buildCalendarActivity(event, nameCache));
+    // 主催者の氏名解決キャッシュをイベント間で共有して重複 API 呼び出しを防ぐ
+    const nameCache = new Map();
+    return filtered.map(event => buildCalendarActivity(event, nameCache));
 }
