@@ -23,27 +23,12 @@ function debugChatApi() {
 /**
  * Chat REST API をユーザ認証で呼び出す
  *
- * ステータス 2xx 以外は例外をスローする。
- *
  * @param {string} path - "/spaces" のような API パス（先頭 "/" 含む）
  * @param {Object} params - URL クエリパラメータ
  * @returns {Object} パース済みのレスポンス JSON
  */
 function callChatApi(path, params) {
-  const token = ScriptApp.getOAuthToken();
-  const query = Object.entries(params || {})
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-  const url = CHAT_API_BASE + path + (query ? "?" + query : "");
-  const response = UrlFetchApp.fetch(url, {
-    headers: { Authorization: "Bearer " + token },
-    muteHttpExceptions: true
-  });
-  const status = response.getResponseCode();
-  if (status < 200 || status >= 300) {
-    throw new Error(`Chat API エラー ${status}: ${response.getContentText()}`);
-  }
-  return JSON.parse(response.getContentText());
+  return callApi(CHAT_API_BASE, path, params);
 }
 
 /**

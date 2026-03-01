@@ -19,6 +19,33 @@ function createErrorResponse(message) {
 }
 
 /**
+ * Google REST API をユーザ認証で呼び出す
+ *
+ * ステータス 2xx 以外は例外をスローする。
+ *
+ * @param {string} baseUrl - API のベース URL（例: "https://chat.googleapis.com/v1"）
+ * @param {string} path - API パス（先頭 "/" 含む）
+ * @param {Object} params - URL クエリパラメータ
+ * @returns {Object} パース済みのレスポンス JSON
+ */
+function callApi(baseUrl, path, params) {
+  const token = ScriptApp.getOAuthToken();
+  const query = Object.entries(params || {})
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+  const url = baseUrl + path + (query ? "?" + query : "");
+  const response = UrlFetchApp.fetch(url, {
+    headers: { Authorization: "Bearer " + token },
+    muteHttpExceptions: true
+  });
+  const status = response.getResponseCode();
+  if (status < 200 || status >= 300) {
+    throw new Error(`API エラー ${status} [${url}]: ${response.getContentText()}`);
+  }
+  return JSON.parse(response.getContentText());
+}
+
+/**
  * 日付文字列から JST 基準の当日開始・翌日開始の UTC RFC3339 ペアを生成
  *
  * @param {string} dateStr - "YYYY-MM-DD" 形式の日付文字列

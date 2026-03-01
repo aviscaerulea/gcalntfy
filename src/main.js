@@ -4,11 +4,12 @@
  *
  * 概要:
  *   指定日の Google Workspace 上のアクティビティを JSON で返す GAS Web App。
- *   現在は Google Chat のみ対応。Calendar, Gmail は将来追加予定。
+ *   Google Chat と Google Calendar に対応。Gmail は将来追加予定。
  *
  * エンドポイント:
  *   GET ?date=YYYY-MM-DD             全メディアのアクティビティを取得
- *   GET ?date=YYYY-MM-DD&medium=chat 取得対象を指定（chat のみ）
+ *   GET ?date=YYYY-MM-DD&medium=chat     取得対象を指定（chat のみ）
+ *   GET ?date=YYYY-MM-DD&medium=calendar 取得対象を指定（calendar のみ）
  *
  * レスポンス:
  *   成功時: { "activities": [ { datetime, medium, content, spaceName, spaceType, permalink }, ... ] }
@@ -41,10 +42,10 @@ function doGet(e) {
     if (medium === "all" || medium === MEDIUM_CHAT) {
       activities.push(...getChatActivities(dateStr));
     }
-    // 将来拡張: Calendar, Gmail
-    // if (medium === "all" || medium === "calendar") {
-    //   activities.push(...getCalendarActivities(dateStr));
-    // }
+    if (medium === "all" || medium === MEDIUM_CALENDAR) {
+      activities.push(...getCalendarActivities(dateStr));
+    }
+    // 将来拡張: Gmail
     // if (medium === "all" || medium === "gmail") {
     //   activities.push(...getGmailActivities(dateStr));
     // }

@@ -1,0 +1,152 @@
+// vi: ts=2 sw=2 ff=unix fenc=utf-8
+
+// Calendar API のベース URL
+const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
+
+// タスク・不在・勤務場所・サイレントモードに対応する除外イベントタイプ
+const EXCLUDED_EVENT_TYPES = new Set(["outOfOffice", "workingLocation", "focusTime"]);
+
+/**
+ * デバッグ用: Calendar API の生レスポンスをログに出力する
+ * GAS エディタから直接実行して確認する（本番では使用しない）
+ */
+function debugCalendarApi() {
+  const data = callCalendarApi("/calendars/primary/events", { maxResults: 5, singleEvents: true });
+  console.log("Response:", JSON.stringify(data, null, 2));
+}
+
+/**
+ * Calendar REST API をユーザ認証で呼び出す
+ *
+ * @param {string} path - "/calendars/primary/events" のような API パス（先頭 "/" 含む）
+ * @param {Object} params - URL クエリパラメータ
+ * @returns {Object} パース済みのレスポンス JSON
+ */
+function callCalendarApi(path, params) {
+  return callApi(CALENDAR_API_BASE, path, params);
+}
+
+/**
+ * プライマリカレンダーのイベント一覧を全件取得する
+ *
+ * ページネーション対応で全件取得し、カレンダー表示名も返す。
+ * singleEvents=true により繰り返しイベントを個別のイベントとして展開する。
+ *
+ * @param {string} startTime - UTC RFC3339 形式の開始日時
+ * @param {string} endTime - UTC RFC3339 形式の終了日時
+ * @returns {{ events: Object[], calendarName: string }}
+ */
+function listPrimaryCalendarEvents(startTime, endTime) {
+  const events = [];
+  let calendarName = "";
+  let pageToken = null;
+
+  do {
+    const params = {
+      timeMin: startTime,
+      timeMax: endTime,
+      maxResults: PAGE_SIZE_EVENTS,
+      singleEvents: true,
+      orderBy: "startTime"
+    };
+    if (pageToken) params.pageToken = pageToken;
+
+    const data = callCalendarApi("/calendars/primary/events", params);
+    if (!calendarName && data.summary) calendarName = data.summary;
+    if (data.items) events.push(...data.items);
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  return { events, calendarName };
+}
+
+/**
+ * イベントの開始日時を UTC RFC3339 形式で返す
+ *
+ * Calendar API の dateTime はタイムゾーンオフセット付き（例: +09:00）で返るため、
+ * Chat の datetime（Z 末尾）と混在したまま localeCompare ソートすると順序が壊れる。
+ * すべて toISOString() で Z 末尾 UTC 形式に正規化して Chat と統一する。
+ * 終日イベント（start.date のみ存在）は JST 00:00:00 として扱う。
+ *
+ * @param {Object} event - Calendar Event リソース
+ * @returns {string} UTC RFC3339 形式（Z 末尾）の日時文字列
+ */
+function resolveEventDatetime(event) {
+  const raw = event.start.dateTime || event.start.date + "T00:00:00+09:00";
+  return new Date(raw).toISOString();
+}
+
+/**
+ * イベントの送信者表示名を解決する
+ *
+ * 自分が作成者の場合は "me"、他人が主催者の場合は主催者の表示名を返す。
+ *
+ * @param {Object} event - Calendar Event リソース
+ * @returns {string} "me" または主催者の表示名
+ */
+function resolveOrganizerName(event) {
+  if (event.creator && event.creator.self) return "me";
+  const organizer = event.organizer || event.creator;
+  if (!organizer) return "unknown";
+  return organizer.displayName || organizer.email || "unknown";
+}
+
+/**
+ * Calendar イベントからアクティビティオブジェクトを構築する
+ *
+ * @param {Object} event - Calendar Event リソース
+ * @param {string} calendarName - カレンダーの表示名
+ * @returns {Object} アクティビティオブジェクト
+ */
+function buildCalendarActivity(event, calendarName) {
+  return {
+    datetime: resolveEventDatetime(event),
+    medium: MEDIUM_CALENDAR,
+    content: event.summary || "",
+    sender: resolveOrganizerName(event),
+    spaceName: calendarName,
+    spaceType: "CALENDAR",
+    permalink: event.htmlLink || "",
+    attendees: resolveAttendees(event.attendees || [])
+  };
+}
+
+/**
+ * デバッグ用: 指定日のカレンダーアクティビティを取得して確認する
+ * GAS エディタから直接実行するためのラッパー（本番では使用しない）
+ */
+function debugGetCalendarActivities() {
+  const result = getCalendarActivities("2026-02-27");
+  console.log(`取得件数: ${result.length}`);
+  for (const activity of result) {
+    console.log(JSON.stringify(activity));
+  }
+}
+
+/**
+ * 指定日のプライマリカレンダーアクティビティの取得
+ *
+ * タスク・不在・勤務場所・サイレントモードのイベントタイプはクライアント側で除外する。
+ * 欠席した予定（attendees の自分の responseStatus が "declined"）も除外する。
+ * 繰り返しイベントは singleEvents=true により個別に展開して取得する。
+ *
+ * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
+ */
+function getCalendarActivities(dateStr) {
+  const range = getDateRange(dateStr);
+  if (!range) throw new Error("無効な日付形式: " + dateStr);
+
+  const { events, calendarName } = listPrimaryCalendarEvents(range.startTime, range.endTime);
+  console.log(`カレンダー「${calendarName}」のイベント: ${events.length} 件取得`);
+
+  // イベントタイプによる除外 + 欠席（declined）の除外
+  const filtered = events.filter(e => {
+    if (EXCLUDED_EVENT_TYPES.has(e.eventType)) return false;
+    const me = e.attendees && e.attendees.find(a => a.self);
+    return !me || me.responseStatus !== "declined";
+  });
+  console.log(`フィルタ後: ${filtered.length} 件（${events.length - filtered.length} 件除外）`);
+
+  return filtered.map(event => buildCalendarActivity(event, calendarName));
+}
