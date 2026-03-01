@@ -127,7 +127,7 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 
 ```bash
 # 1. GAS プロジェクト作成
-pnpx @google/clasp create --type webapp --rootDir src --title "My Google Activities"
+pnpx @google/clasp create --type webapp --rootDir src --title "google-activity"
 
 # 2. ソースを push
 pnpx @google/clasp push
