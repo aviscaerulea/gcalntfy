@@ -7,7 +7,7 @@ Google Chat のメッセージ・ Google Calendar のイベント・ Gmail の�
 
 ## 機能
 
-- 指定日に自分が送信した Google Chat メッセージを全スペースから収集
+- 指定日に自分がメッセージを送信したスペースの全 Chat メッセージを収集（他者含む）
 - DM ・グループチャット・名前付きスペースすべてに対応
 - 指定日のプライマリカレンダーのイベントを収集（会議・タスク等）
 - 指定日に自分が送信した Gmail メールを収集（件名・本文・宛先）
@@ -45,7 +45,6 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
   "chat": [
     {
       "datetime": "2026-02-27T09:23:50.228Z",
-      "media": "chat",
       "content": "@全員 MFA を有効にしましょう...",
       "sender": "me",
       "spaceName": "開発G情報共有",
@@ -77,7 +76,6 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 ```json
 {
   "datetime": "2026-02-27T10:00:00.000Z",
-  "media": "calendar",
   "content": "週次定例ミーティング",
   "sender": "me",
   "permalink": "https://www.google.com/calendar/event?eid=...",
@@ -89,7 +87,6 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 ```json
 {
   "datetime": "2026-02-27T11:30:00.000Z",
-  "media": "mail",
   "content": "Re: 週次報告の件\n\n来週の会議は水曜日に変更します。",
   "sender": "me",
   "permalink": "https://mail.google.com/mail/u/0/#all/18f9a2b3c4d5e6f7",
@@ -108,7 +105,6 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 ```json
 {
   "datetime": "2026-02-27T10:30:00.000Z",
-  "media": "drive",
   "content": "週次報告書",
   "sender": "me",
   "permalink": "https://docs.google.com/document/d/xxx/edit",

@@ -1,6 +1,6 @@
 ## 概要
 
-指定日に自分が発信した Google Workspace 上のアクティビティ（ Chat メッセージ・ Calendar イベント・ Gmail 送信メール・ Drive 更新ファイル）を JSON で返す GAS Web App。
+指定日の Google Workspace 上のアクティビティ（ Chat：自分が送信したスペースの全メッセージ・ Calendar イベント・ Gmail 送信メール・ Drive 更新ファイル）を JSON で返す GAS Web App。
 活動の振り返りや週次報告の材料収集（「誰と何をしたか」）を主な用途とする。
 
 ## エンドポイント
@@ -40,7 +40,7 @@ GAS の実行時間制限（ 6 分）を考慮し、全メディア同時取得�
 ```
 
 メディア名をキーとし、アクティビティオブジェクトの配列を値として返す。
-必須フィールドは `datetime`、`media`、`content`、`permalink` の 4 つ。その他はメディア別の固有フィールド。
+必須フィールドは `datetime`、`content`、`permalink` の 3 つ。その他はメディア別の固有フィールド。
 
 ### 全体取得成功時（media=all）
 
@@ -72,7 +72,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 ```json
 {
   "datetime": "2026-02-27T09:23:50.228Z",
-  "media": "chat",
   "content": "@全員 MFA を有効にしましょう...",
   "sender": "me",
   "spaceName": "開発G情報共有",
@@ -86,9 +85,8 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | フィールド | 説明 |
 |---|---|
 | `datetime` | 発信日時（ UTC RFC3339 形式） |
-| `media` | `"chat"` |
 | `content` | メッセージ本文 |
-| `sender` | 自分: `"me"`、他人: 表示名 |
+| `sender` | 自分: `"me"`、他人: 表示名（`resolveSenderName` で判定） |
 | `spaceName` | スペース表示名（ DM ・グループチャットは参加者名をカンマ区切り） |
 | `spaceType` | `SPACE` / `GROUP_CHAT` / `DIRECT_MESSAGE` |
 | `permalink` | `chat.google.com` 形式のメッセージ直接リンク |
@@ -100,7 +98,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 ```json
 {
   "datetime": "2026-02-27T10:00:00.000Z",
-  "media": "calendar",
   "content": "週次定例ミーティング",
   "sender": "me",
   "permalink": "https://www.google.com/calendar/event?eid=...",
@@ -111,7 +108,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | フィールド | 説明 |
 |---|---|
 | `datetime` | イベント開始日時（ UTC RFC3339 形式）。終日イベントは JST 00:00:00 |
-| `media` | `"calendar"` |
 | `content` | イベントタイトル |
 | `sender` | 自分が作成者: `"me"`、他人が主催者: 解決済み氏名（ People API 経由） |
 | `permalink` | Google Calendar のイベントリンク |
@@ -122,7 +118,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 ```json
 {
   "datetime": "2026-02-27T11:30:00.000Z",
-  "media": "mail",
   "content": "Re: 週次報告の件\n\n来週の会議は水曜日に変更します。\nよろしくお願いします。",
   "sender": "me",
   "permalink": "https://mail.google.com/mail/u/0/#all/18f9a2b3c4d5e6f7",
@@ -140,7 +135,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | フィールド | 説明 |
 |---|---|
 | `datetime` | 送信日時（ UTC RFC3339 形式） |
-| `media` | `"mail"` |
 | `content` | 件名 + `\n\n` + 本文（署名区切り `-- ` 以降を除去） |
 | `sender` | 常に `"me"`（`from:me` フィルタ済み） |
 | `permalink` | Gmail のメッセージ直接リンク |
@@ -154,7 +148,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 ```json
 {
   "datetime": "2026-02-27T10:30:00.000Z",
-  "media": "drive",
   "content": "週次報告書",
   "sender": "me",
   "permalink": "https://docs.google.com/document/d/xxx/edit",
@@ -166,7 +159,6 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | フィールド | 説明 |
 |---|---|
 | `datetime` | ファイル更新日時（ UTC RFC3339 形式。`modifiedByMeTime` 優先、なければ `modifiedTime`） |
-| `media` | `"drive"` |
 | `content` | ファイル名 |
 | `sender` | 常に `"me"` |
 | `permalink` | `webViewLink`（なければ `https://drive.google.com/file/d/{id}/view`） |
@@ -186,14 +178,15 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 
 ### Chat アクティビティ取得の仕様
 
-- 対象: 自分が参加している全スペース
+- 対象: 指定日に自分がメッセージを送信したスペース（自分がメッセージを送信していないスペースは除外）
+- メッセージ出力: 対象スペース内の期間内の全メッセージ（他者のメッセージを含む）
 - フィルタ: `createTime` による日付範囲（ JST 当日 00:00 〜 翌日 00:00 を UTC 変換）
-- 送信者フィルタ: Chat API がサーバー側での sender フィルタに非対応のため、クライアント側で `sender.name` を照合
+- 送信者判定: `resolveSenderName()` で全メッセージの sender を `"me"` または表示名に変換
 - 自分のユーザー ID: OAuth2 userinfo エンドポイントから取得した数値 ID を `users/{id}` 形式で使用
 - スペース名解決: `displayName` が空の場合（ DM ・グループチャット）は `Members.list` で参加者名を取得。メッセージ取得と同一 `fetchAll` バッチで並列実行
 - パーマリンク: `message.name` の spaceId ・ messageId から構築（ DM は `dm/`、その他は `room/` パス）
 - スレッド構造: `message.thread.name` と `message.threadReply` から `threadId` / `isThreadHead` を導出
-- 外部親メッセージ: 自分が返信したスレッドの親メッセージ（別日投稿を含む）を結果に追加することで文脈を保持し、`sender` で送信者を識別可能にする
+- 外部親メッセージ: 全返信メッセージのうちスレッド先頭が当日データにないものを別途取得して文脈を保持する
 
 ### Calendar アクティビティ取得の仕様
 
