@@ -106,6 +106,53 @@ function resolveEmail(email, displayName, cache) {
 }
 
 /**
+ * People API batchGet でユーザーID から氏名を一括解決する
+ *
+ * Chat API の members.list で displayName が空だったユーザーを補完するために使用する。
+ * users/{id} と people/{id} は同一の数値 ID を共有するため変換して参照する。
+ *
+ * @param {string[]} userIds - "users/{id}" 形式の配列
+ * @returns {Map<string, string>} userId → displayName のマッピング
+ */
+function resolveUserIds(userIds) {
+    if (userIds.length === 0) return new Map();
+
+    const token = ScriptApp.getOAuthToken();
+    const result = new Map();
+
+    for (let i = 0; i < userIds.length; i += BATCH_GET_PEOPLE_SIZE) {
+        const batch = userIds.slice(i, i + BATCH_GET_PEOPLE_SIZE);
+        // users/{id} → people/{id} に変換して resourceNames パラメータを構築
+        const params = batch.map(id => "resourceNames=" + encodeURIComponent(id.replace("users/", "people/")));
+        params.push("personFields=names");
+        const url = `${PEOPLE_API_BASE}/people:batchGet?${params.join("&")}`;
+
+        const resp = UrlFetchApp.fetch(url, {
+            headers: { Authorization: "Bearer " + token },
+            muteHttpExceptions: true
+        });
+        if (resp.getResponseCode() !== 200) continue;
+
+        const data = JSON.parse(resp.getContentText());
+        if (!data.responses) continue;
+
+        for (const r of data.responses) {
+            if (r.httpStatusCode && r.httpStatusCode !== 200) continue;
+            const person = r.person;
+            if (!person || !person.resourceName) continue;
+            const names = person.names;
+            if (!names || names.length === 0) continue;
+            // people/{id} → users/{id} に変換して格納
+            const displayName = names[0].displayName;
+            if (!displayName) continue;
+            const userId = person.resourceName.replace("people/", "users/");
+            result.set(userId, displayName);
+        }
+    }
+    return result;
+}
+
+/**
  * イベント参加者リストを解決して氏名配列を返す
  *
  * 会議室・自分・欠席者を除外し、グループアドレスを個人展開してから氏名解決する。

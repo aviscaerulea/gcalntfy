@@ -181,9 +181,9 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 - 対象: 指定日に自分がメッセージを送信したスペース（自分がメッセージを送信していないスペースは除外）
 - メッセージ出力: 対象スペース内の期間内の全メッセージ（他者のメッセージを含む）
 - フィルタ: `createTime` による日付範囲（ JST 当日 00:00 〜 翌日 00:00 を UTC 変換）
-- 送信者判定: `resolveSenderName()` で全メッセージの sender を `"me"` または表示名に変換
+- 送信者判定: `resolveSenderName()` で全メッセージの sender を `"me"` または表示名に変換。`msg.sender.displayName` が空の場合は全スペースのメンバーリストから構築した `userId → displayName` マップでフォールバック解決し、それでも未解決のユーザーは People API `people:batchGet` で一括補完する
 - 自分のユーザー ID: OAuth2 userinfo エンドポイントから取得した数値 ID を `users/{id}` 形式で使用
-- スペース名解決: `displayName` が空の場合（ DM ・グループチャット）は `Members.list` で参加者名を取得。メッセージ取得と同一 `fetchAll` バッチで並列実行
+- スペース名解決: `displayName` が空の場合（ DM ・グループチャット）は `Members.list` で参加者名を取得。全スペースのメンバーリストも同一 `fetchAll` バッチで並列取得して `userId → displayName` マップに蓄積する
 - パーマリンク: `message.name` の spaceId ・ messageId から構築（ DM は `dm/`、その他は `room/` パス）
 - スレッド構造: `message.thread.name` と `message.threadReply` から `threadId` / `isThreadHead` を導出
 - 外部親メッセージ: 全返信メッセージのうちスレッド先頭が当日データにないものを別途取得して文脈を保持する

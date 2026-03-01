@@ -145,14 +145,19 @@ function buildActivity(msg, opts) {
 /**
  * Chat メッセージの送信者表示名を解決する
  *
+ * displayName が空の場合は userNameMap（全スペースのメンバーリストから構築）をフォールバックとして使用する。
+ *
  * @param {Object} msg - Chat Message リソース
  * @param {string} myUserId - 自分のユーザーID（"users/{id}" 形式）
+ * @param {Map<string, string>} userNameMap - userId → displayName マッピング
  * @returns {string} "me"、表示名、またはフォールバック値
  */
-function resolveSenderName(msg, myUserId) {
+function resolveSenderName(msg, myUserId, userNameMap) {
     if (!msg.sender) return "unknown";
     if (msg.sender.name === myUserId) return "me";
-    return msg.sender.displayName || msg.sender.name;
+    return msg.sender.displayName
+        || userNameMap.get(msg.sender.name)
+        || msg.sender.name;
 }
 
 /**
@@ -166,7 +171,7 @@ function resolveSenderName(msg, myUserId) {
  * @param {string} startTime - UTC RFC3339 形式の開始日時
  * @param {string} endTime - UTC RFC3339 形式の終了日時
  * @param {string} myUserId - 自分のユーザーID（"users/{id}" 形式）
- * @returns {{ messagesMap: Map<string, Object[]>, nameMap: Map<string, string> }}
+ * @returns {{ messagesMap: Map<string, Object[]>, nameMap: Map<string, string>, userNameMap: Map<string, string> }}
  */
 function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
     const token = ScriptApp.getOAuthToken();
@@ -176,10 +181,12 @@ function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
     const messagesMap = new Map(spaces.map(s => [s.name, []]));
     const nameMap = new Map();
 
-    // members の名前を配列で蓄積し、最後に結合する
+    // members の名前を配列で蓄積し、最後に結合する（DM/グループチャット用のスペース名解決）
     const memberNamesMap = new Map();
+    // 全スペースのメンバーから構築する userId → displayName マッピング
+    const userNameMap = new Map();
 
-    // 初回リクエストを構築: messages と（必要なら）members を混合
+    // 初回リクエストを構築: messages と members（全スペース）を混合
     let pending = [];
     for (const space of spaces) {
         pending.push({
@@ -189,12 +196,14 @@ function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
         if (space.displayName) {
             nameMap.set(space.name, space.displayName);
         } else {
+            // DM/グループチャット: スペース名をメンバー名から解決する
             memberNamesMap.set(space.name, []);
-            pending.push({
-                url: `${CHAT_API_BASE}/${space.name}/members?pageSize=100`,
-                meta: { type: "members", spaceName: space.name }
-            });
         }
+        // 全スペースで userId → displayName マッピング構築のためにメンバーを取得
+        pending.push({
+            url: `${CHAT_API_BASE}/${space.name}/members?pageSize=100`,
+            meta: { type: "members", spaceName: space.name }
+        });
     }
 
     while (pending.length > 0) {
@@ -230,12 +239,16 @@ function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
                     });
                 }
             } else {
-                // members: 自分以外のメンバー表示名を収集してスペース名にする
+                // members: 全スペースで userId → displayName を蓄積
                 if (data.memberships) {
-                    const names = data.memberships
-                        .filter(m => m.member && m.member.name !== myUserId && m.member.displayName)
-                        .map(m => m.member.displayName);
-                    memberNamesMap.get(meta.spaceName).push(...names);
+                    for (const m of data.memberships) {
+                        if (!m.member || !m.member.name || !m.member.displayName) continue;
+                        userNameMap.set(m.member.name, m.member.displayName);
+                        // DM/グループチャットのスペース名解決用（自分以外）
+                        if (memberNamesMap.has(meta.spaceName) && m.member.name !== myUserId) {
+                            memberNamesMap.get(meta.spaceName).push(m.member.displayName);
+                        }
+                    }
                 }
                 if (data.nextPageToken) {
                     nextPending.push({
@@ -256,7 +269,7 @@ function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
         }
     }
 
-    return { messagesMap, nameMap };
+    return { messagesMap, nameMap, userNameMap };
 }
 
 /**
@@ -350,7 +363,24 @@ function getChatActivities(dateStr) {
     });
     console.log(`対象スペース数: ${spaces.length}（lastActiveTime フィルタで ${allSpaces.length - spaces.length} 件除外）`);
 
-    const { messagesMap, nameMap } = fetchMessagesAndNames(spaces, range.startTime, range.endTime, myUserId);
+    const { messagesMap, nameMap, userNameMap } = fetchMessagesAndNames(spaces, range.startTime, range.endTime, myUserId);
+
+    // members.list で解決できなかったユーザーを People API で補完する
+    const unresolvedIds = new Set();
+    for (const msgs of messagesMap.values()) {
+        for (const msg of msgs) {
+            if (!msg.sender || msg.sender.name === myUserId) continue;
+            if (msg.sender.displayName || userNameMap.has(msg.sender.name)) continue;
+            unresolvedIds.add(msg.sender.name);
+        }
+    }
+    if (unresolvedIds.size > 0) {
+        console.log(`People API で未解決ユーザーを補完: ${unresolvedIds.size} 件`);
+        const peopleNames = resolveUserIds([...unresolvedIds]);
+        for (const [id, name] of peopleNames) {
+            userNameMap.set(id, name);
+        }
+    }
 
     const activities = [];
     // 外部スレッド親の重複を収集時に除去するための Set
@@ -375,7 +405,7 @@ function getChatActivities(dateStr) {
             }
             activities.push(buildActivity(msg, {
                 ...activityOpts,
-                sender: resolveSenderName(msg, myUserId),
+                sender: resolveSenderName(msg, myUserId, userNameMap),
                 isThreadHead
             }));
         }
@@ -406,7 +436,7 @@ function getChatActivities(dateStr) {
         const headResults = fetchThreadHeads(missingThreadHeads);
         for (const { msg, meta } of headResults) {
             activities.push(buildActivity(msg, {
-                sender: resolveSenderName(msg, myUserId),
+                sender: resolveSenderName(msg, myUserId, userNameMap),
                 spaceName: meta.resolvedSpaceName,
                 spaceType: meta.spaceType,
                 isThreadHead: true

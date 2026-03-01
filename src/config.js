@@ -39,6 +39,9 @@ const DRIVE_API_BASE = "https://www.googleapis.com/drive/v3";
 // Drive API の 1 ページあたりの最大取得件数（API 上限: 1000）
 const PAGE_SIZE_DRIVE = 1000;
 
+// People API batchGet の 1 リクエストあたりの最大人数（API 上限: 200）
+const BATCH_GET_PEOPLE_SIZE = 200;
+
 // アクティビティのメディア種別識別子
 const MEDIA_CHAT = "chat";
 const MEDIA_CALENDAR = "calendar";
