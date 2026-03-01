@@ -1,19 +1,7 @@
 // vi: ts=2 sw=2 ff=unix fenc=utf-8
 
-// Calendar API のベース URL
-const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
-
 // タスク・不在・勤務場所・サイレントモードに対応する除外イベントタイプ
 const EXCLUDED_EVENT_TYPES = new Set(["outOfOffice", "workingLocation", "focusTime"]);
-
-/**
- * デバッグ用: Calendar API の生レスポンスをログに出力する
- * GAS エディタから直接実行して確認する（本番では使用しない）
- */
-function debugCalendarApi() {
-  const data = callCalendarApi("/calendars/primary/events", { maxResults: 5, singleEvents: true });
-  console.log("Response:", JSON.stringify(data, null, 2));
-}
 
 /**
  * Calendar REST API をユーザ認証で呼び出す
@@ -27,18 +15,26 @@ function callCalendarApi(path, params) {
 }
 
 /**
+ * デバッグ用: Calendar API の生レスポンスをログに出力する
+ * GAS エディタから直接実行して確認する（本番では使用しない）
+ */
+function debugCalendarApi() {
+  const data = callCalendarApi("/calendars/primary/events", { maxResults: 5, singleEvents: true });
+  console.log("Response:", JSON.stringify(data, null, 2));
+}
+
+/**
  * プライマリカレンダーのイベント一覧を全件取得する
  *
- * ページネーション対応で全件取得し、カレンダー表示名も返す。
+ * ページネーション対応で全件取得する。
  * singleEvents=true により繰り返しイベントを個別のイベントとして展開する。
  *
  * @param {string} startTime - UTC RFC3339 形式の開始日時
  * @param {string} endTime - UTC RFC3339 形式の終了日時
- * @returns {{ events: Object[], calendarName: string }}
+ * @returns {Object[]} Calendar Event リソースの配列
  */
 function listPrimaryCalendarEvents(startTime, endTime) {
   const events = [];
-  let calendarName = "";
   let pageToken = null;
 
   do {
@@ -52,12 +48,11 @@ function listPrimaryCalendarEvents(startTime, endTime) {
     if (pageToken) params.pageToken = pageToken;
 
     const data = callCalendarApi("/calendars/primary/events", params);
-    if (!calendarName && data.summary) calendarName = data.summary;
     if (data.items) events.push(...data.items);
     pageToken = data.nextPageToken;
   } while (pageToken);
 
-  return { events, calendarName };
+  return events;
 }
 
 /**
@@ -77,35 +72,35 @@ function resolveEventDatetime(event) {
 }
 
 /**
- * イベントの送信者表示名を解決する
+ * イベントの主催者名を解決する
  *
- * 自分が作成者の場合は "me"、他人が主催者の場合は主催者の表示名を返す。
+ * 自分が作成者の場合は "me"、他人が主催者の場合は resolveEmail() で氏名解決する。
  *
  * @param {Object} event - Calendar Event リソース
- * @returns {string} "me" または主催者の表示名
+ * @param {Map<string, string>} cache - 氏名解決キャッシュ
+ * @returns {string} "me" または解決済み氏名
  */
-function resolveOrganizerName(event) {
+function resolveOrganizerName(event, cache) {
   if (event.creator && event.creator.self) return "me";
   const organizer = event.organizer || event.creator;
   if (!organizer) return "unknown";
-  return organizer.displayName || organizer.email || "unknown";
+  if (!organizer.email) return organizer.displayName || "unknown";
+  return resolveEmail(organizer.email, organizer.displayName || "", cache);
 }
 
 /**
  * Calendar イベントからアクティビティオブジェクトを構築する
  *
  * @param {Object} event - Calendar Event リソース
- * @param {string} calendarName - カレンダーの表示名
+ * @param {Map<string, string>} nameCache - 主催者の氏名解決キャッシュ（イベント間で共有）
  * @returns {Object} アクティビティオブジェクト
  */
-function buildCalendarActivity(event, calendarName) {
+function buildCalendarActivity(event, nameCache) {
   return {
     datetime: resolveEventDatetime(event),
-    medium: MEDIUM_CALENDAR,
+    media: MEDIA_CALENDAR,
     content: event.summary || "",
-    sender: resolveOrganizerName(event),
-    spaceName: calendarName,
-    spaceType: "CALENDAR",
+    sender: resolveOrganizerName(event, nameCache),
     permalink: event.htmlLink || "",
     attendees: resolveAttendees(event.attendees || [])
   };
@@ -129,6 +124,7 @@ function debugGetCalendarActivities() {
  * タスク・不在・勤務場所・サイレントモードのイベントタイプはクライアント側で除外する。
  * 欠席した予定（attendees の自分の responseStatus が "declined"）も除外する。
  * 繰り返しイベントは singleEvents=true により個別に展開して取得する。
+ * 主催者の氏名解決キャッシュはイベント間で共有する。
  *
  * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
@@ -137,8 +133,8 @@ function getCalendarActivities(dateStr) {
   const range = getDateRange(dateStr);
   if (!range) throw new Error("無効な日付形式: " + dateStr);
 
-  const { events, calendarName } = listPrimaryCalendarEvents(range.startTime, range.endTime);
-  console.log(`カレンダー「${calendarName}」のイベント: ${events.length} 件取得`);
+  const events = listPrimaryCalendarEvents(range.startTime, range.endTime);
+  console.log(`カレンダーイベント: ${events.length} 件取得`);
 
   // イベントタイプによる除外 + 欠席（declined）の除外
   const filtered = events.filter(e => {
@@ -148,5 +144,7 @@ function getCalendarActivities(dateStr) {
   });
   console.log(`フィルタ後: ${filtered.length} 件（${events.length - filtered.length} 件除外）`);
 
-  return filtered.map(event => buildCalendarActivity(event, calendarName));
+  // 主催者の氏名解決キャッシュをイベント間で共有して重複 API 呼び出しを防ぐ
+  const nameCache = new Map();
+  return filtered.map(event => buildCalendarActivity(event, nameCache));
 }

@@ -124,7 +124,7 @@ function buildActivity(msg, opts) {
   const threadName = msg.thread && msg.thread.name;
   return {
     datetime: msg.createTime,
-    medium: MEDIUM_CHAT,
+    media: MEDIA_CHAT,
     content: msg.text || "",
     sender: opts.sender,
     spaceName: opts.spaceName,
