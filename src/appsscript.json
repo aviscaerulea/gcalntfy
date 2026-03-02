@@ -15,8 +15,8 @@
     "https://www.googleapis.com/auth/script.external_request"
   ],
   "webapp": {
-    "executeAs": "USER_ACCESSING",
-    "access": "MYSELF"
+    "executeAs": "USER_DEPLOYING",
+    "access": "ANYONE_ANONYMOUS"
   },
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8"

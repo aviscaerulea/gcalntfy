@@ -48,3 +48,9 @@ const MEDIA_CALENDAR = "calendar";
 const MEDIA_MAIL = "mail";
 const MEDIA_DRIVE = "drive";
 const MEDIA_ALL = "all";
+
+// 氏名解決のメディア種別識別子
+const MEDIA_MEMBER = "member";
+
+// Script Properties のキー名（API トークン）
+const PROP_API_TOKEN = "API_TOKEN";
