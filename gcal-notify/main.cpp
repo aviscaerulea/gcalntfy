@@ -543,9 +543,14 @@ int wmain(int argc, wchar_t* argv[]) {
         DWORD httpStatus = 0;
         auto body = httpPost(apiUrl, jsonBody, &httpStatus);
         if (body.empty()) {
-            char errMsg[64] = "gcal-notify: HTTP request failed";
-            if (httpStatus != 0) sprintf_s(errMsg, "gcal-notify: HTTP request failed (status %lu)", httpStatus);
-            writeStderr(hStderr, errMsg);
+            std::string errMsg = "HTTP request failed";
+            if (httpStatus != 0) {
+                char buf[64];
+                sprintf_s(buf, "HTTP request failed (status %lu)", httpStatus);
+                errMsg = buf;
+            }
+            writeStderr(hStderr, "gcal-notify: " + errMsg);
+            try { showToast(L"gcal-notify", toWide(errMsg)); } catch (...) {}
             return 2;
         }
 
@@ -560,6 +565,7 @@ int wmain(int argc, wchar_t* argv[]) {
         auto [events, errorMsg] = parseCalendarEvents(body);
         if (!errorMsg.empty()) {
             writeStderr(hStderr, "gcal-notify: " + errorMsg);
+            try { showToast(L"gcal-notify", toWide(errorMsg)); } catch (...) {}
             return 2;
         }
         if (events.empty()) return 0;
@@ -580,6 +586,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     } catch (...) {
         writeStderr(hStderr, "gcal-notify: unexpected error");
+        try { showToast(L"gcal-notify", L"unexpected error"); } catch (...) {}
         return 2;
     }
     return 0;
