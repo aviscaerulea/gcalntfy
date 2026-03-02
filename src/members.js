@@ -78,6 +78,27 @@ function expandGroupMembers(email, depth) {
 }
 
 /**
+ * People API + ContactsApp でメールアドレスから氏名を検索する
+ *
+ * フォールバックなし。解決できなかった場合は null を返す。
+ * resolveEmail / resolveEmailForApi の共通検索ロジック。
+ *
+ * @param {string} email - 検索するメールアドレス
+ * @returns {string|null} 氏名または null
+ */
+function lookupName(email) {
+    const name = searchPeopleByEmail(email);
+    if (name) return name;
+    try {
+        const contacts = ContactsApp.getContactsByEmailAddress(email);
+        if (contacts.length > 0) return contacts[0].getFullName() || null;
+    } catch (e) {
+        // noop
+    }
+    return null;
+}
+
+/**
  * メールアドレスから氏名を段階的フォールバックで解決する
  *
  * 解決順: People API（連絡先 → ディレクトリ）→ ContactsApp
@@ -85,22 +106,7 @@ function expandGroupMembers(email, depth) {
  */
 function resolveEmail(email, displayName, cache) {
     if (cache.has(email)) return cache.get(email);
-
-    let name = searchPeopleByEmail(email);
-
-    // ContactsApp が利用できない環境ではスキップ
-    if (!name) {
-        try {
-            const contacts = ContactsApp.getContactsByEmailAddress(email);
-            if (contacts.length > 0) name = contacts[0].getFullName() || null;
-        } catch (e) {
-            // noop
-        }
-    }
-
-    if (!name && displayName) name = displayName;
-    if (!name) name = email;
-
+    const name = lookupName(email) ?? displayName ?? email;
     cache.set(email, name);
     return name;
 }
@@ -150,6 +156,23 @@ function resolveUserIds(userIds) {
         }
     }
     return result;
+}
+
+/**
+ * 外部 API 用の氏名解決
+ *
+ * People API → ContactsApp の順に検索し、未解決の場合は null を返す。
+ * 内部用の resolveEmail と異なり、displayName やメールアドレスへのフォールバックは行わない。
+ *
+ * @param {string} email - 解決するメールアドレス
+ * @param {Map} cache - 重複 API 呼び出し防止キャッシュ
+ * @returns {string|null} 氏名または null
+ */
+function resolveEmailForApi(email, cache) {
+    if (cache.has(email)) return cache.get(email);
+    const name = lookupName(email);
+    cache.set(email, name);
+    return name;
 }
 
 /**
