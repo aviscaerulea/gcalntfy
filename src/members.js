@@ -99,6 +99,19 @@ function lookupName(email) {
 }
 
 /**
+ * 氏名の正規化
+ *
+ * 全角スペースを除去し前後の空白をトリムする。
+ * People API / ContactsApp が返す氏名の全角スペース（\u3000）を除去するために使用する。
+ *
+ * @param {string} name - 正規化する氏名
+ * @returns {string} 正規化後の氏名
+ */
+function normalizeName(name) {
+    return name.replace(/\u3000+/g, "").trim();
+}
+
+/**
  * メールアドレスから氏名を段階的フォールバックで解決する
  *
  * 解決順: People API（連絡先 → ディレクトリ）→ ContactsApp
@@ -106,9 +119,7 @@ function lookupName(email) {
  */
 function resolveEmail(email, displayName, cache) {
     if (cache.has(email)) return cache.get(email);
-    const raw = lookupName(email) ?? displayName ?? email;
-    // 全角スペースを半角スペースに正規化してトリム
-    const name = raw.replace(/\u3000+/g, " ").trim();
+    const name = normalizeName(lookupName(email) ?? displayName ?? email);
     cache.set(email, name);
     return name;
 }
@@ -151,10 +162,10 @@ function resolveUserIds(userIds) {
             const names = person.names;
             if (!names || names.length === 0) continue;
             // people/{id} → users/{id} に変換して格納
-            const displayName = names[0].displayName;
-            if (!displayName) continue;
+            const raw = names[0].displayName;
+            if (!raw) continue;
             const userId = person.resourceName.replace("people/", "users/");
-            result.set(userId, displayName);
+            result.set(userId, normalizeName(raw));
         }
     }
     return result;
@@ -172,7 +183,8 @@ function resolveUserIds(userIds) {
  */
 function resolveEmailForApi(email, cache) {
     if (cache.has(email)) return cache.get(email);
-    const name = lookupName(email);
+    const raw = lookupName(email);
+    const name = raw ? normalizeName(raw) : null;
     cache.set(email, name);
     return name;
 }

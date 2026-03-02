@@ -155,9 +155,10 @@ function buildActivity(msg, opts) {
 function resolveSenderName(msg, myUserId, userNameMap) {
     if (!msg.sender) return "unknown";
     if (msg.sender.name === myUserId) return "me";
-    return msg.sender.displayName
+    const name = msg.sender.displayName
         || userNameMap.get(msg.sender.name)
         || msg.sender.name;
+    return normalizeName(name);
 }
 
 /**
@@ -243,10 +244,11 @@ function fetchMessagesAndNames(spaces, startTime, endTime, myUserId) {
                 if (data.memberships) {
                     for (const m of data.memberships) {
                         if (!m.member || !m.member.name || !m.member.displayName) continue;
-                        userNameMap.set(m.member.name, m.member.displayName);
+                        const name = normalizeName(m.member.displayName);
+                        userNameMap.set(m.member.name, name);
                         // DM/グループチャットのスペース名解決用（自分以外）
                         if (memberNamesMap.has(meta.spaceName) && m.member.name !== myUserId) {
-                            memberNamesMap.get(meta.spaceName).push(m.member.displayName);
+                            memberNamesMap.get(meta.spaceName).push(name);
                         }
                     }
                 }
