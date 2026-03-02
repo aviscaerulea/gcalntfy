@@ -42,6 +42,10 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -H "Content-Type: application/json" \
   -d '{"token":"YOUR_SECRET","date":"2026-02-27 16:00","media":"chat"}' "$BASE"
 
+# フィールド絞り込み（attendees/sender の高コスト API 解決をスキップして高速化）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27 09:00","media":"calendar","fields":["datetime","content"]}' "$BASE"
+
 # 氏名解決（グループ展開なし）
 curl -X POST -H "Content-Type: application/json" \
   -d '{"token":"YOUR_SECRET","media":"member","emails":["a@example.com","group@example.com"]}' "$BASE"

@@ -534,10 +534,12 @@ int wmain(int argc, wchar_t* argv[]) {
             nowUtc = getCurrentUtcISO();
         }
 
-        // (3) POST ボディ構築: {"token":"...","date":"YYYY-MM-DD HH:MM","media":"calendar"}
+        // (3) POST ボディ構築: {"token":"...","date":"YYYY-MM-DD HH:MM","media":"calendar","fields":["datetime","content"]}
+        // fields を指定して attendees/sender の高コスト API 解決をスキップする
         std::string jsonBody = "{\"token\":\""
             + escapeJson(wideToUtf8(apiToken)) + "\",\"date\":\""
-            + escapeJson(wideToUtf8(dateTimeJST)) + "\",\"media\":\"calendar\"}";
+            + escapeJson(wideToUtf8(dateTimeJST))
+            + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\"]}";
 
         // (4) HTTP POST
         DWORD httpStatus = 0;
