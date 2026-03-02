@@ -1,6 +1,0 @@
-// vi: ts=4 sw=4 ff=unix fenc=utf-8
-// リソーススクリプト: gcal-notify.opus をバイナリとして埋め込む
-
-#include "resource.h"
-
-IDR_NOTIFY_OPUS RCDATA "gcal-notify.opus"

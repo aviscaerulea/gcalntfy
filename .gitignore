@@ -1,11 +1,11 @@
 .clasp.json
 node_modules/
 
-# gcal-notify ビルド成果物
-gcal-notify/*.exe
-gcal-notify/*.obj
-gcal-notify/*.res
+# gcalntfy ビルド成果物
+gcalntfy/*.exe
+gcalntfy/*.obj
+gcalntfy/*.res
 
-# gcal-notify ユーザ環境固有ファイル
-gcal-notify/*.local.ini
-gcal-notify/*.local.opus
+# gcalntfy ユーザ環境固有ファイル
+gcalntfy/*.local.ini
+gcalntfy/*.local.opus

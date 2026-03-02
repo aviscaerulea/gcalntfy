@@ -1,10 +1,10 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
 /**
- * gcal-notify - Google カレンダーの次の予定を Windows Toast 通知で知らせる CLI ツール
+ * gcalntfy - Google カレンダーの次の予定を Windows Toast 通知で知らせる CLI ツール
  *
- * exe 同フォルダの gcal-notify.ini（または .local.ini）から GAS Web App の URL とトークンを読み込み、
+ * exe 同フォルダの gcalntfy.ini（または .local.ini）から GAS Web App の URL とトークンを読み込み、
  * POST リクエストで現在日時以降の最初のカレンダーイベントを取得して Toast 通知を表示する。
- * 通知音は埋め込み opus リソース、または gcal-notify.local.opus を ffplay で再生する。
+ * 通知音は埋め込み opus リソース、または gcalntfy.local.opus を ffplay で再生する。
  *
  * 引数: [YYYY-MM-DD HH:MM]（省略時は現在時刻）
  *   指定すると、その JST 日時を起点にして次の予定を取得する。
@@ -17,7 +17,7 @@
  * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
  * 外部依存: ffplay (PATH 上に存在すること、未インストールでも Toast 通知は表示される)
  * ビルド: rc /nologo resource.rc
- *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcal-notify.exe main.cpp resource.res
+ *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
  *             /link /SUBSYSTEM:CONSOLE windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
  */
 
@@ -52,7 +52,7 @@
 #include "resource.h"
 
 // アプリケーション識別子（Toast 通知に使用）
-static const wchar_t* APP_AUMID = L"com.gcal.notify";
+static const wchar_t* APP_AUMID = L"com.gcalntfy";
 
 // ==================== データ構造 ====================
 
@@ -80,11 +80,11 @@ static std::wstring getExeDir() {
 // INI ファイルから指定キーの値を読み込む（.local.ini を優先）
 static std::wstring readIniValue(const std::wstring& exeDir, const wchar_t* key) {
     wchar_t val[2048] = {};
-    std::wstring localIni = exeDir + L"\\gcal-notify.local.ini";
-    GetPrivateProfileStringW(L"gcal-notify", key, L"", val, _countof(val), localIni.c_str());
+    std::wstring localIni = exeDir + L"\\gcalntfy.local.ini";
+    GetPrivateProfileStringW(L"gcalntfy", key, L"", val, _countof(val), localIni.c_str());
     if (val[0]) return val;
-    std::wstring ini = exeDir + L"\\gcal-notify.ini";
-    GetPrivateProfileStringW(L"gcal-notify", key, L"", val, _countof(val), ini.c_str());
+    std::wstring ini = exeDir + L"\\gcalntfy.ini";
+    GetPrivateProfileStringW(L"gcalntfy", key, L"", val, _countof(val), ini.c_str());
     return val;
 }
 
@@ -232,7 +232,7 @@ static void writeStderr(HANDLE hStderr, std::string_view msg) {
 static std::string httpPost(const std::wstring& url, const std::string& jsonBody,
     DWORD* outStatusCode = nullptr) {
     if (outStatusCode) *outStatusCode = 0;
-    HINTERNET hSession = WinHttpOpen(L"gcal-notify/1.0",
+    HINTERNET hSession = WinHttpOpen(L"gcalntfy/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
@@ -353,10 +353,11 @@ static const CalendarEvent* findNextEvent(
 // ==================== 通知音再生 ====================
 
 // ffplay で通知音を起動する
-// gcal-notify.local.opus がある場合はファイルパス直接指定、なければ埋め込みリソースを stdin パイプで渡す
+// gcalntfy.local.opus がある場合はファイルパス直接指定、なければ埋め込みリソースを stdin パイプで渡す
 // ffplay が未インストールの場合は何もしない（Toast 通知は表示される）
+// BLE ヘッドホン対処: adelay=1000:all=1 で冒頭 1 秒の無音を追加し、接続遅延による冒頭切れを防ぐ
 static void launchSound(const std::wstring& exeDir) {
-    std::wstring localOpus = exeDir + L"\\gcal-notify.local.opus";
+    std::wstring localOpus = exeDir + L"\\gcalntfy.local.opus";
     bool useLocal = (GetFileAttributesW(localOpus.c_str()) != INVALID_FILE_ATTRIBUTES);
 
     STARTUPINFOW si = {};
@@ -369,7 +370,7 @@ static void launchSound(const std::wstring& exeDir) {
 
     if (useLocal) {
         // ローカルファイルをパス直接指定で ffplay に渡す
-        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet \"" + localOpus + L"\"";
+        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 \"" + localOpus + L"\"";
         si.hStdInput = INVALID_HANDLE_VALUE;
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
             FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
@@ -395,7 +396,7 @@ static void launchSound(const std::wstring& exeDir) {
         SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
 
         si.hStdInput = hReadPipe;
-        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -i pipe:0";
+        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 -i pipe:0";
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
             TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             CloseHandle(hReadPipe);
@@ -420,11 +421,18 @@ static void launchSound(const std::wstring& exeDir) {
 
 // AUMID 付きスタートメニューショートカットを作成する（Toast 通知に必要）
 // Windows 10/11 ではデスクトップアプリの Toast に AUMID 付き .lnk が必要。既存の場合はスキップ。
+// AUMID 変更に伴い旧 gcal-notify.lnk が残る場合は削除する。
 static void ensureShortcut() {
     wchar_t appData[MAX_PATH] = {};
     if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) return;
-    std::wstring linkPath = std::wstring(appData)
+
+    // 旧ショートカット削除（AUMID 変更による残留ショートカット対処）
+    std::wstring oldLink = std::wstring(appData)
         + L"\\Microsoft\\Windows\\Start Menu\\Programs\\gcal-notify.lnk";
+    DeleteFileW(oldLink.c_str());
+
+    std::wstring linkPath = std::wstring(appData)
+        + L"\\Microsoft\\Windows\\Start Menu\\Programs\\gcalntfy.lnk";
 
     if (GetFileAttributesW(linkPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
@@ -491,11 +499,11 @@ int wmain(int argc, wchar_t* argv[]) {
         auto apiUrl   = readIniValue(exeDir, L"ApiUrl");
         auto apiToken = readIniValue(exeDir, L"ApiToken");
         if (apiUrl.empty()) {
-            writeStderr(hStderr, "gcal-notify: ApiUrl is not set in gcal-notify.ini (or .local.ini)");
+            writeStderr(hStderr, "gcalntfy: ApiUrl is not set in gcalntfy.ini (or .local.ini)");
             return 1;
         }
         if (apiToken.empty()) {
-            writeStderr(hStderr, "gcal-notify: ApiToken is not set in gcal-notify.ini (or .local.ini)");
+            writeStderr(hStderr, "gcalntfy: ApiToken is not set in gcalntfy.ini (or .local.ini)");
             return 1;
         }
 
@@ -551,8 +559,8 @@ int wmain(int argc, wchar_t* argv[]) {
                 sprintf_s(buf, "HTTP request failed (status %lu)", httpStatus);
                 errMsg = buf;
             }
-            writeStderr(hStderr, "gcal-notify: " + errMsg);
-            try { showToast(L"gcal-notify", toWide(errMsg)); } catch (...) {}
+            writeStderr(hStderr, "gcalntfy: " + errMsg);
+            try { showToast(L"gcalntfy", toWide(errMsg)); } catch (...) {}
             return 2;
         }
 
@@ -566,8 +574,8 @@ int wmain(int argc, wchar_t* argv[]) {
         // (5) JSON パース → Calendar イベント配列
         auto [events, errorMsg] = parseCalendarEvents(body);
         if (!errorMsg.empty()) {
-            writeStderr(hStderr, "gcal-notify: " + errorMsg);
-            try { showToast(L"gcal-notify", toWide(errorMsg)); } catch (...) {}
+            writeStderr(hStderr, "gcalntfy: " + errorMsg);
+            try { showToast(L"gcalntfy", toWide(errorMsg)); } catch (...) {}
             return 2;
         }
         if (events.empty()) return 0;
@@ -587,8 +595,8 @@ int wmain(int argc, wchar_t* argv[]) {
         showToast(jstTime, title);
 
     } catch (...) {
-        writeStderr(hStderr, "gcal-notify: unexpected error");
-        try { showToast(L"gcal-notify", L"unexpected error"); } catch (...) {}
+        writeStderr(hStderr, "gcalntfy: unexpected error");
+        try { showToast(L"gcalntfy", L"unexpected error"); } catch (...) {}
         return 2;
     }
     return 0;

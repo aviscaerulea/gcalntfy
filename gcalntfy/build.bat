@@ -1,12 +1,12 @@
 @echo off
 rem vi: ts=4 sw=4 ff=dos fenc=cp932
-rem gcal-notify build script
+rem gcalntfy build script
 rem
 rem Run Enable-VSDev in PowerShell before this script:
 rem   Enable-VSDev
-rem   .\gcal-notify\build.bat
+rem   .\gcalntfy\build.bat
 rem
-rem Place gcal-notify.opus in this directory before building.
+rem Place gcalntfy.opus in this directory before building.
 
 setlocal
 cd /d "%~dp0"
@@ -19,7 +19,7 @@ if errorlevel 1 (
 )
 
 echo [2/2] C++ compile + link...
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcal-notify.exe main.cpp resource.res ^
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res ^
     /link /SUBSYSTEM:CONSOLE ^
     windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
 if errorlevel 1 (
@@ -27,5 +27,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Build SUCCESS: gcal-notify.exe
+echo Build SUCCESS: gcalntfy.exe
 endlocal
