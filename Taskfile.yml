@@ -1,0 +1,32 @@
+# vi: ts=2 sw=2 ff=unix fenc=utf-8
+version: '3'
+
+vars:
+  VERSION: '0.1.0'
+
+tasks:
+  clean:
+    desc: ビルド成果物を削除
+    dir: gcalntfy
+    cmds:
+      - rm -rf out
+
+  build:
+    desc: gcalntfy をビルド
+    dir: gcalntfy
+    cmds:
+      - mkdir -p out
+      - pwsh -NonInteractive -File build.ps1
+      - cp gcalntfy.ini out/
+
+  release:
+    desc: リリースビルドと zip 作成
+    dir: gcalntfy
+    deps: [build]
+    cmds:
+      - >-
+        pwsh -NonInteractive -Command '
+        Compress-Archive
+        -Path out\gcalntfy.exe, gcalntfy.ini
+        -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
+        -Force'

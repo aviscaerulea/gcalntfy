@@ -1,10 +1,8 @@
 .clasp.json
 node_modules/
 
-# gcalntfy ビルド成果物
-gcalntfy/*.exe
-gcalntfy/*.obj
-gcalntfy/*.res
+# gcalntfy ビルド成果物（out/ ディレクトリ全体）
+gcalntfy/out/
 
 # gcalntfy ユーザ環境固有ファイル
 gcalntfy/*.local.ini
