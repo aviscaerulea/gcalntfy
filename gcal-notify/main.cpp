@@ -30,6 +30,7 @@
 #include <winrt/Windows.UI.Notifications.h>
 
 #include <windows.h>
+#undef GetObject  // GDI マクロを解除（winrt::IJsonValue::GetObject と競合するため）
 #include <winhttp.h>
 #include <shlwapi.h>
 #include <shobjidl_core.h>
@@ -64,10 +65,6 @@ struct CalendarEvent {
 struct ParseResult {
     std::vector<CalendarEvent> events;
     std::string errorMsg;
-};
-
-struct SoundThreadParams {
-    std::wstring exeDir;
 };
 
 // ==================== ユーティリティ ====================
@@ -239,12 +236,17 @@ static void writeStderr(HANDLE hStderr, std::string_view msg) {
 // WinHTTP で HTTPS POST しレスポンスボディを返す
 // GAS Web App は POST を受け取って処理後に 302 リダイレクトを返す。
 // WinHTTP は 302 で POST→GET に変換するが、GAS の仕様上リダイレクト先は GET で取得するため正常動作する。
-static std::string httpPost(const std::wstring& url, const std::string& jsonBody) {
+// outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む（失敗時は 0）
+static std::string httpPost(const std::wstring& url, const std::string& jsonBody,
+    DWORD* outStatusCode = nullptr) {
+    if (outStatusCode) *outStatusCode = 0;
     HINTERNET hSession = WinHttpOpen(L"gcal-notify/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
+    // 接続 15秒、送受信 30秒
+    WinHttpSetTimeouts(hSession, 0, 15000, 30000, 30000);
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
@@ -274,12 +276,24 @@ static std::string httpPost(const std::wstring& url, const std::string& jsonBody
         return "";
     }
 
-    auto* bodyData = reinterpret_cast<LPVOID>(const_cast<char*>(jsonBody.c_str()));
+    auto* bodyData = static_cast<LPVOID>(const_cast<char*>(jsonBody.c_str()));
     auto  bodyLen  = static_cast<DWORD>(jsonBody.size());
     bool ok = WinHttpSendRequest(hRequest,
         L"Content-Type: application/json\r\n", -1L,
         bodyData, bodyLen, bodyLen, 0) && WinHttpReceiveResponse(hRequest, nullptr);
     if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (outStatusCode) *outStatusCode = statusCode;
+    if (statusCode != 200) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
@@ -320,8 +334,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 
         auto arr = obj.GetNamedArray(L"calendar");
         for (auto item : arr) {
-            // GetObject() は Win32 GDI マクロに展開されるため Stringify→Parse で回避
-            auto ev = winrt::Windows::Data::Json::JsonObject::Parse(item.Stringify());
+            auto ev = item.GetObject();
             CalendarEvent e;
             e.datetime = winrt::to_string(ev.GetNamedString(L"datetime", L""));
             e.content  = winrt::to_string(ev.GetNamedString(L"content", L""));
@@ -347,13 +360,11 @@ static const CalendarEvent* findNextEvent(
 
 // ==================== 通知音再生 ====================
 
-// ffplay で通知音を再生するスレッド関数
+// ffplay で通知音を起動する
 // gcal-notify.local.opus がある場合はファイルパス直接指定、なければ埋め込みリソースを stdin パイプで渡す
 // ffplay が未インストールの場合は何もしない（Toast 通知は表示される）
-static DWORD WINAPI soundThread(LPVOID param) {
-    auto* p = reinterpret_cast<SoundThreadParams*>(param);
-
-    std::wstring localOpus = p->exeDir + L"\\gcal-notify.local.opus";
+static void launchSound(const std::wstring& exeDir) {
+    std::wstring localOpus = exeDir + L"\\gcal-notify.local.opus";
     bool useLocal = (GetFileAttributesW(localOpus.c_str()) != INVALID_FILE_ATTRIBUTES);
 
     STARTUPINFOW si = {};
@@ -370,24 +381,24 @@ static DWORD WINAPI soundThread(LPVOID param) {
         si.hStdInput = INVALID_HANDLE_VALUE;
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
             FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            return 0;
+            return;
         }
     } else {
         // 埋め込みリソースから opus データを stdin パイプ経由で ffplay に渡す
         HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_NOTIFY_OPUS), (LPCWSTR)RT_RCDATA);
-        if (!hRes) return 0;
+        if (!hRes) return;
         HGLOBAL hGlobal = LoadResource(nullptr, hRes);
-        if (!hGlobal) return 0;
+        if (!hGlobal) return;
         DWORD size       = SizeofResource(nullptr, hRes);
         const void* data = LockResource(hGlobal);
-        if (!data || size == 0) return 0;
+        if (!data || size == 0) return;
 
         SECURITY_ATTRIBUTES sa = {};
         sa.nLength        = sizeof(sa);
         sa.bInheritHandle = TRUE;
 
         HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
-        if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return 0;
+        if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
         // 書き込み側は子プロセスに継承しない
         SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
 
@@ -397,7 +408,7 @@ static DWORD WINAPI soundThread(LPVOID param) {
             TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             CloseHandle(hReadPipe);
             CloseHandle(hWritePipe);
-            return 0;
+            return;
         }
 
         // 読み取り側は子プロセスに継承済みなので親側は閉じる
@@ -408,10 +419,9 @@ static DWORD WINAPI soundThread(LPVOID param) {
         CloseHandle(hWritePipe); // EOF 送信
     }
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    // ffplay は独立プロセスとして継続するため待機しない
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return 0;
 }
 
 // ==================== ショートカット ====================
@@ -452,8 +462,8 @@ static void ensureShortcut() {
 // ==================== Toast 通知 ====================
 
 // Toast 通知を表示する
-// Dismissed / Activated / Failed のいずれかのイベントが発火すると hEvent をシグナル状態にする
-static void showToast(const std::wstring& timeJST, const std::wstring& title, HANDLE hEvent, HANDLE hStderr) {
+// OS に通知を登録して即 return する（コールバック待機なし）
+static void showToast(const std::wstring& timeJST, const std::wstring& title) {
     std::wstring xml =
         L"<toast>"
         L"<visual><binding template=\"ToastGeneric\">"
@@ -468,16 +478,6 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title, HA
     auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager
         ::CreateToastNotifier(APP_AUMID);
     auto notification = winrt::Windows::UI::Notifications::ToastNotification(doc);
-
-    notification.Dismissed([hEvent](auto&&, auto&&) { SetEvent(hEvent); });
-    notification.Activated([hEvent](auto&&, auto&&) { SetEvent(hEvent); });
-    notification.Failed([hEvent, hStderr](auto&&, auto&& args) {
-        auto code = args.ErrorCode();
-        char buf[64];
-        sprintf_s(buf, "gcal-notify: toast failed (0x%08X)", static_cast<unsigned>(code.value));
-        writeStderr(hStderr, buf);
-        SetEvent(hEvent);
-    });
 
     notifier.Show(notification);
 }
@@ -541,9 +541,12 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
             + escapeJson(wideToUtf8(dateTimeJST)) + "\",\"media\":\"calendar\"}";
 
         // (4) HTTP POST
-        auto body = httpPost(apiUrl, jsonBody);
+        DWORD httpStatus = 0;
+        auto body = httpPost(apiUrl, jsonBody, &httpStatus);
         if (body.empty()) {
-            writeStderr(hStderr, "gcal-notify: HTTP request failed");
+            char errMsg[64] = "gcal-notify: HTTP request failed";
+            if (httpStatus != 0) sprintf_s(errMsg, "gcal-notify: HTTP request failed (status %lu)", httpStatus);
+            writeStderr(hStderr, errMsg);
             return 2;
         }
 
@@ -570,22 +573,11 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
         auto jstTime = utcToJstHHMM(next->datetime);
         auto title   = toWide(next->content);
 
-        // (8) 通知音再生スレッド起動（ffplay 未インストールでも Toast は表示される）
-        SoundThreadParams soundParams = { exeDir };
-        HANDLE hSoundThread = CreateThread(nullptr, 0, soundThread, &soundParams, 0, nullptr);
+        // (8) 通知音起動（ffplay 未インストールでも Toast は表示される）
+        launchSound(exeDir);
 
-        // (9) Toast 通知表示（イベント発火で hToastEvent をセット）
-        HANDLE hToastEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!hToastEvent) {
-            writeStderr(hStderr, "gcal-notify: CreateEvent failed");
-            return 2;
-        }
-        showToast(jstTime, title, hToastEvent, hStderr);
-
-        // (10) Toast 完了を待機（音声再生はプロセス終了時に自動停止）
-        WaitForSingleObject(hToastEvent, INFINITE);
-        CloseHandle(hToastEvent);
-        if (hSoundThread) CloseHandle(hSoundThread);
+        // (9) Toast 通知表示（OS に登録後即 return、プロセス終了後も OS が管理して表示）
+        showToast(jstTime, title);
 
     } catch (...) {
         writeStderr(hStderr, "gcal-notify: unexpected error");
