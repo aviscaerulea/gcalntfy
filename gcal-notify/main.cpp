@@ -18,7 +18,7 @@
  * 外部依存: ffplay (PATH 上に存在すること、未インストールでも Toast 通知は表示される)
  * ビルド: rc /nologo resource.rc
  *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcal-notify.exe main.cpp resource.res
- *             /link /SUBSYSTEM:WINDOWS windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
+ *             /link /SUBSYSTEM:CONSOLE windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
  */
 
 // C++/WinRT ヘッダは windows.h より先にインクルードする
@@ -215,17 +215,9 @@ static std::string escapeJson(const std::string& s) {
 
 // ==================== stderr 出力 ====================
 
-// 親プロセスのコンソールにアタッチ試行（プロセスにつき 1 回）
-// コンソールなし環境（タスクスケジューラ等）では失敗して INVALID_HANDLE_VALUE を返す
-static HANDLE initStderr() {
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return INVALID_HANDLE_VALUE;
-    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-    return (h == INVALID_HANDLE_VALUE) ? INVALID_HANDLE_VALUE : h;
-}
-
 // stderr にメッセージを出力する（末尾に改行を付加）
 static void writeStderr(HANDLE hStderr, std::string_view msg) {
-    if (hStderr == INVALID_HANDLE_VALUE) return;
+    if (hStderr == INVALID_HANDLE_VALUE || hStderr == nullptr) return;
     DWORD written;
     WriteFile(hStderr, msg.data(), static_cast<DWORD>(msg.size()), &written, nullptr);
     WriteFile(hStderr, "\n", 1, &written, nullptr);
@@ -484,8 +476,8 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title) {
 
 // ==================== エントリポイント ====================
 
-int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
-    HANDLE hStderr = initStderr();
+int wmain(int argc, wchar_t* argv[]) {
+    HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
     try {
@@ -511,8 +503,15 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
         std::wstring dateTimeJST;
         std::string nowUtc;
 
+        // argv[1..] を空白区切りで結合してコマンドライン文字列を構築
+        std::wstring cmdLine;
+        for (int i = 1; i < argc; ++i) {
+            if (i > 1) cmdLine += L' ';
+            cmdLine += argv[i];
+        }
+
         int y = 0, mo = 0, d = 0, h = 0, mi = 0;
-        if (lpCmdLine[0] && swscanf_s(lpCmdLine, L"%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5
+        if (!cmdLine.empty() && swscanf_s(cmdLine.c_str(), L"%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5
             && y >= 2000 && y <= 9999 && mo >= 1 && mo <= 12
             && d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
             wchar_t buf[32];

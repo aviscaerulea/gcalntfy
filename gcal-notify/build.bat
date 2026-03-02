@@ -20,7 +20,7 @@ if errorlevel 1 (
 
 echo [2/2] C++ compile + link...
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcal-notify.exe main.cpp resource.res ^
-    /link /SUBSYSTEM:WINDOWS ^
+    /link /SUBSYSTEM:CONSOLE ^
     windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
 if errorlevel 1 (
     echo ERROR: cl.exe failed
