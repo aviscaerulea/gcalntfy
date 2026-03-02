@@ -43,14 +43,25 @@ const MEDIA_GETTERS = {
 /**
  * アクティビティを取得し datetime 昇順でソートして返す
  *
+ * fields が指定された場合は getter に渡す（getter が対応している場合のみスキップ最適化が有効）。
+ * ソート後に指定フィールドのみ抽出して返す。getter は datetime を常に返す必要がある。
+ *
  * @param {Function} getter - アクティビティ取得関数
  * @param {string} dateStr - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式の日付
+ * @param {string[]|null} fields - 返却するフィールド名の配列。null なら全フィールド
  * @returns {Array} datetime 昇順でソート済みのアクティビティ配列
  */
-function fetchSorted(getter, dateStr) {
-    const activities = getter(dateStr);
+function fetchSorted(getter, dateStr, fields) {
+    const activities = getter(dateStr, fields);
     activities.sort((a, b) => a.datetime.localeCompare(b.datetime));
-    return activities;
+    if (!fields) return activities;
+    return activities.map(a => {
+        const obj = {};
+        for (const f of fields) {
+            if (f in a) obj[f] = a[f];
+        }
+        return obj;
+    });
 }
 
 /**
@@ -186,6 +197,9 @@ function doPost(e) {
 
 /**
  * アクティビティ取得処理（chat / calendar / mail / drive / all）
+ *
+ * fields パラメータが指定された場合は指定フィールドのみ返す（後方互換: 省略時は全フィールド）。
+ * media=all の場合は fields を無視して常にフル取得する。
  */
 function handleActivityFetch(body, media) {
     const dateStr = body.date;
@@ -205,7 +219,8 @@ function handleActivityFetch(body, media) {
         return createErrorResponse("不正な media 値: " + media + "（chat / calendar / mail / drive / all / member のいずれかを指定）");
     }
 
-    return createJsonResponse({ [media]: fetchSorted(getter, dateStr) });
+    const fields = Array.isArray(body.fields) && body.fields.length > 0 ? body.fields : null;
+    return createJsonResponse({ [media]: fetchSorted(getter, dateStr, fields) });
 }
 
 /**

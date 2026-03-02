@@ -99,18 +99,32 @@ function resolveOrganizerName(event, cache) {
 /**
  * Calendar イベントからアクティビティオブジェクトを構築する
  *
+ * fields が指定された場合は必要なフィールドのみ構築し、
+ * attendees / sender が含まれない場合は高コスト API 呼び出しをスキップする。
+ *
  * @param {Object} event - Calendar Event リソース
- * @param {Map<string, string>} nameCache - 主催者の氏名解決キャッシュ（イベント間で共有）
+ * @param {Map<string, string>|null} nameCache - 主催者の氏名解決キャッシュ（fields で sender が不要なら null）
+ * @param {string[]|null} fields - 返却するフィールド名の配列。null なら全フィールド
  * @returns {Object} アクティビティオブジェクト
  */
-function buildCalendarActivity(event, nameCache) {
-    return {
-        datetime: resolveEventDatetime(event),
-        content: event.summary || "",
-        sender: resolveOrganizerName(event, nameCache),
-        permalink: event.htmlLink || "",
-        attendees: resolveAttendees(event.attendees || [])
-    };
+function buildCalendarActivity(event, nameCache, fields) {
+    if (!fields) {
+        return {
+            datetime: resolveEventDatetime(event),
+            content: event.summary || "",
+            sender: resolveOrganizerName(event, nameCache),
+            permalink: event.htmlLink || "",
+            attendees: resolveAttendees(event.attendees || [])
+        };
+    }
+    // fields 指定時は要求されたフィールドのみ構築（高コスト処理スキップ）
+    // datetime はソートに必要なため常に含める（fetchSorted の最終フィルタで除外）
+    const obj = { datetime: resolveEventDatetime(event) };
+    if (fields.includes("content"))   obj.content   = event.summary || "";
+    if (fields.includes("sender"))    obj.sender    = resolveOrganizerName(event, nameCache);
+    if (fields.includes("permalink")) obj.permalink = event.htmlLink || "";
+    if (fields.includes("attendees")) obj.attendees = resolveAttendees(event.attendees || []);
+    return obj;
 }
 
 /**
@@ -131,12 +145,13 @@ function debugGetCalendarActivities() {
  * タスク・不在・勤務場所・サイレントモードのイベントタイプはクライアント側で除外する。
  * 欠席した予定（attendees の自分の responseStatus が "declined"）も除外する。
  * 繰り返しイベントは singleEvents=true により個別に展開して取得する。
- * 主催者の氏名解決キャッシュはイベント間で共有する。
+ * fields に sender / attendees が含まれない場合、People API 呼び出しをスキップする。
  *
  * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @param {string[]|null} fields - 返却するフィールド名の配列。null なら全フィールド
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
-function getCalendarActivities(dateStr) {
+function getCalendarActivities(dateStr, fields) {
     const range = getDateRange(dateStr);
     if (!range) throw new Error("無効な日付形式: " + dateStr);
 
@@ -151,7 +166,8 @@ function getCalendarActivities(dateStr) {
     });
     console.log(`フィルタ後: ${filtered.length} 件（${events.length - filtered.length} 件除外）`);
 
-    // 主催者の氏名解決キャッシュをイベント間で共有して重複 API 呼び出しを防ぐ
-    const nameCache = new Map();
-    return filtered.map(event => buildCalendarActivity(event, nameCache));
+    // fields に sender が含まれる場合のみ氏名解決キャッシュを生成（高コスト API スキップ）
+    const needNames = !fields || fields.includes("sender");
+    const nameCache = needNames ? new Map() : null;
+    return filtered.map(event => buildCalendarActivity(event, nameCache, fields));
 }
