@@ -106,7 +106,9 @@ function lookupName(email) {
  */
 function resolveEmail(email, displayName, cache) {
     if (cache.has(email)) return cache.get(email);
-    const name = lookupName(email) ?? displayName ?? email;
+    const raw = lookupName(email) ?? displayName ?? email;
+    // 全角スペースを半角スペースに正規化してトリム
+    const name = raw.replace(/\u3000+/g, " ").trim();
     cache.set(email, name);
     return name;
 }
@@ -200,9 +202,9 @@ function resolveAttendees(attendees) {
         }
     }
 
-    // 氏名解決（キャッシュで重複 API 呼び出しを防ぐ）
+    // 氏名解決（キャッシュで重複 API 呼び出しを防ぐ）、空文字は除外
     const cache = new Map();
-    return [...emailToDisplayName.entries()].map(
-        ([email, dn]) => resolveEmail(email, dn, cache)
-    );
+    return [...emailToDisplayName.entries()]
+        .map(([email, dn]) => resolveEmail(email, dn, cache))
+        .filter(Boolean);
 }
