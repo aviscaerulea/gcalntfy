@@ -486,6 +486,7 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title, HA
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
     HANDLE hStderr = initStderr();
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
     try {
         winrt::init_apartment();
@@ -546,6 +547,13 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
             return 2;
         }
 
+        // JSON レスポンスを stdout に出力
+        if (hStdout != INVALID_HANDLE_VALUE && hStdout != nullptr) {
+            DWORD written;
+            WriteFile(hStdout, body.c_str(), static_cast<DWORD>(body.size()), &written, nullptr);
+            WriteFile(hStdout, "\n", 1, &written, nullptr);
+        }
+
         // (5) JSON パース → Calendar イベント配列
         auto [events, errorMsg] = parseCalendarEvents(body);
         if (!errorMsg.empty()) {
@@ -574,15 +582,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
         }
         showToast(jstTime, title, hToastEvent, hStderr);
 
-        // (10) Toast 完了と音再生完了の両方を待機
-        if (hSoundThread) {
-            HANDLE handles[2] = { hToastEvent, hSoundThread };
-            WaitForMultipleObjects(2, handles, TRUE, INFINITE);
-            CloseHandle(hSoundThread);
-        } else {
-            WaitForSingleObject(hToastEvent, INFINITE);
-        }
+        // (10) Toast 完了を待機（音声再生はプロセス終了時に自動停止）
+        WaitForSingleObject(hToastEvent, INFINITE);
         CloseHandle(hToastEvent);
+        if (hSoundThread) CloseHandle(hSoundThread);
 
     } catch (...) {
         writeStderr(hStderr, "gcal-notify: unexpected error");
