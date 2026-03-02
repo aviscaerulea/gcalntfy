@@ -14,24 +14,41 @@ Google Chat のメッセージ・ Google Calendar のイベント・ Gmail の�
 - Calendar イベントの参加者、Gmail メールの宛先を氏名解決して取得
 - 指定日に自分が作成・更新した Google Drive ファイルのメタデータを収集（マイドライブ・共有ドライブ対象）
 - 全メディアをまとめて取得する `media=all` をサポート
-- HTTP GET で取得できる Web API として公開
+- メールアドレス→氏名変換とグループ展開を行う `media=member` をサポート
+- POST + トークン認証の Web API として公開
 
 ## 使い方
 
-メディア種別（`media`）を必須パラメータとして指定する。個別取得と全体取得の両方に対応。
+すべての機能は POST メソッドで提供する。`token` と `media` は必須。
 
 ```bash
+BASE="https://script.google.com/macros/s/{DEPLOY_ID}/exec"
+
 # 個別取得
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=chat"
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=calendar"
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=mail"
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=drive"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"chat"}' "$BASE"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"calendar"}' "$BASE"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"mail"}' "$BASE"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"drive"}' "$BASE"
 
 # 全メディアまとめて取得
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27&media=all"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"all"}' "$BASE"
 
 # 時刻指定（16:00 以降のみ）
-curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3A00&media=chat"
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27 16:00","media":"chat"}' "$BASE"
+
+# 氏名解決（グループ展開なし）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","media":"member","emails":["a@example.com","group@example.com"]}' "$BASE"
+
+# 氏名解決（グループ展開人数の上限指定）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","media":"member","emails":["group@example.com"],"expandLimit":20}' "$BASE"
 ```
 
 ## レスポンス形式
@@ -70,9 +87,26 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 }
 ```
 
+### 氏名解決（media=member）
+
+```json
+{
+  "member": {
+    "a@example.com": "山田太郎",
+    "smallgroup@example.com": { "_expanded": true, "members": ["田中花子", "佐藤一郎"] },
+    "biggroup@example.com": "全社メーリングリスト"
+  }
+}
+```
+
+- 個人アドレス：氏名文字列
+- グループ（`expandLimit` 以内）：`{ _expanded: true, members: [氏名, ...] }`
+- グループ（`expandLimit` 超過）：グループ表示名の文字列
+
 各メディアのフィールド定義:
 
-**calendar:**
+#### calendar
+
 ```json
 {
   "datetime": "2026-02-27T10:00:00.000Z",
@@ -83,7 +117,8 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 }
 ```
 
-**mail:**
+#### mail
+
 ```json
 {
   "datetime": "2026-02-27T11:30:00.000Z",
@@ -101,7 +136,8 @@ curl "https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=2026-02-27%2016%3
 }
 ```
 
-**drive:**
+#### drive
+
 ```json
 {
   "datetime": "2026-02-27T10:30:00.000Z",
@@ -135,6 +171,16 @@ pnpx @google/clasp push
 # 3. Web App としてデプロイ
 pnpx @google/clasp deploy --description "v1.0.0"
 ```
+
+### API トークンの設定
+
+デプロイ後、GAS エディタで `setupApiToken` 関数を実行して API トークンを設定する。
+
+1. `src/main.js` の `setupApiToken` 関数内の `token` 変数を任意の秘密文字列に変更してから push
+2. GAS エディタで `setupApiToken` を選択して実行
+3. Script Properties に `API_TOKEN` が保存されたことを確認
+
+設定した文字列をリクエストの `token` フィールドで送信する。
 
 ### GCP API 有効化
 

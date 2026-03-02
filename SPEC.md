@@ -5,29 +5,47 @@
 
 ## エンドポイント
 
-GAS Web App として公開。`executeAs: USER_ACCESSING` でアクセス者自身の権限で実行する。
+GAS Web App として公開。`executeAs: USER_DEPLOYING` でデプロイ者の権限で実行する。
+すべての機能は POST メソッドで提供し、POST ボディの `token` フィールドで認証する。
+GET リクエストは使い方案内のみ返す。
 
 ```
-GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=chat
-GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=calendar
-GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=mail
-GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=drive
-GET https://script.google.com/macros/s/{DEPLOY_ID}/exec?date=YYYY-MM-DD&media=all
+POST https://script.google.com/macros/s/{DEPLOY_ID}/exec
+Content-Type: application/json
 ```
 
-### クエリパラメータ
+### POST ボディの共通フォーマット
+
+```json
+{
+  "token": "YOUR_SECRET",
+  "media": "chat | calendar | mail | drive | all | member",
+  ...メディア固有パラメータ
+}
+```
+
+### パラメータ
 
 | パラメータ | 必須 | 説明 |
 |---|---|---|
-| `date` | 必須 | 取得対象日時（JST 基準）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
-| `media` | 必須 | 取得対象メディア。`chat` / `calendar` / `mail` / `drive` / `all` のいずれか |
+| `token` | 必須 | API トークン。Script Properties の `API_TOKEN` と照合する |
+| `media` | 必須 | 取得対象。`chat` / `calendar` / `mail` / `drive` / `all` / `member` のいずれか |
+| `date` | media が member 以外の場合に必須 | 取得対象日時（JST 基準）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
+| `emails` | media="member" の場合に必須 | 解決するメールアドレスの配列 |
+| `expandLimit` | media="member" の場合に任意 | グループ展開の上限数。`0`（デフォルト）で上限なし。`N>0` で展開後人数が N を超えるグループはグループ名を返す |
 
-`media` パラメータは必須。`all` を指定すると全メディアをまとめて取得する。
-GAS の実行時間制限（ 6 分）を考慮し、全メディア同時取得（`media=all`）は個別取得より時間がかかる。
+`media=all` を指定すると全アクティビティメディアをまとめて取得する。
+GAS の実行時間制限（6 分）を考慮し、全メディア同時取得は個別取得より時間がかかる。
 
 `date` パラメータの時刻指定について:
 - `YYYY-MM-DD` のみ: JST 00:00:00 〜 翌日 00:00:00（当日全体）
 - `YYYY-MM-DD HH:MM`: JST 指定時刻 〜 翌日 00:00:00（日付は跨がない）
+
+### トークン認証
+
+初回デプロイ後、GAS エディタで `setupApiToken` 関数を実行して API トークンを Script Properties に設定する。
+設定した任意の秘密文字列を POST ボディの `token` フィールドで送信する。
+トークンは URL に露出しない POST ボディのみで送信することで、GAS Web App の制約（リクエストヘッダ不可）の中で安全なトークン送信を実現する。
 
 ## レスポンス
 
@@ -54,6 +72,20 @@ GAS の実行時間制限（ 6 分）を考慮し、全メディア同時取得�
 ```
 
 全メディアの結果をひとつの JSON で返す。各メディアの配列は datetime 昇順でソート済み。
+
+### 氏名解決成功時（media=member）
+
+```json
+{
+  "member": {
+    "a@example.com": "山田太郎",
+    "smallgroup@example.com": { "_expanded": true, "members": ["田中花子", "佐藤一郎"] },
+    "biggroup@example.com": "全社メーリングリスト"
+  }
+}
+```
+
+個人アドレスは氏名文字列を返す。グループアドレスは `expandLimit` に応じて展開結果またはグループ名を返す。
 
 ### エラー時
 
@@ -165,6 +197,25 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | `mimeType` | ファイルの MIME タイプ |
 | `isNew` | `true`: 対象日に自分が作成、`false`: 既存ファイルの更新 |
 
+### Member（氏名解決）
+
+```json
+{
+  "member": {
+    "a@example.com": "山田太郎",
+    "smallgroup@example.com": { "_expanded": true, "members": ["田中花子", "佐藤一郎"] },
+    "biggroup@example.com": "全社メーリングリスト"
+  }
+}
+```
+
+| フィールド | 説明 |
+|---|---|
+| キー | 入力メールアドレス（リクエストの `emails` 配列の各要素） |
+| 値（個人） | 氏名文字列（解決不可の場合はメールアドレスをそのまま返す） |
+| 値（グループ・展開） | `{ _expanded: true, members: ["氏名", ...] }`（`expandLimit` 内に収まる場合） |
+| 値（グループ・上限超過） | グループ表示名の文字列（`expandLimit` を超える場合） |
+
 ## 実装詳細
 
 ### 対応メディア
@@ -175,6 +226,7 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 | Google Calendar | 実装済み | プライマリカレンダー対象 |
 | Gmail | 実装済み | 送信メール（ SENT ラベル相当）対象 |
 | Google Drive | 実装済み | マイドライブ・共有ドライブ対象 |
+| 氏名解決（member） | 実装済み | メールアドレス→氏名変換、グループ展開対応 |
 
 ### Chat アクティビティ取得の仕様
 
@@ -236,7 +288,9 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 
 #### 必要な GAS 設定
 
-**認証方式:** UrlFetchApp + `ScriptApp.getOAuthToken()`（ Advanced Service 不使用）
+##### 認証方式
+
+UrlFetchApp + `ScriptApp.getOAuthToken()`（ Advanced Service 不使用）
 
 #### OAuth スコープ
 
@@ -256,12 +310,12 @@ GAS Web App では HTTP ステータスコードを制御できないため、�
 ```
 src/
 ├── appsscript.json   GAS マニフェスト
-├── main.js           Web App エントリポイント（doGet）
+├── main.js           Web App エントリポイント（doPost / doGet）
 ├── chat.js           Chat アクティビティ取得モジュール
 ├── calendar.js       Calendar アクティビティ取得モジュール
 ├── gmail.js          Gmail アクティビティ取得モジュール
 ├── drive.js          Drive アクティビティ取得モジュール
-├── members.js        参加者・宛先の氏名解決モジュール
+├── members.js        参加者・宛先の氏名解決モジュール（外部 API 用 resolveEmailForApi 含む）
 ├── config.js         定数定義
 └── util.js           共通ユーティリティ
 ```
