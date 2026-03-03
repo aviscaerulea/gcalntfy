@@ -227,14 +227,40 @@ static std::string escapeJson(const std::string& s) {
     return r;
 }
 
-// ==================== stderr 出力 ====================
+// ==================== ログ出力 ====================
 
-// stderr にメッセージを出力する（末尾に改行を付加）
-static void writeStderr(HANDLE hStderr, std::string_view msg) {
-    if (hStderr == INVALID_HANDLE_VALUE || hStderr == nullptr) return;
+// ログディレクトリパス（初期化後に設定）
+static std::wstring g_logDir;
+
+// ログファイルに追記する
+// g_logDir\YYYY-MM-DD.log に "YYYY-MM-DD HH:mm:ss msg\n" を書き込む
+static void writeLog(const std::string& msg) {
+    if (g_logDir.empty()) return;
+
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    st = utcToJst(st);
+
+    // 日付部分（ファイル名とタイムスタンプ共通）
+    char dateBuf[12];
+    sprintf_s(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+
+    std::wstring path = g_logDir + L"\\" + toWide(dateBuf) + L".log";
+    // FILE_APPEND_DATA でアトミックな末尾追記を保証する（SetFilePointer 不要）
+    // FILE_SHARE_WRITE で再起動の一瞬だけ旧・新プロセスが並走しても SHARING_VIOLATION を防ぐ
+    HANDLE hFile = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    char tsBuf[24];
+    sprintf_s(tsBuf, sizeof(tsBuf), "%s %02d:%02d:%02d",
+        dateBuf, st.wHour, st.wMinute, st.wSecond);
+
+    std::string line = std::string(tsBuf) + " " + msg + "\n";
     DWORD written;
-    WriteFile(hStderr, msg.data(), static_cast<DWORD>(msg.size()), &written, nullptr);
-    WriteFile(hStderr, "\n", 1, &written, nullptr);
+    WriteFile(hFile, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(hFile);
 }
 
 // ==================== HTTP ====================
@@ -375,8 +401,7 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
         return toml::parse_file(path);
     }
     catch (const toml::parse_error& e) {
-        HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
-        writeStderr(hStderr, "gcalntfy: TOML parse error in " + wideToUtf8(path)
+        writeLog("TOML parse error in " + wideToUtf8(path)
             + ": " + std::string(e.description()));
         return std::nullopt;
     }
@@ -586,14 +611,17 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title) {
 // ==================== エントリポイント ====================
 
 int wmain() {
-    HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
+    // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
+    auto exeDir = getExeDir();
+    g_logDir = exeDir + L"\\logs";
+    CreateDirectoryW(g_logDir.c_str(), nullptr);
 
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスと関連子プロセス（ffplay）をまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
     HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
-        writeStderr(hStderr, "gcalntfy: terminating previous instance");
+        writeLog("terminating previous instance");
         TerminateJobObject(hJob, 0);
         CloseHandle(hJob);
         // カーネルが Job Object 名を解放するまで待機
@@ -601,7 +629,7 @@ int wmain() {
         hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
         // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
         if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
-            writeStderr(hStderr, "gcalntfy: warning: previous instance still alive");
+            writeLog("warning: previous instance still alive");
             CloseHandle(hJob);
             hJob = nullptr;
         }
@@ -610,30 +638,30 @@ int wmain() {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
-            writeStderr(hStderr, "gcalntfy: warning: failed to set job object limits");
+            writeLog("warning: failed to set job object limits");
         }
         if (!AssignProcessToJobObject(hJob, GetCurrentProcess())) {
-            writeStderr(hStderr, "gcalntfy: warning: failed to assign to job object");
+            writeLog("warning: failed to assign to job object");
         }
     }
     else {
-        writeStderr(hStderr, "gcalntfy: warning: failed to create job object");
+        writeLog("warning: failed to create job object");
     }
 
     try {
         winrt::init_apartment();
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
         ensureShortcut();
+        writeLog("started");
 
-        auto exeDir = getExeDir();
-        auto cfg    = loadConfig(exeDir);
+        auto cfg = loadConfig(exeDir);
 
         if (cfg.apiUrl.empty()) {
-            writeStderr(hStderr, "gcalntfy: api_url is not set in gcalntfy.toml");
+            writeLog("api_url is not set in gcalntfy.toml");
             return 1;
         }
         if (cfg.apiToken.empty()) {
-            writeStderr(hStderr, "gcalntfy: api_token is not set in gcalntfy.toml");
+            writeLog("api_token is not set in gcalntfy.toml");
             return 1;
         }
 
@@ -678,18 +706,19 @@ int wmain() {
                 if (body.empty()) {
                     std::string err = "HTTP request failed";
                     if (httpStatus != 0) {
-                        char buf[64];
-                        sprintf_s(buf, "HTTP request failed (status %lu)", httpStatus);
-                        err = buf;
+                        err += " (status " + std::to_string(httpStatus) + ")";
                     }
-                    writeStderr(hStderr, "gcalntfy: " + err);
+                    writeLog(err);
                     Sleep(RETRY_WAIT_MS);
                     continue;
                 }
 
                 auto [events, errorMsg] = parseCalendarEvents(body);
                 if (!errorMsg.empty()) {
-                    writeStderr(hStderr, "gcalntfy: " + errorMsg);
+                    writeLog(errorMsg);
+                }
+                else {
+                    writeLog("poll: " + std::to_string(events.size()) + " events");
                 }
 
                 // 次のイベント検索 → 通知判定
@@ -700,6 +729,9 @@ int wmain() {
                     std::string eventKey = next->datetime + "|" + next->content;
                     long long diffMs = calcDiffMs(next->datetime, nowUtc);
                     bool alreadyNotified = notifiedSet.count(eventKey) > 0;
+                    auto jstTime = wideToUtf8(utcToJstHHMM(next->datetime));
+                    writeLog("next: " + jstTime + " " + next->content
+                        + " (" + std::to_string(diffMs) + "ms ahead)");
 
                     if (diffMs <= 0) {
                         // 既に開始済み
@@ -711,6 +743,7 @@ int wmain() {
                             Sleep(static_cast<DWORD>(diffMs - NOTIFY_LEAD_MS));
                         }
                         notifiedSet.insert(eventKey);
+                        writeLog("notify: " + jstTime + " " + next->content);
                         launchSound(exeDir);
                         showToast(utcToJstHHMM(next->datetime), toWide(next->content));
                         sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
@@ -720,13 +753,13 @@ int wmain() {
                 Sleep(sleepMs);
             }
             catch (...) {
-                writeStderr(hStderr, "gcalntfy: unexpected error in polling loop");
+                writeLog("unexpected error in polling loop");
                 Sleep(RETRY_WAIT_MS);
             }
         }
     }
     catch (...) {
-        writeStderr(hStderr, "gcalntfy: unexpected initialization error");
+        writeLog("unexpected initialization error");
         return 2;
     }
 
