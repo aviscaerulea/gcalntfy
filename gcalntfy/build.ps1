@@ -2,14 +2,15 @@
 # gcalntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
 
-# VS 開発環境の初期化（DevShell モジュール経由）
-$vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-if (-not $vsPath) {
-    Write-Error 'Visual Studio not found'
-    exit 1
-}
-Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
-Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -Arch amd64 -HostArch amd64 *> $null
+# VS 開発環境の初期化（DevShell モジュール経由、Build Tools 対応）
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsPath = & $vswhere -products '*' -latest -property installationPath
+if (-not $vsPath) { Write-Error "Visual Studio / Build Tools が見つからない"; exit 1 }
+
+$devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+if (-not (Test-Path $devShellDll)) { Write-Error "DevShell.dll が見つからない: $devShellDll"; exit 1 }
+Import-Module $devShellDll
+Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
 rc /nologo /fo out\resource.res src\resource.rc
 if ($LASTEXITCODE) { exit 1 }
