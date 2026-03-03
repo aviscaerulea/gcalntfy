@@ -477,66 +477,99 @@ static long long calcDiffMs(const std::string& isoTarget, const std::string& iso
 
 // ==================== 通知音再生 ====================
 
+// 埋め込みリソースのデータポインタとサイズを返す（ロード失敗時は nullptr）
+static const void* loadResource(int id, DWORD& outSize) {
+    HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(id), (LPCWSTR)RT_RCDATA);
+    if (!hRes) return nullptr;
+    HGLOBAL hGlobal = LoadResource(nullptr, hRes);
+    if (!hGlobal) return nullptr;
+    outSize = SizeofResource(nullptr, hRes);
+    return LockResource(hGlobal);
+}
+
 // ffplay で通知音を起動する
-// gcalntfy.local.opus がある場合はファイルパス直接指定、なければ埋め込みリソースを stdin パイプで渡す
-// ffplay が未インストールの場合は何もしない（Toast 通知は表示される）
-// BLE ヘッドホン対処: adelay=1000:all=1 で冒頭 1 秒の無音を追加し、接続遅延による冒頭切れを防ぐ
+//
+// 再生フロー（埋め込み・ローカル共通）:
+//   adelay=1000（1秒無音） → intro.opus（チャイム） → 本体音声
+// Ogg チェイニングにより intro + 本体をバイト連結して stdin パイプで渡す。
+// intro ロード失敗時はチャイムなしで本体のみ再生（グレースフルデグレード）。
+// ローカルファイル読み込み失敗時は埋め込みリソースにフォールバック。
+// ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
+// BLE ヘッドホン対処: adelay=1000:all=1 で冒頭 1 秒の無音を追加し、接続遅延による冒頭切れを防ぐ。
+// 注意: Ogg チェイニングはチャネル数が同一の場合のみ正常再生できる。
+//       intro.opus・gcalntfy.opus は 1ch モノ。ユーザ提供 gcalntfy.local.opus も 1ch を推奨。
 static void launchSound(const std::wstring& exeDir) {
+    // intro リソースをロード（失敗時は nullptr のまま続行）
+    DWORD introSize = 0;
+    const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
+
+    // 埋め込み本体音声をロード
+    DWORD notifySize = 0;
+    const void* notifyData = loadResource(IDR_NOTIFY_OPUS, notifySize);
+    if (!notifyData || notifySize == 0) return;
+
+    // ローカルファイルの存在確認
     std::wstring localOpus = exeDir + L"\\gcalntfy.local.opus";
     bool useLocal = (GetFileAttributesW(localOpus.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    // パイプ作成
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
+    // 書き込み側は子プロセスに継承しない
+    SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si = {};
     si.cb         = sizeof(si);
     si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdOutput = INVALID_HANDLE_VALUE;
-    si.hStdError  = INVALID_HANDLE_VALUE;
+    si.hStdInput  = hReadPipe;
+    si.hStdOutput = nullptr;
+    si.hStdError  = nullptr;
 
     PROCESS_INFORMATION pi = {};
-
-    if (useLocal) {
-        // ローカルファイルをパス直接指定で ffplay に渡す
-        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 \"" + localOpus + L"\"";
-        si.hStdInput = INVALID_HANDLE_VALUE;
-        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-            FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            return;
-        }
-    }
-    else {
-        // 埋め込みリソースから opus データを stdin パイプ経由で ffplay に渡す
-        HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_NOTIFY_OPUS), (LPCWSTR)RT_RCDATA);
-        if (!hRes) return;
-        HGLOBAL hGlobal = LoadResource(nullptr, hRes);
-        if (!hGlobal) return;
-        DWORD size       = SizeofResource(nullptr, hRes);
-        const void* data = LockResource(hGlobal);
-        if (!data || size == 0) return;
-
-        SECURITY_ATTRIBUTES sa = {};
-        sa.nLength        = sizeof(sa);
-        sa.bInheritHandle = TRUE;
-
-        HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
-        if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
-        // 書き込み側は子プロセスに継承しない
-        SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
-
-        si.hStdInput = hReadPipe;
-        std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 -i pipe:0";
-        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-            TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(hReadPipe);
-            CloseHandle(hWritePipe);
-            return;
-        }
-
-        // 読み取り側は子プロセスに継承済みなので親側は閉じる
+    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 -i pipe:0";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+        TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        writeLog("launchSound: CreateProcessW failed: " + std::to_string(GetLastError()));
         CloseHandle(hReadPipe);
-
-        DWORD written = 0;
-        WriteFile(hWritePipe, data, size, &written, nullptr);
-        CloseHandle(hWritePipe); // EOF 送信
+        CloseHandle(hWritePipe);
+        return;
     }
+
+    // 読み取り側は子プロセスに継承済みなので親側は閉じる
+    CloseHandle(hReadPipe);
+
+    DWORD written = 0;
+
+    // intro データをパイプに書き込む（Ogg チェイニング前半）
+    if (introData && introSize > 0) {
+        WriteFile(hWritePipe, introData, introSize, &written, nullptr);
+    }
+
+    // 本体データをパイプに書き込む（Ogg チェイニング後半）
+    // ローカルファイル読み込み失敗時は埋め込みリソースにフォールバック
+    bool wroteLocal = false;
+    if (useLocal) {
+        HANDLE hFile = CreateFileW(localOpus.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            char buf[8192];
+            DWORD readBytes = 0;
+            while (ReadFile(hFile, buf, sizeof(buf), &readBytes, nullptr) && readBytes > 0) {
+                WriteFile(hWritePipe, buf, readBytes, &written, nullptr);
+            }
+            CloseHandle(hFile);
+            wroteLocal = true;
+        }
+    }
+    if (!wroteLocal) {
+        WriteFile(hWritePipe, notifyData, notifySize, &written, nullptr);
+    }
+
+    CloseHandle(hWritePipe); // EOF 送信
 
     // ffplay は独立プロセスとして継続するため待機しない
     CloseHandle(pi.hProcess);
