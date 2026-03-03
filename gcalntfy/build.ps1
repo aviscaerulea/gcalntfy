@@ -12,6 +12,23 @@ if (-not (Test-Path $devShellDll)) { Write-Error "DevShell.dll が見つから�
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
+# チャイム音 + 通知音を結合（ffmpeg がなければ通知音のみ使用）
+$chime    = "src\chime.opus"
+$notify   = "src\gcalntfy.opus"
+$combined = "out\notify.opus"
+if (-not (Test-Path $notify)) { Write-Error "notify sound not found: $notify"; exit 1 }
+$merged   = $false
+if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Test-Path $chime)) {
+    & ffmpeg -y -i $chime -i $notify `
+        -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" `
+        -c:a libopus -b:a 64k $combined
+    $merged = -not $LASTEXITCODE
+    if (-not $merged) { Write-Warning "ffmpeg concat failed, using notify sound only" }
+}
+if (-not $merged) {
+    Copy-Item $notify $combined
+}
+
 rc /nologo /fo out\resource.res src\resource.rc
 if ($LASTEXITCODE) { exit 1 }
 

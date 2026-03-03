@@ -1,6 +1,7 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
-// リソーススクリプト: gcalntfy.opus をバイナリとして埋め込む
+// リソーススクリプト: アイコンと notify.opus をバイナリとして埋め込む
 
 #include "resource.h"
 
-IDR_NOTIFY_OPUS RCDATA "gcalntfy.opus"
+IDI_APP_ICON    ICON    "..\\app.ico"
+IDR_NOTIFY_OPUS RCDATA  "..\\out\\notify.opus"

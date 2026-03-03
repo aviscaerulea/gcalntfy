@@ -7,3 +7,6 @@ gcalntfy/out/
 # gcalntfy ユーザ環境固有ファイル
 gcalntfy/*.local.toml
 gcalntfy/*.local.opus
+
+# gcalntfy チャイム素材（ソース mp3 はコミット対象外）
+gcalntfy/intro.mp3
