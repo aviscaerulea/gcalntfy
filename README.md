@@ -1,9 +1,9 @@
 ## My Google Activities
 
-指定日に自分が発信した Google Workspace 上のアクティビティを JSON で取得する GAS Web App。
-活動の振り返りや週次報告の材料収集（「誰と何をしたか」）を主な用途とする。
+Google Workspace 上のアクティビティを活用するための 2 コンポーネント構成のプロジェクト。
 
-Google Chat のメッセージ・ Google Calendar のイベント・ Gmail の送信メール・ Google Drive の更新ファイルに対応している。
+- **GAS Web App**: 指定日の Chat メッセージ・Calendar イベント・Gmail 送信メール・Drive 更新ファイルを JSON で返す REST API。活動の振り返りや週次報告の材料収集（「誰と何をしたか」）に使う
+- **gcalntfy**: GAS Web App の calendar API を定期ポーリングし、予定を 4 分前に Windows Toast 通知する常駐デーモン（Windows 用）
 
 ## 機能
 
@@ -16,6 +16,30 @@ Google Chat のメッセージ・ Google Calendar のイベント・ Gmail の�
 - 全メディアをまとめて取得する `media=all` をサポート
 - メールアドレス→氏名変換とグループ展開を行う `media=member` をサポート
 - POST + トークン認証の Web API として公開
+
+## API 一覧
+
+すべての機能は POST メソッドで提供する。エンドポイントは GAS Web App のデプロイ URL。
+
+### 共通パラメータ
+
+| パラメータ | 必須 | 説明 |
+|---|---|---|
+| `token` | 必須 | API トークン（Script Properties の `API_TOKEN` と照合） |
+| `media` | 必須 | 取得対象（下表参照） |
+| `date` | `member` 以外は必須 | 取得対象日時（JST）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
+| `fields` | 任意 | 返却するフィールド名の配列。省略時は全フィールドを返す |
+
+### media パラメータ
+
+| `media` | 機能 | 追加の必須パラメータ |
+|---|---|---|
+| `chat` | 指定日の Chat メッセージ取得（自分が発信したスペースの全メッセージ） | `date` |
+| `calendar` | 指定日のプライマリカレンダーのイベント取得 | `date` |
+| `mail` | 指定日の Gmail 送信メール取得 | `date` |
+| `drive` | 指定日のマイドライブ・共有ドライブの更新ファイル取得 | `date` |
+| `all` | 全メディアまとめて取得 | `date` |
+| `member` | メールアドレス→氏名解決・グループ展開 | `emails`（アドレス配列） |
 
 ## 使い方
 
@@ -194,7 +218,48 @@ GAS プロジェクトに紐づく Google Cloud Project で以下の API を有�
 - Gmail API
 - Google Drive API
 
+## gcalntfy
+
+GAS Web App の calendar API を定期ポーリングし、次の予定を 4 分前に Windows Toast 通知する常駐デーモン。
+
+### 動作
+
+- 起動すると常駐し、`gcalntfy.toml` の `schedule` に従って当日の Calendar イベントをポーリング
+- 次のイベントの 4 分前に Windows Toast 通知を表示し、通知音（Opus 形式）を再生
+- 日付が変わると通知済みセットをリセットして当日分を再取得
+
+### 特徴
+
+- **時間帯別ポーリング間隔**: `schedule` に 24 要素の配列（分単位）で設定。`0` の時間帯はポーリングしない
+- **通知音**: exe に埋め込んだ Opus 音声を ffplay で再生。`gcalntfy.local.opus` を同フォルダに置くとカスタム音に上書き
+- **BLE ヘッドホン対応**: `adelay=1000` で冒頭 1 秒の無音を挿入して接続遅延による冒頭切れを防止
+- **多重起動制御**: Job Object により新プロセス起動時に旧プロセスと子プロセス（ffplay）をまとめて終了
+- **設定オーバーライド**: `gcalntfy.local.toml` がある場合はキー単位で優先して使用
+
+### ビルド
+
+```shell
+task build
+```
+
+Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
+
+### 設定
+
+`gcalntfy.toml`（または `gcalntfy.local.toml`）を exe と同フォルダに配置する。
+
+```toml
+# GAS Web App のデプロイ URL
+api_url = "https://script.google.com/macros/s/{DEPLOY_ID}/exec"
+# API トークン（setupApiToken 関数で設定した値）
+api_token = "YOUR_SECRET"
+# 0時〜23時のポーリング間隔（分）。0=ポーリングしない
+schedule = [60, 60, 60, 60, 60, 60, 60, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 20, 20, 20, 60, 60]
+```
+
 ## 技術スタック
+
+### GAS Web App
 
 - Google Apps Script (V8 ランタイム)
 - Google Chat REST API v1
@@ -203,3 +268,11 @@ GAS プロジェクトに紐づく Google Cloud Project で以下の API を有�
 - Google Drive REST API v3
 - People API v1 (REST 直呼び)
 - GroupsApp (GAS 組み込みサービス)
+
+### gcalntfy
+
+- C++20（MSVC）
+- WinRT Toast Notifications（Windows.UI.Notifications）
+- WinHTTP（HTTPS ポーリング）
+- toml++（TOML 設定パーサ）
+- ffplay（通知音再生）
