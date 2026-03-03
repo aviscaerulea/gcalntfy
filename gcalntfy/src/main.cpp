@@ -1,24 +1,22 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
 /**
- * gcalntfy - Google カレンダーの次の予定を Windows Toast 通知で知らせる CLI ツール
+ * gcalntfy - Google カレンダーの予定を Windows Toast 通知で知らせる常駐デーモン
  *
- * exe 同フォルダの gcalntfy.ini（または .local.ini）から GAS Web App の URL とトークンを読み込み、
- * POST リクエストで現在日時以降の最初のカレンダーイベントを取得して Toast 通知を表示する。
- * 通知音は埋め込み opus リソース、または gcalntfy.local.opus を ffplay で再生する。
- *
- * 引数: [YYYY-MM-DD HH:MM]（省略時は現在時刻）
- *   指定すると、その JST 日時を起点にして次の予定を取得する。
+ * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
+ * schedule に従って自律的にポーリングし、次の予定を 4 分前に Toast 通知で知らせる。
+ * schedule は 0 時〜 23 時の 24 要素配列（分単位のポーリング間隔、0=ポーリングしない）。
+ * 通知済みイベントは datetime+title で記憶して重複防止する。
  *
  * 終了コード:
- *   0  - 正常終了（通知表示 or イベントなし）
- *   1  - 設定エラー（INI 読み込み失敗）
- *   2  - 通信 / データエラー（HTTP 失敗・JSON パースエラー・API エラーレスポンス）
+ *   0  - 正常動作時は常駐し続けるため到達しない
+ *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
+ *   2  - 予期しない初期化エラー
  *
  * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
  * 外部依存: ffplay (PATH 上に存在すること、未インストールでも Toast 通知は表示される)
  * ビルド: rc /nologo resource.rc
  *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
- *             /link /SUBSYSTEM:CONSOLE windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
+ *             /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
  */
 
 // C++/WinRT ヘッダは windows.h より先にインクルードする
@@ -38,9 +36,14 @@
 #include <propkey.h>
 #include <propvarutil.h>
 
+#include "toml.hpp"
+
 #include <string>
 #include <string_view>
 #include <vector>
+#include <set>
+#include <optional>
+#include <algorithm>
 #include <cstdio>
 
 #pragma comment(lib, "windowsapp.lib")
@@ -53,6 +56,12 @@
 
 // アプリケーション識別子（Toast 通知に使用）
 static const wchar_t* APP_AUMID = L"com.gcalntfy";
+
+// 4 分前通知のリード時間（ミリ秒）
+static constexpr long long NOTIFY_LEAD_MS = 4LL * 60 * 1000;
+
+// エラー時のリトライ待機時間（ミリ秒）
+static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
 // ==================== データ構造 ====================
 
@@ -67,6 +76,13 @@ struct ParseResult {
     std::string errorMsg;
 };
 
+// loadConfig の戻り値
+struct Config {
+    std::wstring     apiUrl;
+    std::wstring     apiToken;
+    std::vector<int> schedule; // 24 要素（0 時〜 23 時のポーリング間隔[分]）
+};
+
 // ==================== ユーティリティ ====================
 
 // exe のあるディレクトリパスを取得する
@@ -77,46 +93,36 @@ static std::wstring getExeDir() {
     return path;
 }
 
-// INI ファイルから指定キーの値を読み込む（.local.ini を優先）
-static std::wstring readIniValue(const std::wstring& exeDir, const wchar_t* key) {
-    wchar_t val[2048] = {};
-    std::wstring localIni = exeDir + L"\\gcalntfy.local.ini";
-    GetPrivateProfileStringW(L"gcalntfy", key, L"", val, _countof(val), localIni.c_str());
-    if (val[0]) return val;
-    std::wstring ini = exeDir + L"\\gcalntfy.ini";
-    GetPrivateProfileStringW(L"gcalntfy", key, L"", val, _countof(val), ini.c_str());
-    return val;
+// SYSTEMTIME を ULARGE_INTEGER（100 ナノ秒単位）に変換する
+static ULARGE_INTEGER systemTimeToUli(const SYSTEMTIME& st) {
+    FILETIME ft = {};
+    SystemTimeToFileTime(&st, &ft);
+    return ULARGE_INTEGER{ ft.dwLowDateTime, ft.dwHighDateTime };
 }
 
-// UTC SYSTEMTIME を JST SYSTEMTIME に変換する（100 ナノ秒単位で +9 時間加算）
-static SYSTEMTIME utcToJst(SYSTEMTIME st) {
-    FILETIME ft;
-    SystemTimeToFileTime(&st, &ft);
-    ULARGE_INTEGER uli;
-    uli.LowPart  = ft.dwLowDateTime;
-    uli.HighPart = ft.dwHighDateTime;
-    uli.QuadPart += static_cast<ULONGLONG>(9) * 60 * 60 * 10000000ULL;
-    ft.dwLowDateTime  = uli.LowPart;
-    ft.dwHighDateTime = uli.HighPart;
-    SYSTEMTIME jst;
-    FileTimeToSystemTime(&ft, &jst);
-    return jst;
+// ULARGE_INTEGER（100 ナノ秒単位）を SYSTEMTIME に変換する
+static SYSTEMTIME uliToSystemTime(ULARGE_INTEGER uli) {
+    FILETIME ft = { uli.LowPart, uli.HighPart };
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&ft, &st);
+    return st;
 }
 
-// JST SYSTEMTIME を UTC SYSTEMTIME に変換する（100 ナノ秒単位で -9 時間減算）
-static SYSTEMTIME jstToUtc(SYSTEMTIME st) {
-    FILETIME ft;
-    SystemTimeToFileTime(&st, &ft);
-    ULARGE_INTEGER uli;
-    uli.LowPart  = ft.dwLowDateTime;
-    uli.HighPart = ft.dwHighDateTime;
-    uli.QuadPart -= static_cast<ULONGLONG>(9) * 60 * 60 * 10000000ULL;
-    ft.dwLowDateTime  = uli.LowPart;
-    ft.dwHighDateTime = uli.HighPart;
-    SYSTEMTIME utc;
-    FileTimeToSystemTime(&ft, &utc);
-    return utc;
+// SYSTEMTIME を指定時間（100 ナノ秒単位）だけシフトする
+static SYSTEMTIME shiftSystemTime(SYSTEMTIME st, long long offsetHns) {
+    auto uli = systemTimeToUli(st);
+    uli.QuadPart += offsetHns;
+    return uliToSystemTime(uli);
 }
+
+// JST オフセット（100 ナノ秒単位で +9 時間）
+static constexpr long long JST_OFFSET_HNS = 9LL * 60 * 60 * 10000000LL;
+
+// UTC SYSTEMTIME を JST SYSTEMTIME に変換する
+static SYSTEMTIME utcToJst(SYSTEMTIME st) { return shiftSystemTime(st, +JST_OFFSET_HNS); }
+
+// JST SYSTEMTIME を UTC SYSTEMTIME に変換する
+static SYSTEMTIME jstToUtc(SYSTEMTIME st) { return shiftSystemTime(st, -JST_OFFSET_HNS); }
 
 // 現在日時を JST "YYYY-MM-DD HH:MM" 形式で取得する
 static std::wstring getCurrentDateTimeJST() {
@@ -139,19 +145,27 @@ static std::string getCurrentUtcISO() {
     return buf;
 }
 
+// ISO 8601 UTC 文字列 "YYYY-MM-DDTHH:MM:SS...Z" を SYSTEMTIME にパースする
+// パース失敗時は false を返す
+static bool parseIsoToSystemTime(const std::string& iso, SYSTEMTIME& out) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (sscanf_s(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) {
+        return false;
+    }
+    out = {};
+    out.wYear   = static_cast<WORD>(y);
+    out.wMonth  = static_cast<WORD>(mo);
+    out.wDay    = static_cast<WORD>(d);
+    out.wHour   = static_cast<WORD>(h);
+    out.wMinute = static_cast<WORD>(mi);
+    out.wSecond = static_cast<WORD>(s);
+    return true;
+}
+
 // UTC RFC3339 "YYYY-MM-DDTHH:MM:SS...Z" を JST "HH:MM" に変換する
 static std::wstring utcToJstHHMM(const std::string& utcIso) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (sscanf_s(utcIso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) {
-        return L"??:??";
-    }
-    SYSTEMTIME st = {};
-    st.wYear   = static_cast<WORD>(y);
-    st.wMonth  = static_cast<WORD>(mo);
-    st.wDay    = static_cast<WORD>(d);
-    st.wHour   = static_cast<WORD>(h);
-    st.wMinute = static_cast<WORD>(mi);
-    st.wSecond = static_cast<WORD>(s);
+    SYSTEMTIME st;
+    if (!parseIsoToSystemTime(utcIso, st)) return L"??:??";
     auto jst = utcToJst(st);
     wchar_t buf[8];
     swprintf_s(buf, _countof(buf), L"%02d:%02d", jst.wHour, jst.wMinute);
@@ -332,9 +346,11 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             e.content  = winrt::to_string(ev.GetNamedString(L"content", L""));
             if (!e.datetime.empty()) result.events.push_back(std::move(e));
         }
-    } catch (winrt::hresult_error const& e) {
+    }
+    catch (winrt::hresult_error const& e) {
         result.errorMsg = "JSON parse error: " + winrt::to_string(e.message());
-    } catch (...) {
+    }
+    catch (...) {
         result.errorMsg = "JSON parse error: unknown exception";
     }
     return result;
@@ -348,6 +364,90 @@ static const CalendarEvent* findNextEvent(
         if (e.datetime >= nowUtc) return &e;
     }
     return nullptr;
+}
+
+// ==================== 設定読み込み ====================
+
+// TOML ファイルをパースして table を返す（ファイル不在・パースエラーは nullopt）
+static std::optional<toml::table> loadToml(const std::wstring& path) {
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return std::nullopt;
+    try {
+        return toml::parse_file(path);
+    }
+    catch (const toml::parse_error& e) {
+        HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
+        writeStderr(hStderr, "gcalntfy: TOML parse error in " + wideToUtf8(path)
+            + ": " + std::string(e.description()));
+        return std::nullopt;
+    }
+}
+
+// schedule 配列を TOML テーブルから読み込む（なければ nullopt）
+static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
+    if (!tbl) return std::nullopt;
+    const auto* arr = (*tbl)["schedule"].as_array();
+    if (!arr) return std::nullopt;
+    std::vector<int> s;
+    for (const auto& el : *arr) {
+        if (s.size() >= 24) break;
+        s.push_back((std::max)(0, el.value_or(0)));
+    }
+    while (s.size() < 24) s.push_back(0);
+    return s;
+}
+
+// gcalntfy.toml と gcalntfy.local.toml を読み込んで Config を構築する
+//
+// local.toml のキーが優先（キー単位でオーバーライド）。
+// schedule は local があれば local 全体を使用、なければ base を使用。
+static Config loadConfig(const std::wstring& exeDir) {
+    auto base  = loadToml(exeDir + L"\\gcalntfy.toml");
+    auto local = loadToml(exeDir + L"\\gcalntfy.local.toml");
+
+    auto getString = [&](const char* key) -> std::wstring {
+        if (local) {
+            if (auto v = (*local)[key].value<std::string>()) return toWide(*v);
+        }
+        if (base) {
+            if (auto v = (*base)[key].value<std::string>()) return toWide(*v);
+        }
+        return {};
+    };
+
+    Config cfg;
+    cfg.apiUrl   = getString("api_url");
+    cfg.apiToken = getString("api_token");
+
+    if (auto s = readSchedule(local)) {
+        cfg.schedule = std::move(*s);
+    }
+    else if (auto s = readSchedule(base)) {
+        cfg.schedule = std::move(*s);
+    }
+    else {
+        cfg.schedule.resize(24, 0);
+    }
+
+    return cfg;
+}
+
+// ==================== 時刻ユーティリティ ====================
+
+// ISO 8601 UTC 文字列 "YYYY-MM-DDTHH:MM:SS...Z" を ULARGE_INTEGER（100 ナノ秒単位）に変換する
+static ULARGE_INTEGER parseIsoToUli(const std::string& iso) {
+    SYSTEMTIME st;
+    if (!parseIsoToSystemTime(iso, st)) {
+        return ULARGE_INTEGER{};
+    }
+    return systemTimeToUli(st);
+}
+
+// 2 つの UTC ISO 8601 文字列の差をミリ秒で返す（isoTarget - isoNow、負の場合は 0）
+static long long calcDiffMs(const std::string& isoTarget, const std::string& isoNow) {
+    auto target = parseIsoToUli(isoTarget);
+    auto now    = parseIsoToUli(isoNow);
+    if (target.QuadPart <= now.QuadPart) return 0LL;
+    return static_cast<long long>((target.QuadPart - now.QuadPart) / 10000LL);
 }
 
 // ==================== 通知音再生 ====================
@@ -376,7 +476,8 @@ static void launchSound(const std::wstring& exeDir) {
             FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             return;
         }
-    } else {
+    }
+    else {
         // 埋め込みリソースから opus データを stdin パイプ経由で ffplay に渡す
         HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_NOTIFY_OPUS), (LPCWSTR)RT_RCDATA);
         if (!hRes) return;
@@ -484,9 +585,8 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title) {
 
 // ==================== エントリポイント ====================
 
-int wmain(int argc, wchar_t* argv[]) {
+int wmain() {
     HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
-    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスと関連子プロセス（ffplay）をまとめて終了させる。
@@ -526,110 +626,109 @@ int wmain(int argc, wchar_t* argv[]) {
         ensureShortcut();
 
         auto exeDir = getExeDir();
+        auto cfg    = loadConfig(exeDir);
 
-        // (1) INI から API URL とトークンを読み込み
-        auto apiUrl   = readIniValue(exeDir, L"ApiUrl");
-        auto apiToken = readIniValue(exeDir, L"ApiToken");
-        if (apiUrl.empty()) {
-            writeStderr(hStderr, "gcalntfy: ApiUrl is not set in gcalntfy.ini (or .local.ini)");
+        if (cfg.apiUrl.empty()) {
+            writeStderr(hStderr, "gcalntfy: api_url is not set in gcalntfy.toml");
             return 1;
         }
-        if (apiToken.empty()) {
-            writeStderr(hStderr, "gcalntfy: ApiToken is not set in gcalntfy.ini (or .local.ini)");
+        if (cfg.apiToken.empty()) {
+            writeStderr(hStderr, "gcalntfy: api_token is not set in gcalntfy.toml");
             return 1;
         }
 
-        // (2) 日時を決定（引数優先、なければ現在時刻）
-        std::wstring dateTimeJST;
-        std::string nowUtc;
+        std::set<std::string> notifiedSet;
+        int lastJstDay = -1;
 
-        // argv[1..] を空白区切りで結合してコマンドライン文字列を構築
-        std::wstring cmdLine;
-        for (int i = 1; i < argc; ++i) {
-            if (i > 1) cmdLine += L' ';
-            cmdLine += argv[i];
-        }
+        while (true) {
+            try {
+                SYSTEMTIME utcNow;
+                GetSystemTime(&utcNow);
+                auto jstNow = utcToJst(utcNow);
 
-        int y = 0, mo = 0, d = 0, h = 0, mi = 0;
-        if (!cmdLine.empty() && swscanf_s(cmdLine.c_str(), L"%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5
-            && y >= 2000 && y <= 9999 && mo >= 1 && mo <= 12
-            && d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
-            wchar_t buf[32];
-            swprintf_s(buf, _countof(buf), L"%04d-%02d-%02d %02d:%02d", y, mo, d, h, mi);
-            dateTimeJST = buf;
+                // 日付変更で通知済みセットをクリア
+                if (static_cast<int>(jstNow.wDay) != lastJstDay) {
+                    notifiedSet.clear();
+                    lastJstDay = static_cast<int>(jstNow.wDay);
+                }
 
-            SYSTEMTIME jst = {};
-            jst.wYear   = static_cast<WORD>(y);
-            jst.wMonth  = static_cast<WORD>(mo);
-            jst.wDay    = static_cast<WORD>(d);
-            jst.wHour   = static_cast<WORD>(h);
-            jst.wMinute = static_cast<WORD>(mi);
-            auto utc = jstToUtc(jst);
-            char utcBuf[32];
-            sprintf_s(utcBuf, sizeof(utcBuf), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-                utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
-            nowUtc = utcBuf;
-        } else {
-            dateTimeJST = getCurrentDateTimeJST();
-            nowUtc = getCurrentUtcISO();
-        }
+                int interval = cfg.schedule[jstNow.wHour];
+                DWORD intervalMs = static_cast<DWORD>(interval) * 60000u;
 
-        // (3) POST ボディ構築: {"token":"...","date":"YYYY-MM-DD HH:MM","media":"calendar","fields":["datetime","content"]}
-        // fields を指定して attendees/sender の高コスト API 解決をスキップする
-        std::string jsonBody = "{\"token\":\""
-            + escapeJson(wideToUtf8(apiToken)) + "\",\"date\":\""
-            + escapeJson(wideToUtf8(dateTimeJST))
-            + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\"]}";
+                // schedule=0 の時間帯: 次の正時までスリープ
+                if (interval == 0) {
+                    long long remainMs = (long long)(60 - jstNow.wMinute) * 60000LL
+                        - (long long)jstNow.wSecond * 1000LL
+                        - (long long)jstNow.wMilliseconds;
+                    if (remainMs < 1000) remainMs = 1000;
+                    Sleep(static_cast<DWORD>(remainMs));
+                    continue;
+                }
 
-        // (4) HTTP POST
-        DWORD httpStatus = 0;
-        auto body = httpPost(apiUrl, jsonBody, &httpStatus);
-        if (body.empty()) {
-            std::string errMsg = "HTTP request failed";
-            if (httpStatus != 0) {
-                char buf[64];
-                sprintf_s(buf, "HTTP request failed (status %lu)", httpStatus);
-                errMsg = buf;
+                // API ポーリング
+                auto dateJST = getCurrentDateTimeJST();
+                auto nowUtc  = getCurrentUtcISO();
+                std::string jsonBody = "{\"token\":\""
+                    + escapeJson(wideToUtf8(cfg.apiToken)) + "\",\"date\":\""
+                    + escapeJson(wideToUtf8(dateJST))
+                    + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\"]}";
+
+                DWORD httpStatus = 0;
+                auto body = httpPost(cfg.apiUrl, jsonBody, &httpStatus);
+                if (body.empty()) {
+                    std::string err = "HTTP request failed";
+                    if (httpStatus != 0) {
+                        char buf[64];
+                        sprintf_s(buf, "HTTP request failed (status %lu)", httpStatus);
+                        err = buf;
+                    }
+                    writeStderr(hStderr, "gcalntfy: " + err);
+                    Sleep(RETRY_WAIT_MS);
+                    continue;
+                }
+
+                auto [events, errorMsg] = parseCalendarEvents(body);
+                if (!errorMsg.empty()) {
+                    writeStderr(hStderr, "gcalntfy: " + errorMsg);
+                }
+
+                // 次のイベント検索 → 通知判定
+                const CalendarEvent* next = errorMsg.empty() ? findNextEvent(events, nowUtc) : nullptr;
+                DWORD sleepMs = intervalMs;
+
+                if (next) {
+                    std::string eventKey = next->datetime + "|" + next->content;
+                    long long diffMs = calcDiffMs(next->datetime, nowUtc);
+                    bool alreadyNotified = notifiedSet.count(eventKey) > 0;
+
+                    if (diffMs <= 0) {
+                        // 既に開始済み
+                        notifiedSet.insert(eventKey);
+                    }
+                    else if (!alreadyNotified && diffMs <= static_cast<long long>(intervalMs)) {
+                        // ポーリング窓内: 4 分前まで待機して通知
+                        if (diffMs > NOTIFY_LEAD_MS) {
+                            Sleep(static_cast<DWORD>(diffMs - NOTIFY_LEAD_MS));
+                        }
+                        notifiedSet.insert(eventKey);
+                        launchSound(exeDir);
+                        showToast(utcToJstHHMM(next->datetime), toWide(next->content));
+                        sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
+                    }
+                }
+
+                Sleep(sleepMs);
             }
-            writeStderr(hStderr, "gcalntfy: " + errMsg);
-            try { showToast(L"gcalntfy", toWide(errMsg)); } catch (...) {}
-            return 2;
+            catch (...) {
+                writeStderr(hStderr, "gcalntfy: unexpected error in polling loop");
+                Sleep(RETRY_WAIT_MS);
+            }
         }
-
-        // JSON レスポンスを stdout に出力
-        if (hStdout != INVALID_HANDLE_VALUE && hStdout != nullptr) {
-            DWORD written;
-            WriteFile(hStdout, body.c_str(), static_cast<DWORD>(body.size()), &written, nullptr);
-            WriteFile(hStdout, "\n", 1, &written, nullptr);
-        }
-
-        // (5) JSON パース → Calendar イベント配列
-        auto [events, errorMsg] = parseCalendarEvents(body);
-        if (!errorMsg.empty()) {
-            writeStderr(hStderr, "gcalntfy: " + errorMsg);
-            try { showToast(L"gcalntfy", toWide(errorMsg)); } catch (...) {}
-            return 2;
-        }
-        if (events.empty()) return 0;
-
-        // (6) 現在 UTC 以降の最初のイベントを検索
-        const CalendarEvent* next = findNextEvent(events, nowUtc);
-        if (!next) return 0;
-
-        // (7) JST "HH:MM" 変換とタイトル取得
-        auto jstTime = utcToJstHHMM(next->datetime);
-        auto title   = toWide(next->content);
-
-        // (8) 通知音起動（ffplay 未インストールでも Toast は表示される）
-        launchSound(exeDir);
-
-        // (9) Toast 通知表示（OS に登録後即 return、プロセス終了後も OS が管理して表示）
-        showToast(jstTime, title);
-
-    } catch (...) {
-        writeStderr(hStderr, "gcalntfy: unexpected error");
-        try { showToast(L"gcalntfy", L"unexpected error"); } catch (...) {}
+    }
+    catch (...) {
+        writeStderr(hStderr, "gcalntfy: unexpected initialization error");
         return 2;
     }
-    return 0;
+
+    return 0; // 正常動作時は常駐し続けるため到達しない
 }

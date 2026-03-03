@@ -18,6 +18,6 @@ if ($LASTEXITCODE) { exit 1 }
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
-    /link /SUBSYSTEM:CONSOLE `
+    /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `
     windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
 if ($LASTEXITCODE) { exit 1 }

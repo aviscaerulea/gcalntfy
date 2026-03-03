@@ -17,7 +17,7 @@ tasks:
     cmds:
       - mkdir -p out
       - pwsh -NonInteractive -File build.ps1
-      - cp gcalntfy.ini out/
+      - cp gcalntfy.toml out/
       - cp -f *.local.* out/ 2>/dev/null || true
 
   release:
@@ -28,6 +28,6 @@ tasks:
       - >-
         pwsh -NonInteractive -Command '
         Compress-Archive
-        -Path out\gcalntfy.exe, gcalntfy.ini
+        -Path out\gcalntfy.exe, gcalntfy.toml
         -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
         -Force'
