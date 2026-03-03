@@ -1,21 +1,15 @@
 # vi: ts=4 sw=4 ff=unix fenc=utf-8
 # gcalntfy ビルドスクリプト
-# vcvarsall.bat 経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
-# vswhere.exe の絶対パスを使用（PATH に含まれない環境を考慮）。
+# DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
 
-$vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-if (-not (Test-Path $vswhere)) {
-    Write-Error "vswhere.exe not found: $vswhere"
+# VS 開発環境の初期化（DevShell モジュール経由）
+$vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+if (-not $vsPath) {
+    Write-Error 'Visual Studio not found'
     exit 1
 }
-$vsPath = & $vswhere -latest -property installationPath
-$vcvarsall = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
-
-# vcvarsall.bat の環境変数を現在の PowerShell プロセスに取り込む
-$envLines = cmd /c "`"$vcvarsall`" amd64 >nul 2>&1 && set"
-$envLines | Where-Object { $_ -match '^([^=]+)=(.*)$' } | ForEach-Object {
-    [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2])
-}
+Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -Arch amd64 -HostArch amd64 *> $null
 
 rc /nologo /fo out\resource.res src\resource.rc
 if ($LASTEXITCODE) { exit 1 }
