@@ -488,6 +488,38 @@ int wmain(int argc, wchar_t* argv[]) {
     HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
+    // 多重起動制御（新プロセス優先）
+    // 名前付き Job Object で旧プロセスと関連子プロセス（ffplay）をまとめて終了させる。
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
+    HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
+    if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
+        writeStderr(hStderr, "gcalntfy: terminating previous instance");
+        TerminateJobObject(hJob, 0);
+        CloseHandle(hJob);
+        // カーネルが Job Object 名を解放するまで待機
+        Sleep(100);
+        hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
+        // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
+        if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
+            writeStderr(hStderr, "gcalntfy: warning: previous instance still alive");
+            CloseHandle(hJob);
+            hJob = nullptr;
+        }
+    }
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+            writeStderr(hStderr, "gcalntfy: warning: failed to set job object limits");
+        }
+        if (!AssignProcessToJobObject(hJob, GetCurrentProcess())) {
+            writeStderr(hStderr, "gcalntfy: warning: failed to assign to job object");
+        }
+    }
+    else {
+        writeStderr(hStderr, "gcalntfy: warning: failed to create job object");
+    }
+
     try {
         winrt::init_apartment();
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
