@@ -18,6 +18,7 @@ tasks:
       - mkdir -p out
       - pwsh -NonInteractive -File build.ps1
       - cp gcalntfy.ini out/
+      - cp -f *.local.* out/ 2>/dev/null || true
 
   release:
     desc: リリースビルドと zip 作成
