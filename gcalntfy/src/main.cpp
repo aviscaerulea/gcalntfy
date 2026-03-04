@@ -462,6 +462,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
 static Config loadConfig(const std::wstring& exeDir) {
     auto base  = loadToml(exeDir + L"\\gcalntfy.toml");
     auto local = loadToml(exeDir + L"\\gcalntfy.local.toml");
+    if (local) writeLog("Loaded gcalntfy.local.toml (override active)");
 
     auto getString = [&](const char* key) -> std::wstring {
         if (local) {
