@@ -70,6 +70,7 @@ static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 struct CalendarEvent {
     std::string datetime;
     std::string content;
+    std::string permalink;
 };
 
 // parseCalendarEvents の戻り値
@@ -196,6 +197,11 @@ static std::wstring escapeXml(const std::wstring& s) {
         }
     }
     return r;
+}
+
+// https:// または http:// のみ許可する（任意プロトコルハンドラ悪用防止）
+static bool isHttpUrl(const std::wstring& url) {
+    return url.substr(0, 8) == L"https://" || url.substr(0, 7) == L"http://";
 }
 
 // UTF-8 std::string を UTF-16 std::wstring に変換する
@@ -378,9 +384,10 @@ static ParseResult parseCalendarEvents(const std::string& json) {
         for (auto item : arr) {
             auto ev = item.GetObject();
             CalendarEvent e;
-            e.datetime = winrt::to_string(ev.GetNamedString(L"datetime", L""));
-            e.content  = winrt::to_string(ev.GetNamedString(L"content", L""));
-            if (!e.datetime.empty()) result.events.push_back(std::move(e));
+            e.datetime  = winrt::to_string(ev.GetNamedString(L"datetime",  L""));
+            e.content   = winrt::to_string(ev.GetNamedString(L"content",   L""));
+            e.permalink = winrt::to_string(ev.GetNamedString(L"permalink", L""));
+            if (!e.datetime.empty() && !e.content.empty()) result.events.push_back(std::move(e));
         }
     }
     catch (winrt::hresult_error const& e) {
@@ -832,15 +839,37 @@ static void ensureShortcut() {
 // ==================== Toast 通知 ====================
 
 // Toast 通知を表示する
-// OS に通知を登録して即 return する（コールバック待機なし）
-static void showToast(const std::wstring& timeJST, const std::wstring& title) {
+//
+// OS に通知を登録して即 return する（コールバック待機なし）。
+// アプリアイコン（exe 同フォルダの app.ico）・OS 通知音の無効化・
+// Calendar を開くボタンを含むリッチな通知を表示する。
+static void showToast(const std::wstring& timeJST, const std::wstring& title,
+                      const std::wstring& permalink)
+{
+    auto iconPath = getExeDir() + L"\\app.ico";
+
+    std::wstring iconTag;
+    if (PathFileExistsW(iconPath.c_str())) {
+        iconTag = L"<image placement=\"appLogoOverride\" src=\"" + escapeXml(iconPath) + L"\"/>";
+    }
+
     std::wstring xml =
         L"<toast>"
         L"<visual><binding template=\"ToastGeneric\">"
+        + iconTag +
         L"<text>" + escapeXml(timeJST) + L"</text>"
         L"<text>" + escapeXml(title)   + L"</text>"
         L"</binding></visual>"
-        L"</toast>";
+        L"<audio silent=\"true\"/>";
+
+    // https:// / http:// 以外のスキームは拒否して任意プロトコルハンドラの悪用を防ぐ
+    if (!permalink.empty() && isHttpUrl(permalink)) {
+        xml += L"<actions>"
+               L"<action activationType=\"protocol\" content=\"Calendar\""
+               L" arguments=\"" + escapeXml(permalink) + L"\"/>"
+               L"</actions>";
+    }
+    xml += L"</toast>";
 
     winrt::Windows::Data::Xml::Dom::XmlDocument doc;
     doc.LoadXml(xml);
@@ -943,7 +972,7 @@ int wmain() {
                 std::string jsonBody = "{\"token\":\""
                     + escapeJson(wideToUtf8(cfg.apiToken)) + "\",\"date\":\""
                     + escapeJson(wideToUtf8(dateJST))
-                    + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\"]}";
+                    + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\",\"permalink\"]}";
 
                 DWORD httpStatus = 0;
                 auto body = httpPost(cfg.apiUrl, jsonBody, &httpStatus);
@@ -973,7 +1002,8 @@ int wmain() {
                     std::string eventKey = next->datetime + "|" + next->content;
                     long long diffMs = calcDiffMs(next->datetime, nowUtc);
                     bool alreadyNotified = notifiedSet.count(eventKey) > 0;
-                    auto jstTime = wideToUtf8(utcToJstHHMM(next->datetime));
+                    auto jstTimeW = utcToJstHHMM(next->datetime);
+                    auto jstTime  = wideToUtf8(jstTimeW);
                     writeLog("next: " + jstTime + " " + next->content
                         + " (" + std::to_string(diffMs) + "ms ahead)");
 
@@ -989,7 +1019,8 @@ int wmain() {
                         notifiedSet.insert(eventKey);
                         writeLog("notify: " + jstTime + " " + next->content);
                         launchSound(exeDir, cfg);
-                        showToast(utcToJstHHMM(next->datetime), toWide(next->content));
+                        showToast(jstTimeW, toWide(next->content),
+                                  toWide(next->permalink));
                         sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
                     }
                 }

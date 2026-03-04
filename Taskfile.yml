@@ -19,6 +19,7 @@ tasks:
       - pwsh -NonInteractive -File build.ps1
       - cp gcalntfy.toml out/
       - cp gcalntfy.opus out/
+      - cp src/app.ico out/
       - cp -f *.local.* out/ 2>/dev/null || true
 
   release:
