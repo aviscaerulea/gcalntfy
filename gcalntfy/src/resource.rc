@@ -1,8 +1,7 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
-// リソーススクリプト: アイコン・チャイム音・通知音をバイナリとして埋め込む
+// リソーススクリプト: アイコン・チャイム音をバイナリとして埋め込む
 
 #include "resource.h"
 
 IDI_APP_ICON    ICON    "app.ico"
 IDR_INTRO_OPUS  RCDATA  "intro.opus"
-IDR_NOTIFY_OPUS RCDATA  "gcalntfy.opus"

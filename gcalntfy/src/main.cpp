@@ -86,10 +86,11 @@ struct Config {
     std::vector<std::wstring> duckTargets; // 通知音再生中にミュートするプロセス名
 };
 
-// アンミュートスレッドへの受け渡し用コンテキスト
-struct DuckContext {
-    HANDLE                                          hProcess; // ffplay プロセスハンドル
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;    // ミュート済みセッション（復元用）
+// 通知音再生スレッドへの受け渡し用コンテキスト
+struct SoundContext {
+    HANDLE                                          hIntroProcess; // intro ffplay プロセスハンドル
+    std::wstring                                    bodyPath;      // gcalntfy.opus パス（空なら body なし）
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;         // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -610,35 +611,6 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
     muted.clear();
 }
 
-// ffplay 終了を待機してアンミュートするスレッド関数
-//
-// STA で初期化することで、duckAudioSessions が STA で生成した ISimpleAudioVolume を
-// アパートメント境界を越えずに安全に操作できる。
-// CoWaitForMultipleHandles を使用することで STA のメッセージキューをポンピングし、
-// デッドロックを防ぐ。
-static DWORD WINAPI unduckThread(LPVOID param) {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    auto* ctx = static_cast<DuckContext*>(param);
-
-    if (SUCCEEDED(hr) || hr == S_FALSE) {
-        // ffplay 終了を最大 30 秒待機（タイムアウトしても復元する）
-        // STA では CoWaitForMultipleHandles を使い、メッセージキューをポンピングする
-        DWORD idx = 0;
-        CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
-            30000, 1, &ctx->hProcess, &idx);
-        unduckAudioSessions(ctx->muted);
-        writeLog("unduckAudioSessions: restored");
-    }
-    else {
-        writeLog("unduckThread: CoInitializeEx failed, skipping unmute");
-    }
-
-    CloseHandle(ctx->hProcess);
-    delete ctx; // COM ポインタを CoUninitialize 前に解放
-    if (SUCCEEDED(hr) || hr == S_FALSE) CoUninitialize();
-    return 0;
-}
-
 // ==================== 通知音再生 ====================
 
 // 埋め込みリソースのデータポインタとサイズを返す（ロード失敗時は nullptr）
@@ -651,116 +623,162 @@ static const void* loadResource(int id, DWORD& outSize) {
     return LockResource(hGlobal);
 }
 
-// ffplay で通知音を起動する
+// 埋め込み音声をパイプ経由で ffplay に渡して再生する
 //
-// 再生フロー（埋め込み・ローカル共通）:
-//   adelay=2000（2秒無音） → intro.opus（チャイム） → 本体音声 → apad（2秒無音）
-// Ogg チェイニングにより intro + 本体をバイト連結して stdin パイプで渡す。
-// intro ロード失敗時はチャイムなしで本体のみ再生（グレースフルデグレード）。
-// ローカルファイル読み込み失敗時は埋め込みリソースにフォールバック。
-// ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
-// BLE ヘッドホン対処: adelay=2000:all=1 で冒頭 2 秒の無音を追加し、接続遅延による冒頭切れを防ぐ。
-// apad=pad_dur=2 で末尾 2 秒の無音を追加し、ダッキング解除の遷移を滑らかにする。
-// ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、ffplay 終了後に復元する。
-// 注意: Ogg チェイニングはチャネル数が同一の場合のみ正常再生できる。
-//       intro.opus・gcalntfy.opus は 1ch モノ。ユーザ提供 gcalntfy.local.opus も 1ch を推奨。
-static void launchSound(const std::wstring& exeDir, const Config& cfg) {
-    // intro リソースをロード（失敗時は nullptr のまま続行）
-    DWORD introSize = 0;
-    const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
-
-    // 埋め込み本体音声をロード
-    DWORD notifySize = 0;
-    const void* notifyData = loadResource(IDR_NOTIFY_OPUS, notifySize);
-    if (!notifyData || notifySize == 0) return;
-
-    // ローカルファイルの存在確認
-    std::wstring localOpus = exeDir + L"\\gcalntfy.local.opus";
-    bool useLocal = (GetFileAttributesW(localOpus.c_str()) != INVALID_FILE_ATTRIBUTES);
-
-    // パイプ作成
+// data/size: 再生する Opus データ
+// 戻り値: ffplay のプロセスハンドル（起動失敗時は INVALID_HANDLE_VALUE）
+// adelay=1000 で冒頭 1 秒の無音を挿入し、BLE ヘッドホンの接続遅延を吸収する。
+static HANDLE playViaPipe(const void* data, DWORD size) {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength        = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return;
-    // 書き込み側は子プロセスに継承しない
+    HANDLE hReadPipe, hWritePipe;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return INVALID_HANDLE_VALUE;
     SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si = {};
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdInput  = hReadPipe;
-    si.hStdOutput = nullptr;
-    si.hStdError  = nullptr;
+    si.cb        = sizeof(si);
+    si.dwFlags   = STARTF_USESTDHANDLES;
+    si.hStdInput = hReadPipe;
 
     PROCESS_INFORMATION pi = {};
     std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet"
-        L" -af adelay=2000:all=1,apad=pad_dur=2 -i pipe:0";
+        L" -af adelay=1000:all=1 -i pipe:0";
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-        TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        writeLog("launchSound: CreateProcessW failed: " + std::to_string(GetLastError()));
+            TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        writeLog("playViaPipe: CreateProcessW failed: " + std::to_string(GetLastError()));
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
-        return;
+        return INVALID_HANDLE_VALUE;
     }
 
-    // 読み取り側は子プロセスに継承済みなので親側は閉じる
     CloseHandle(hReadPipe);
 
-    // ダッキング：ffplay 起動後、音声書き込み前にミュート
-    auto mutedSessions = duckAudioSessions(cfg.duckTargets);
-
     DWORD written = 0;
-
-    // intro データをパイプに書き込む（Ogg チェイニング前半）
-    if (introData && introSize > 0) {
-        WriteFile(hWritePipe, introData, introSize, &written, nullptr);
-    }
-
-    // 本体データをパイプに書き込む（Ogg チェイニング後半）
-    // ローカルファイル読み込み失敗時は埋め込みリソースにフォールバック
-    bool wroteLocal = false;
-    if (useLocal) {
-        HANDLE hFile = CreateFileW(localOpus.c_str(), GENERIC_READ, FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            char buf[8192];
-            DWORD readBytes = 0;
-            while (ReadFile(hFile, buf, sizeof(buf), &readBytes, nullptr) && readBytes > 0) {
-                WriteFile(hWritePipe, buf, readBytes, &written, nullptr);
-            }
-            CloseHandle(hFile);
-            wroteLocal = true;
-        }
-    }
-    if (!wroteLocal) {
-        WriteFile(hWritePipe, notifyData, notifySize, &written, nullptr);
-    }
-
-    CloseHandle(hWritePipe); // EOF 送信
+    WriteFile(hWritePipe, data, size, &written, nullptr);
+    CloseHandle(hWritePipe); // EOF
 
     CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
 
-    if (mutedSessions.empty()) {
-        // ダッキング無効: fire-and-forget（スレッド起動オーバーヘッドを回避）
-        CloseHandle(pi.hProcess);
+// ファイルを ffplay で直接再生する
+//
+// path: 再生ファイルのフルパス
+// 戻り値: ffplay のプロセスハンドル（起動失敗時は INVALID_HANDLE_VALUE）
+static HANDLE playViaFile(const std::wstring& path) {
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet \"" + path + L"\"";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+            FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        writeLog("playViaFile: CreateProcessW failed: " + std::to_string(GetLastError()));
+        return INVALID_HANDLE_VALUE;
+    }
+
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
+// intro 再生完了待機 → body 再生 → ダッキング解除するスレッド関数
+//
+// STA で COM 初期化し、CoWaitForMultipleHandles でメッセージキューをポンピングする。
+// intro 終了後、bodyPath が空でなければ playViaFile で gcalntfy.opus を即起動する。
+static DWORD WINAPI soundThread(LPVOID param) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    auto* ctx = static_cast<SoundContext*>(param);
+    bool comOk = SUCCEEDED(hr) || hr == S_FALSE;
+
+    if (comOk) {
+        // intro 終了を待機（最大 30 秒）
+        DWORD idx = 0;
+        CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+            30000, 1, &ctx->hIntroProcess, &idx);
+        CloseHandle(ctx->hIntroProcess);
+
+        // body 再生（gcalntfy.opus が存在する場合）
+        if (!ctx->bodyPath.empty()) {
+            HANDLE hBody = playViaFile(ctx->bodyPath);
+            if (hBody != INVALID_HANDLE_VALUE) {
+                CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+                    60000, 1, &hBody, &idx);
+                CloseHandle(hBody);
+            }
+        }
+
+        // ダッキング解除
+        if (!ctx->muted.empty()) {
+            Sleep(2000); // ダッキング解除の遷移バッファ
+            unduckAudioSessions(ctx->muted);
+            writeLog("unduckAudioSessions: restored");
+        }
+    }
+    else {
+        writeLog("soundThread: CoInitializeEx failed");
+        CloseHandle(ctx->hIntroProcess);
+        if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
+    }
+
+    delete ctx;
+    if (comOk) CoUninitialize();
+    return 0;
+}
+
+// ffplay で通知音を再生する
+//
+// 再生フロー:
+//   adelay=1000（1秒無音） → intro.opus（チャイム） → gcalntfy.opus（存在時のみ）
+// intro.opus は埋め込みリソースからパイプ経由で再生し、gcalntfy.opus は exe 同ディレクトリの
+// ファイルを直接指定して再生する。2 つの ffplay プロセスを逐次起動する方式により
+// Ogg チェイニングの制約（adelay 再適用等）を回避する。
+// gcalntfy.opus が存在しない場合は intro のみ再生して終了する。
+// ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
+// BLE ヘッドホン対処: intro 再生時に adelay=1000:all=1 で冒頭 1 秒の無音を追加する。
+// ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
+//             末尾バッファは soundThread 内の Sleep(2000) で実現する。
+static void launchSound(const std::wstring& exeDir, const Config& cfg) {
+    // intro リソースをロード（失敗時は何も再生しない）
+    DWORD introSize = 0;
+    const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
+    if (!introData || introSize == 0) return;
+
+    // gcalntfy.opus の存在確認（exe 同ディレクトリ）
+    std::wstring bodyPath = exeDir + L"\\gcalntfy.opus";
+    bool hasBody = (GetFileAttributesW(bodyPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    // ダッキング開始（intro 再生前にミュート）
+    auto mutedSessions = duckAudioSessions(cfg.duckTargets);
+
+    // intro を再生（パイプ経由、adelay=1000 付き）
+    HANDLE hIntro = playViaPipe(introData, introSize);
+    if (hIntro == INVALID_HANDLE_VALUE) {
+        if (!mutedSessions.empty()) unduckAudioSessions(mutedSessions);
         return;
     }
 
-    // ダッキング有効: 別スレッドで ffplay 終了待機 → アンミュート
-    auto* ctx = new DuckContext{pi.hProcess, std::move(mutedSessions)};
-    HANDLE hUnduck = CreateThread(nullptr, 0, unduckThread, ctx, 0, nullptr);
-    if (!hUnduck) {
-        // スレッド起動失敗時は即アンミュートして後始末（メインスレッド STA から実行）
-        unduckAudioSessions(ctx->muted);
-        CloseHandle(ctx->hProcess);
+    // ダッキング無効かつ body なし → fire-and-forget
+    if (mutedSessions.empty() && !hasBody) {
+        CloseHandle(hIntro);
+        return;
+    }
+
+    // スレッドで後続処理（intro 待機 → body 再生 → アンミュート）
+    auto* ctx = new SoundContext{
+        .hIntroProcess = hIntro,
+        .bodyPath      = hasBody ? bodyPath : L"",
+        .muted         = std::move(mutedSessions)
+    };
+    HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
+    if (!hThread) {
+        if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
+        CloseHandle(ctx->hIntroProcess);
         delete ctx;
         return;
     }
-    // hUnduck ハンドルはスレッドの完了を待機しないためここで閉じる（スレッドは独立して完走する）
-    CloseHandle(hUnduck);
+    CloseHandle(hThread);
 }
 
 // ==================== ショートカット ====================
