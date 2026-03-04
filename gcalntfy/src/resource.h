@@ -3,5 +3,5 @@
 
 // アプリケーションアイコン
 #define IDI_APP_ICON    102
-// チャイム音（通知前に再生）
+// Intro chime sound
 #define IDR_INTRO_OPUS  103
