@@ -30,6 +30,6 @@ tasks:
       - >-
         pwsh -NonInteractive -Command '
         Compress-Archive
-        -Path out\gcalntfy.exe, gcalntfy.toml, gcalntfy.opus
+        -Path out\gcalntfy.exe, gcalntfy.toml, gcalntfy.opus, out\app.ico
         -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
         -Force'
