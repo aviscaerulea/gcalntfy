@@ -65,6 +65,9 @@ static constexpr long long NOTIFY_LEAD_MS = 4LL * 60 * 1000;
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
+// 設定ファイル再読み込みの間隔（5分）
+static constexpr ULONGLONG CONFIG_CHECK_INTERVAL_MS = 5uLL * 60 * 1000;
+
 // ==================== データ構造 ====================
 
 struct CalendarEvent {
@@ -85,6 +88,7 @@ struct Config {
     std::wstring              apiToken;
     std::vector<int>          schedule;    // 24 要素（0 時〜 23 時のポーリング間隔[分]）
     std::vector<std::wstring> duckTargets; // 通知音再生中にミュートするプロセス名
+    bool operator==(const Config&) const = default;
 };
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
@@ -277,6 +281,19 @@ static void writeLog(const std::string& msg) {
     DWORD written;
     WriteFile(hFile, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
     CloseHandle(hFile);
+}
+
+// schedule 配列と1日の概算ポーリング回数をログ出力する
+static void logSchedule(const std::vector<int>& schedule) {
+    int total = 0;
+    std::string s = "schedule: [";
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        if (i > 0) s += ',';
+        s += std::to_string(schedule[i]);
+        if (schedule[i] > 0) total += 60 / schedule[i];
+    }
+    s += "] (" + std::to_string(total) + " polls/day)";
+    writeLog(s);
 }
 
 // ==================== HTTP ====================
@@ -933,13 +950,19 @@ int wmain() {
             writeLog("api_url is not set in gcalntfy.toml");
             return 1;
         }
+        if (!isHttpUrl(cfg.apiUrl)) {
+            writeLog("api_url is invalid (must start with https://)");
+            return 1;
+        }
         if (cfg.apiToken.empty()) {
             writeLog("api_token is not set in gcalntfy.toml");
             return 1;
         }
+        logSchedule(cfg.schedule);
 
         std::set<std::string> notifiedSet;
         int lastJstDay = -1;
+        ULONGLONG lastConfigCheck = GetTickCount64();
 
         while (true) {
             try {
@@ -951,6 +974,23 @@ int wmain() {
                 if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                     notifiedSet.clear();
                     lastJstDay = static_cast<int>(jstNow.wDay);
+                }
+
+                // 設定再読み込み（5分間隔、バリデーションエラー時は前回設定を維持）
+                ULONGLONG nowTick = GetTickCount64();
+                if (nowTick - lastConfigCheck >= CONFIG_CHECK_INTERVAL_MS) {
+                    lastConfigCheck = nowTick;
+                    auto newCfg = loadConfig(exeDir);
+                    if (!newCfg.apiUrl.empty() && !newCfg.apiToken.empty() && isHttpUrl(newCfg.apiUrl)) {
+                        if (newCfg != cfg) {
+                            writeLog("config reloaded");
+                            logSchedule(newCfg.schedule);
+                        }
+                        cfg = std::move(newCfg);
+                    }
+                    else {
+                        writeLog("config reload skipped: invalid settings");
+                    }
                 }
 
                 int interval = cfg.schedule[jstNow.wHour];
