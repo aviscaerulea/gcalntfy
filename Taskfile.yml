@@ -15,6 +15,7 @@ tasks:
     desc: gcalntfy をビルド
     dir: gcalntfy
     cmds:
+      - taskkill //F //IM gcalntfy.exe 2>/dev/null || true
       - mkdir -p out
       - pwsh -NonInteractive -File build.ps1
       - cp gcalntfy.toml out/
