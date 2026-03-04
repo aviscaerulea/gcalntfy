@@ -35,6 +35,8 @@
 #include <propsys.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 
 #include "toml.hpp"
 
@@ -78,9 +80,16 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::wstring     apiUrl;
-    std::wstring     apiToken;
-    std::vector<int> schedule; // 24 要素（0 時〜 23 時のポーリング間隔[分]）
+    std::wstring              apiUrl;
+    std::wstring              apiToken;
+    std::vector<int>          schedule;    // 24 要素（0 時〜 23 時のポーリング間隔[分]）
+    std::vector<std::wstring> duckTargets; // 通知音再生中にミュートするプロセス名
+};
+
+// アンミュートスレッドへの受け渡し用コンテキスト
+struct DuckContext {
+    HANDLE                                          hProcess; // ffplay プロセスハンドル
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;    // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -439,6 +448,18 @@ static Config loadConfig(const std::wstring& exeDir) {
         return {};
     };
 
+    // duck_targets 配列の読み込み（local 優先、なければ base）
+    auto readDuckTargets = [&](const std::optional<toml::table>& tbl) -> std::vector<std::wstring> {
+        if (!tbl) return {};
+        const auto* arr = (*tbl)["duck_targets"].as_array();
+        if (!arr) return {};
+        std::vector<std::wstring> targets;
+        for (const auto& el : *arr) {
+            if (auto s = el.value<std::string>()) targets.push_back(toWide(*s));
+        }
+        return targets;
+    };
+
     Config cfg;
     cfg.apiUrl   = getString("api_url");
     cfg.apiToken = getString("api_token");
@@ -452,6 +473,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     else {
         cfg.schedule.resize(24, 0);
     }
+
+    cfg.duckTargets = readDuckTargets(local);
+    if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
 
     return cfg;
 }
@@ -475,6 +499,146 @@ static long long calcDiffMs(const std::string& isoTarget, const std::string& iso
     return static_cast<long long>((target.QuadPart - now.QuadPart) / 10000LL);
 }
 
+// ==================== ダッキング ====================
+
+// プロセス ID からプロセス名（小文字）を取得する
+static std::wstring getProcessName(DWORD pid) {
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return {};
+    wchar_t buf[MAX_PATH];
+    DWORD size = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(hProc, 0, buf, &size) != 0;
+    CloseHandle(hProc);
+    if (!ok) return {};
+    std::wstring name = PathFindFileNameW(buf);
+    CharLowerW(name.data());
+    return name;
+}
+
+// 対象プロセスのオーディオセッションをミュートし、復元用リストを返す
+//
+// targets が空の場合は空リストを返す（ダッキング無効）。
+// COM デバイス取得失敗時はログ出力して空リストを返す。
+// 元々ミュート済みのセッションはスキップする（復元時にアンミュートしない）。
+// 呼び出し元は COM が初期化済みであること（STA/MTA 問わず）。
+static std::vector<winrt::com_ptr<ISimpleAudioVolume>> duckAudioSessions(
+    const std::vector<std::wstring>& targets)
+{
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;
+    if (targets.empty()) return muted;
+
+    // targets を小文字化した比較セットを作成
+    std::set<std::wstring> targetSet;
+    for (const auto& t : targets) {
+        std::wstring lower = t;
+        CharLowerW(lower.data());
+        targetSet.insert(lower);
+    }
+
+    // デフォルト再生デバイスの取得
+    winrt::com_ptr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), enumerator.put_void()))) {
+        writeLog("duckAudioSessions: failed to create IMMDeviceEnumerator");
+        return muted;
+    }
+
+    winrt::com_ptr<IMMDevice> device;
+    if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, device.put()))) {
+        writeLog("duckAudioSessions: failed to get default audio endpoint");
+        return muted;
+    }
+
+    // セッションマネージャ取得
+    winrt::com_ptr<IAudioSessionManager2> mgr;
+    if (FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+            nullptr, mgr.put_void()))) {
+        writeLog("duckAudioSessions: failed to activate IAudioSessionManager2");
+        return muted;
+    }
+
+    // セッション列挙
+    winrt::com_ptr<IAudioSessionEnumerator> sessionEnum;
+    if (FAILED(mgr->GetSessionEnumerator(sessionEnum.put()))) {
+        writeLog("duckAudioSessions: failed to get session enumerator");
+        return muted;
+    }
+
+    int count = 0;
+    if (FAILED(sessionEnum->GetCount(&count))) {
+        writeLog("duckAudioSessions: failed to get session count");
+        return muted;
+    }
+
+    for (int i = 0; i < count; i++) {
+        winrt::com_ptr<IAudioSessionControl> ctrl;
+        if (FAILED(sessionEnum->GetSession(i, ctrl.put()))) continue;
+
+        auto ctrl2 = ctrl.try_as<IAudioSessionControl2>();
+        if (!ctrl2) continue;
+
+        DWORD pid = 0;
+        ctrl2->GetProcessId(&pid);
+        if (pid == 0) continue;
+
+        auto name = getProcessName(pid);
+        if (name.empty() || targetSet.find(name) == targetSet.end()) continue;
+
+        auto vol = ctrl.try_as<ISimpleAudioVolume>();
+        if (!vol) continue;
+
+        // 元々ミュート済みのセッションはスキップ
+        BOOL alreadyMuted = FALSE;
+        vol->GetMute(&alreadyMuted);
+        if (alreadyMuted) continue;
+
+        vol->SetMute(TRUE, nullptr);
+        muted.push_back(vol);
+    }
+
+    if (!muted.empty()) {
+        writeLog("duckAudioSessions: muted " + std::to_string(muted.size()) + " session(s)");
+    }
+    return muted;
+}
+
+// ミュートしたセッションを復元する
+static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>& muted) {
+    for (auto& vol : muted) {
+        vol->SetMute(FALSE, nullptr);
+    }
+    muted.clear();
+}
+
+// ffplay 終了を待機してアンミュートするスレッド関数
+//
+// STA で初期化することで、duckAudioSessions が STA で生成した ISimpleAudioVolume を
+// アパートメント境界を越えずに安全に操作できる。
+// CoWaitForMultipleHandles を使用することで STA のメッセージキューをポンピングし、
+// デッドロックを防ぐ。
+static DWORD WINAPI unduckThread(LPVOID param) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    auto* ctx = static_cast<DuckContext*>(param);
+
+    if (SUCCEEDED(hr) || hr == S_FALSE) {
+        // ffplay 終了を最大 30 秒待機（タイムアウトしても復元する）
+        // STA では CoWaitForMultipleHandles を使い、メッセージキューをポンピングする
+        DWORD idx = 0;
+        CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+            30000, 1, &ctx->hProcess, &idx);
+        unduckAudioSessions(ctx->muted);
+        writeLog("unduckAudioSessions: restored");
+    }
+    else {
+        writeLog("unduckThread: CoInitializeEx failed, skipping unmute");
+    }
+
+    CloseHandle(ctx->hProcess);
+    delete ctx; // COM ポインタを CoUninitialize 前に解放
+    if (SUCCEEDED(hr) || hr == S_FALSE) CoUninitialize();
+    return 0;
+}
+
 // ==================== 通知音再生 ====================
 
 // 埋め込みリソースのデータポインタとサイズを返す（ロード失敗時は nullptr）
@@ -490,15 +654,17 @@ static const void* loadResource(int id, DWORD& outSize) {
 // ffplay で通知音を起動する
 //
 // 再生フロー（埋め込み・ローカル共通）:
-//   adelay=1000（1秒無音） → intro.opus（チャイム） → 本体音声
+//   adelay=2000（2秒無音） → intro.opus（チャイム） → 本体音声 → apad（2秒無音）
 // Ogg チェイニングにより intro + 本体をバイト連結して stdin パイプで渡す。
 // intro ロード失敗時はチャイムなしで本体のみ再生（グレースフルデグレード）。
 // ローカルファイル読み込み失敗時は埋め込みリソースにフォールバック。
 // ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
-// BLE ヘッドホン対処: adelay=1000:all=1 で冒頭 1 秒の無音を追加し、接続遅延による冒頭切れを防ぐ。
+// BLE ヘッドホン対処: adelay=2000:all=1 で冒頭 2 秒の無音を追加し、接続遅延による冒頭切れを防ぐ。
+// apad=pad_dur=2 で末尾 2 秒の無音を追加し、ダッキング解除の遷移を滑らかにする。
+// ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、ffplay 終了後に復元する。
 // 注意: Ogg チェイニングはチャネル数が同一の場合のみ正常再生できる。
 //       intro.opus・gcalntfy.opus は 1ch モノ。ユーザ提供 gcalntfy.local.opus も 1ch を推奨。
-static void launchSound(const std::wstring& exeDir) {
+static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // intro リソースをロード（失敗時は nullptr のまま続行）
     DWORD introSize = 0;
     const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
@@ -530,7 +696,8 @@ static void launchSound(const std::wstring& exeDir) {
     si.hStdError  = nullptr;
 
     PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet -af adelay=1000:all=1 -i pipe:0";
+    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet"
+        L" -af adelay=2000:all=1,apad=pad_dur=2 -i pipe:0";
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
         TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         writeLog("launchSound: CreateProcessW failed: " + std::to_string(GetLastError()));
@@ -541,6 +708,9 @@ static void launchSound(const std::wstring& exeDir) {
 
     // 読み取り側は子プロセスに継承済みなので親側は閉じる
     CloseHandle(hReadPipe);
+
+    // ダッキング：ffplay 起動後、音声書き込み前にミュート
+    auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
     DWORD written = 0;
 
@@ -571,9 +741,26 @@ static void launchSound(const std::wstring& exeDir) {
 
     CloseHandle(hWritePipe); // EOF 送信
 
-    // ffplay は独立プロセスとして継続するため待機しない
-    CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    if (mutedSessions.empty()) {
+        // ダッキング無効: fire-and-forget（スレッド起動オーバーヘッドを回避）
+        CloseHandle(pi.hProcess);
+        return;
+    }
+
+    // ダッキング有効: 別スレッドで ffplay 終了待機 → アンミュート
+    auto* ctx = new DuckContext{pi.hProcess, std::move(mutedSessions)};
+    HANDLE hUnduck = CreateThread(nullptr, 0, unduckThread, ctx, 0, nullptr);
+    if (!hUnduck) {
+        // スレッド起動失敗時は即アンミュートして後始末（メインスレッド STA から実行）
+        unduckAudioSessions(ctx->muted);
+        CloseHandle(ctx->hProcess);
+        delete ctx;
+        return;
+    }
+    // hUnduck ハンドルはスレッドの完了を待機しないためここで閉じる（スレッドは独立して完走する）
+    CloseHandle(hUnduck);
 }
 
 // ==================== ショートカット ====================
@@ -777,7 +964,7 @@ int wmain() {
                         }
                         notifiedSet.insert(eventKey);
                         writeLog("notify: " + jstTime + " " + next->content);
-                        launchSound(exeDir);
+                        launchSound(exeDir, cfg);
                         showToast(utcToJstHHMM(next->datetime), toWide(next->content));
                         sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
                     }

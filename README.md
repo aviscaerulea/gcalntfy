@@ -232,7 +232,8 @@ GAS Web App の calendar API を定期ポーリングし、次の予定を 4 分
 
 - **時間帯別ポーリング間隔**: `schedule` に 24 要素の配列（分単位）で設定。`0` の時間帯はポーリングしない
 - **通知音**: exe に埋め込んだ Opus 音声を ffplay で再生。`gcalntfy.local.opus` を同フォルダに置くとカスタム音に上書き
-- **BLE ヘッドホン対応**: `adelay=1000` で冒頭 1 秒の無音を挿入して接続遅延による冒頭切れを防止
+- **BLE ヘッドホン対応**: `adelay=2000` で冒頭 2 秒の無音を挿入して接続遅延による冒頭切れを防止
+- **ダッキング**: 通知音再生中に `duck_targets` で指定したプロセスをミュートし、終了後に自動復元
 - **多重起動制御**: Job Object により新プロセス起動時に旧プロセスと子プロセス（ffplay）をまとめて終了
 - **設定オーバーライド**: `gcalntfy.local.toml` がある場合はキー単位で優先して使用
 
@@ -255,6 +256,8 @@ api_url = "https://script.google.com/macros/s/{DEPLOY_ID}/exec"
 api_token = "YOUR_SECRET"
 # 0時〜23時のポーリング間隔（分）。0=ポーリングしない
 schedule = [60, 60, 60, 60, 60, 60, 60, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 20, 20, 20, 60, 60]
+# 通知音再生中にミュートするプロセス名（空配列で無効）
+# duck_targets = ["chrome.exe", "msedge.exe"]
 ```
 
 ## 技術スタック
@@ -273,6 +276,7 @@ schedule = [60, 60, 60, 60, 60, 60, 60, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 
 
 - C++20（MSVC）
 - WinRT Toast Notifications（Windows.UI.Notifications）
+- WASAPI Core Audio API（ダッキング）
 - WinHTTP（HTTPS ポーリング）
 - toml++（TOML 設定パーサ）
 - ffplay（通知音再生）
