@@ -743,11 +743,16 @@ static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // intro リソースをロード（失敗時は何も再生しない）
     DWORD introSize = 0;
     const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
-    if (!introData || introSize == 0) return;
+    if (!introData || introSize == 0) {
+        writeLog("launchSound: loadResource failed");
+        return;
+    }
+    writeLog("launchSound: intro loaded (" + std::to_string(introSize) + " bytes)");
 
     // gcalntfy.opus の存在確認（exe 同ディレクトリ）
     std::wstring bodyPath = exeDir + L"\\gcalntfy.opus";
     bool hasBody = (GetFileAttributesW(bodyPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    writeLog("launchSound: body " + std::string(hasBody ? "found" : "not found"));
 
     // ダッキング開始（intro 再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
@@ -758,6 +763,7 @@ static void launchSound(const std::wstring& exeDir, const Config& cfg) {
         if (!mutedSessions.empty()) unduckAudioSessions(mutedSessions);
         return;
     }
+    writeLog("launchSound: intro playing");
 
     // ダッキング無効かつ body なし → fire-and-forget
     if (mutedSessions.empty() && !hasBody) {
