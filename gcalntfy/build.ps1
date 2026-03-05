@@ -1,6 +1,7 @@
 # vi: ts=4 sw=4 ff=unix fenc=utf-8
 # gcalntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
+param([string]$Version = "0.0.0")
 
 # VS 開発環境の初期化（DevShell モジュール経由、Build Tools 対応）
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -15,7 +16,9 @@ Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments 
 rc /nologo /fo out\resource.res src\resource.rc
 if ($LASTEXITCODE) { exit 1 }
 
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 `
+"#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
+
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `

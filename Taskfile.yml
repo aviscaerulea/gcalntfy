@@ -17,7 +17,7 @@ tasks:
     cmds:
       - taskkill //F //IM gcalntfy.exe 2>/dev/null || true
       - mkdir -p out
-      - pwsh -NonInteractive -File build.ps1
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
       - cp gcalntfy.toml out/
       - cp gcalntfy.opus out/
       - cp src/app.ico out/

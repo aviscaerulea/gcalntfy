@@ -57,6 +57,7 @@
 #pragma comment(lib, "user32.lib")
 
 #include "resource.h"
+#include "version.h"  // ビルド時生成（APP_VERSION を定義）
 
 // アプリケーション識別子（Toast 通知に使用）
 static const wchar_t* APP_AUMID = L"com.gcalntfy";
@@ -953,7 +954,7 @@ static void addTrayIcon(HWND hWnd) {
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
-    wcscpy_s(nid.szTip, L"gcalntfy");
+    wcscpy_s(nid.szTip, L"読み込み中...");
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
 }
@@ -966,18 +967,18 @@ static void removeTrayIcon(HWND hWnd) {
 
 // トレイアイコンのツールチップを更新する
 //
-// next が非 null の場合 "gcalntfy - 次: HH:MM タイトル"、null の場合 "gcalntfy - 本日の予定なし"
+// next が非 null の場合 "次: HH:MM タイトル"、null の場合 "本日の予定なし"
 static void updateTrayTooltip(HWND hWnd, const CalendarEvent* next) {
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
     if (next) {
         auto timeW  = utcToJstHHMM(next->datetime);
         auto titleW = toWide(next->content);
-        swprintf_s(nid.szTip, _countof(nid.szTip), L"gcalntfy - 次: %s %s",
+        swprintf_s(nid.szTip, _countof(nid.szTip), L"次: %s %s",
             timeW.c_str(), titleW.c_str());
     }
     else {
-        wcscpy_s(nid.szTip, L"gcalntfy - 本日の予定なし");
+        wcscpy_s(nid.szTip, L"本日の予定なし");
     }
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -989,6 +990,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"gcalntfy v" APP_VERSION);
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
             SetForegroundWindow(hWnd);
