@@ -1091,9 +1091,6 @@ int wmain() {
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
         g_hWnd = createTrayWindow();
-        addTrayIcon(g_hWnd);
-        writeLog("started");
-
         auto cfg = loadConfig(exeDir);
 
         if (cfg.apiUrl.empty()) {
@@ -1108,6 +1105,9 @@ int wmain() {
             writeLog("api_token is not set in gcalntfy.toml");
             return 1;
         }
+
+        addTrayIcon(g_hWnd);
+        writeLog("started");
         logSchedule(cfg.schedule);
 
         std::set<std::string> notifiedSet;
