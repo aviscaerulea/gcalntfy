@@ -1113,6 +1113,7 @@ int wmain() {
         std::set<std::string> notifiedSet;
         int lastJstDay = -1;
         ULONGLONG lastConfigCheck = GetTickCount64();
+        bool firstPoll = true; // 起動時は schedule に関わらず必ず1回ポーリング
 
         while (!g_shutdownRequested) {
             try {
@@ -1120,10 +1121,11 @@ int wmain() {
                 GetSystemTime(&utcNow);
                 auto jstNow = utcToJst(utcNow);
 
-                // 日付変更で通知済みセットをクリア
+                // 日付変更で通知済みセットをクリアし、当日の予定取得のため強制ポーリング
                 if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                     notifiedSet.clear();
                     lastJstDay = static_cast<int>(jstNow.wDay);
+                    firstPoll = true;
                 }
 
                 // 設定再読み込み（5分間隔、バリデーションエラー時は前回設定を維持）
@@ -1146,14 +1148,33 @@ int wmain() {
                 int interval = cfg.schedule[jstNow.wHour];
                 DWORD intervalMs = static_cast<DWORD>(interval) * 60000u;
 
-                // schedule=0 の時間帯: 次の正時までスリープ
-                if (interval == 0) {
+                // schedule=0 の時間帯: 次の正時までスリープ（初回は必ずポーリング）
+                if (interval == 0 && !firstPoll) {
                     long long remainMs = (long long)(60 - jstNow.wMinute) * 60000LL
                         - (long long)jstNow.wSecond * 1000LL
                         - (long long)jstNow.wMilliseconds;
                     if (remainMs < 1000) remainMs = 1000;
                     waitWithMessages(static_cast<DWORD>(remainMs));
                     continue;
+                }
+
+                // schedule=0 の初回ポーリング: 次の非ゼロ時間帯までを通知窓とする
+                // intervalMs=0 のまま通知判定に進むと diffMs <= intervalMs が成立せず通知窓が機能しないため補正する
+                if (interval == 0) {
+                    long long msAhead = (long long)(60 - jstNow.wMinute) * 60000LL
+                        - (long long)jstNow.wSecond * 1000LL
+                        - (long long)jstNow.wMilliseconds;
+                    if (msAhead < 1000) msAhead = 1000;
+                    bool found = false;
+                    for (int i = 1; i < 24; i++) {  // i=1: 現在時間帯は interval==0 確認済みのためスキップ
+                        if (cfg.schedule[(jstNow.wHour + i) % 24] > 0) { found = true; break; }
+                        msAhead += 60LL * 60000;  // 1時間分加算
+                    }
+                    if (found) {
+                        intervalMs = static_cast<DWORD>(
+                            (std::min)(msAhead, (long long)(UINT32_MAX)));
+                    }
+                    // found=false (全時間帯 0): intervalMs=0 のまま維持 → waitWithMessages(0) で即座に通常動作へ
                 }
 
                 // API ポーリング
@@ -1224,6 +1245,7 @@ int wmain() {
                     }
                 }
 
+                firstPoll = false;
                 waitWithMessages(sleepMs);
             }
             catch (...) {
