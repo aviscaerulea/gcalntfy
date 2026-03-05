@@ -925,9 +925,9 @@ static void waitWithMessages(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
     while (!g_shutdownRequested) {
         ULONGLONG now = GetTickCount64();
-        DWORD remain = (end > now)
-            ? static_cast<DWORD>((std::min)(end - now, static_cast<ULONGLONG>(INFINITE - 1)))
-            : 0;
+        if (end <= now) break;
+        DWORD remain = static_cast<DWORD>(
+            (std::min)(end - now, static_cast<ULONGLONG>(INFINITE - 1)));
         DWORD result = MsgWaitForMultipleObjects(0, nullptr, FALSE, remain, QS_ALLINPUT);
         if (result == WAIT_TIMEOUT) break;
         MSG msg;
@@ -935,16 +935,21 @@ static void waitWithMessages(DWORD ms) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (remain == 0) break;
     }
+}
+
+// NOTIFYICONDATAW の共通フィールドを初期化する
+static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = hWnd;
+    nid.uID    = 1;
+    return nid;
 }
 
 // トレイアイコンを登録する
 static void addTrayIcon(HWND hWnd) {
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize           = sizeof(nid);
-    nid.hWnd             = hWnd;
-    nid.uID              = 1;
+    auto nid = makeTrayNid(hWnd);
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
@@ -955,10 +960,7 @@ static void addTrayIcon(HWND hWnd) {
 
 // トレイアイコンを除去する
 static void removeTrayIcon(HWND hWnd) {
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd   = hWnd;
-    nid.uID    = 1;
+    auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
@@ -966,10 +968,7 @@ static void removeTrayIcon(HWND hWnd) {
 //
 // next が非 null の場合 "gcalntfy - 次: HH:MM タイトル"、null の場合 "gcalntfy - 本日の予定なし"
 static void updateTrayTooltip(HWND hWnd, const CalendarEvent* next) {
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd   = hWnd;
-    nid.uID    = 1;
+    auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
     if (next) {
         auto timeW  = utcToJstHHMM(next->datetime);
@@ -1060,7 +1059,8 @@ int wmain() {
     }
     if (hJob) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        jeli.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
             writeLog("warning: failed to set job object limits");
         }
@@ -1140,7 +1140,6 @@ int wmain() {
                         - (long long)jstNow.wMilliseconds;
                     if (remainMs < 1000) remainMs = 1000;
                     waitWithMessages(static_cast<DWORD>(remainMs));
-                    if (g_shutdownRequested) continue;
                     continue;
                 }
 
@@ -1161,7 +1160,6 @@ int wmain() {
                     }
                     writeLog(err);
                     waitWithMessages(RETRY_WAIT_MS);
-                    if (g_shutdownRequested) continue;
                     continue;
                 }
 
@@ -1208,12 +1206,10 @@ int wmain() {
                 }
 
                 waitWithMessages(sleepMs);
-                if (g_shutdownRequested) continue;
             }
             catch (...) {
                 writeLog("unexpected error in polling loop");
                 waitWithMessages(RETRY_WAIT_MS);
-                if (g_shutdownRequested) continue;
             }
         }
 
@@ -1222,6 +1218,7 @@ int wmain() {
         DestroyWindow(g_hWnd);
 
         if (g_restartRequested) {
+            writeLog("restarting");
             wchar_t exePath[MAX_PATH];
             GetModuleFileNameW(nullptr, exePath, MAX_PATH);
             std::wstring cmd = std::wstring(L"\"") + exePath + L"\"";
@@ -1229,11 +1226,13 @@ int wmain() {
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi = {};
             if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-                    FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                    FALSE, CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi)) {
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
-            writeLog("restarting");
+            else {
+                writeLog("failed to restart process");
+            }
         }
         else {
             writeLog("shutdown");
