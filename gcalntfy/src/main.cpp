@@ -8,7 +8,7 @@
  * 通知済みイベントは datetime+title で記憶して重複防止する。
  *
  * 終了コード:
- *   0  - 正常動作時は常駐し続けるため到達しない
+ *   0  - 正常終了（トレイメニューの「終了」または「再起動」による）
  *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
  *   2  - 予期しない初期化エラー
  *
@@ -31,6 +31,7 @@
 #undef GetObject  // GDI マクロを解除（winrt::IJsonValue::GetObject と競合するため）
 #include <winhttp.h>
 #include <shlwapi.h>
+#include <shellapi.h>
 #include <shobjidl_core.h>
 #include <propsys.h>
 #include <propkey.h>
@@ -53,6 +54,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "user32.lib")
 
 #include "resource.h"
 
@@ -67,6 +69,21 @@ static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
 // 設定ファイル再読み込みの間隔（5分）
 static constexpr ULONGLONG CONFIG_CHECK_INTERVAL_MS = 5uLL * 60 * 1000;
+
+// トレイアイコン用メッセージ ID
+static constexpr UINT WM_TRAYICON = WM_USER + 1;
+
+// コンテキストメニューコマンド ID
+static constexpr UINT IDM_RESTART = 40001;
+static constexpr UINT IDM_EXIT    = 40002;
+
+// シャットダウン・再起動フラグ
+static bool g_shutdownRequested = false;
+static bool g_restartRequested  = false;
+static HWND g_hWnd = nullptr;
+
+// TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
+static UINT WM_TASKBAR_CREATED = 0;
 
 // ==================== データ構造 ====================
 
@@ -899,6 +916,122 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title,
     notifier.Show(notification);
 }
 
+// ==================== トレイアイコン ====================
+
+// メッセージポンプしつつ指定時間（ミリ秒）待機する Sleep() 代替
+//
+// g_shutdownRequested が true になった時点で即座にリターンする。
+static void waitWithMessages(DWORD ms) {
+    ULONGLONG end = GetTickCount64() + ms;
+    while (!g_shutdownRequested) {
+        ULONGLONG now = GetTickCount64();
+        DWORD remain = (end > now)
+            ? static_cast<DWORD>((std::min)(end - now, static_cast<ULONGLONG>(INFINITE - 1)))
+            : 0;
+        DWORD result = MsgWaitForMultipleObjects(0, nullptr, FALSE, remain, QS_ALLINPUT);
+        if (result == WAIT_TIMEOUT) break;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (remain == 0) break;
+    }
+}
+
+// トレイアイコンを登録する
+static void addTrayIcon(HWND hWnd) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize           = sizeof(nid);
+    nid.hWnd             = hWnd;
+    nid.uID              = 1;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+    wcscpy_s(nid.szTip, L"gcalntfy");
+    Shell_NotifyIconW(NIM_ADD, &nid);
+    if (nid.hIcon) DestroyIcon(nid.hIcon);
+}
+
+// トレイアイコンを除去する
+static void removeTrayIcon(HWND hWnd) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = hWnd;
+    nid.uID    = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+// トレイアイコンのツールチップを更新する
+//
+// next が非 null の場合 "gcalntfy - 次: HH:MM タイトル"、null の場合 "gcalntfy - 本日の予定なし"
+static void updateTrayTooltip(HWND hWnd, const CalendarEvent* next) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = hWnd;
+    nid.uID    = 1;
+    nid.uFlags = NIF_TIP;
+    if (next) {
+        auto timeW  = utcToJstHHMM(next->datetime);
+        auto titleW = toWide(next->content);
+        swprintf_s(nid.szTip, _countof(nid.szTip), L"gcalntfy - 次: %s %s",
+            timeW.c_str(), titleW.c_str());
+    }
+    else {
+        wcscpy_s(nid.szTip, L"gcalntfy - 本日の予定なし");
+    }
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+// トレイアイコン用ウィンドウプロシージャ
+static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_TRAYICON) {
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
+            AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
+            SetForegroundWindow(hWnd);
+            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+            DestroyMenu(hMenu);
+        }
+        return 0;
+    }
+    if (msg == WM_COMMAND) {
+        UINT id = LOWORD(wParam);
+        if (id == IDM_RESTART) {
+            g_restartRequested  = true;
+            g_shutdownRequested = true;
+        }
+        else if (id == IDM_EXIT) {
+            g_shutdownRequested = true;
+        }
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        PostQuitMessage(0);
+        return 0;
+    }
+    if (WM_TASKBAR_CREATED != 0 && msg == WM_TASKBAR_CREATED) {
+        addTrayIcon(hWnd);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// HWND_MESSAGE 非表示ウィンドウを作成してトレイメッセージ受信に使用する
+static HWND createTrayWindow() {
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = trayWndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"gcalntfy_tray";
+    RegisterClassExW(&wc);
+    return CreateWindowExW(0, L"gcalntfy_tray", nullptr, 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+}
+
 // ==================== エントリポイント ====================
 
 int wmain() {
@@ -943,6 +1076,9 @@ int wmain() {
         winrt::init_apartment();
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
         ensureShortcut();
+        WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
+        g_hWnd = createTrayWindow();
+        addTrayIcon(g_hWnd);
         writeLog("started");
 
         auto cfg = loadConfig(exeDir);
@@ -965,7 +1101,7 @@ int wmain() {
         int lastJstDay = -1;
         ULONGLONG lastConfigCheck = GetTickCount64();
 
-        while (true) {
+        while (!g_shutdownRequested) {
             try {
                 SYSTEMTIME utcNow;
                 GetSystemTime(&utcNow);
@@ -1003,7 +1139,8 @@ int wmain() {
                         - (long long)jstNow.wSecond * 1000LL
                         - (long long)jstNow.wMilliseconds;
                     if (remainMs < 1000) remainMs = 1000;
-                    Sleep(static_cast<DWORD>(remainMs));
+                    waitWithMessages(static_cast<DWORD>(remainMs));
+                    if (g_shutdownRequested) continue;
                     continue;
                 }
 
@@ -1023,7 +1160,8 @@ int wmain() {
                         err += " (status " + std::to_string(httpStatus) + ")";
                     }
                     writeLog(err);
-                    Sleep(RETRY_WAIT_MS);
+                    waitWithMessages(RETRY_WAIT_MS);
+                    if (g_shutdownRequested) continue;
                     continue;
                 }
 
@@ -1038,6 +1176,8 @@ int wmain() {
                 // 次のイベント検索 → 通知判定
                 const CalendarEvent* next = errorMsg.empty() ? findNextEvent(events, nowUtc) : nullptr;
                 DWORD sleepMs = intervalMs;
+
+                if (g_hWnd) updateTrayTooltip(g_hWnd, next);
 
                 if (next) {
                     std::string eventKey = next->datetime + "|" + next->content;
@@ -1055,7 +1195,8 @@ int wmain() {
                     else if (!alreadyNotified && diffMs <= static_cast<long long>(intervalMs)) {
                         // ポーリング窓内: 4 分前まで待機して通知
                         if (diffMs > NOTIFY_LEAD_MS) {
-                            Sleep(static_cast<DWORD>(diffMs - NOTIFY_LEAD_MS));
+                            waitWithMessages(static_cast<DWORD>(diffMs - NOTIFY_LEAD_MS));
+                            if (g_shutdownRequested) continue;
                         }
                         notifiedSet.insert(eventKey);
                         writeLog("notify: " + jstTime + " " + next->content);
@@ -1066,12 +1207,36 @@ int wmain() {
                     }
                 }
 
-                Sleep(sleepMs);
+                waitWithMessages(sleepMs);
+                if (g_shutdownRequested) continue;
             }
             catch (...) {
                 writeLog("unexpected error in polling loop");
-                Sleep(RETRY_WAIT_MS);
+                waitWithMessages(RETRY_WAIT_MS);
+                if (g_shutdownRequested) continue;
             }
+        }
+
+        // ループ終了後のクリーンアップ
+        removeTrayIcon(g_hWnd);
+        DestroyWindow(g_hWnd);
+
+        if (g_restartRequested) {
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            std::wstring cmd = std::wstring(L"\"") + exePath + L"\"";
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+                    FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            writeLog("restarting");
+        }
+        else {
+            writeLog("shutdown");
         }
     }
     catch (...) {
@@ -1079,5 +1244,5 @@ int wmain() {
         return 2;
     }
 
-    return 0; // 正常動作時は常駐し続けるため到達しない
+    return 0;
 }
