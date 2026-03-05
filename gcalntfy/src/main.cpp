@@ -75,12 +75,16 @@ static constexpr ULONGLONG CONFIG_CHECK_INTERVAL_MS = 5uLL * 60 * 1000;
 static constexpr UINT WM_TRAYICON = WM_USER + 1;
 
 // コンテキストメニューコマンド ID
-static constexpr UINT IDM_RESTART = 40001;
-static constexpr UINT IDM_EXIT    = 40002;
+static constexpr UINT IDM_RESTART    = 40001;
+static constexpr UINT IDM_EXIT       = 40002;
+static constexpr UINT IDM_SKIP_SOUND = 40003;
 
 // シャットダウン・再起動フラグ
 static bool g_shutdownRequested = false;
 static bool g_restartRequested  = false;
+
+// 次回通知の音声スキップフラグ（チェックで有効、通知後に自動解除）
+static bool g_skipNextSound = false;
 static HWND g_hWnd = nullptr;
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
@@ -992,6 +996,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             HMENU hMenu = CreatePopupMenu();
             AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"gcalntfy v" APP_VERSION);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
+                IDM_SKIP_SOUND, L"次回の音声通知を無効");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
             SetForegroundWindow(hWnd);
@@ -1008,6 +1015,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         else if (id == IDM_EXIT) {
             g_shutdownRequested = true;
+        }
+        else if (id == IDM_SKIP_SOUND) {
+            g_skipNextSound = !g_skipNextSound;
         }
         return 0;
     }
@@ -1201,7 +1211,13 @@ int wmain() {
                         }
                         notifiedSet.insert(eventKey);
                         writeLog("notify: " + jstTime + " " + next->content);
-                        launchSound(exeDir, cfg);
+                        if (g_skipNextSound) {
+                            writeLog("sound skipped (one-shot mute)");
+                            g_skipNextSound = false;
+                        }
+                        else {
+                            launchSound(exeDir, cfg);
+                        }
                         showToast(jstTimeW, toWide(next->content),
                                   toWide(next->permalink));
                         sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
