@@ -47,6 +47,11 @@
 #include <set>
 #include <optional>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 
 #pragma comment(lib, "windowsapp.lib")
@@ -79,12 +84,12 @@ static constexpr UINT IDM_RESTART    = 40001;
 static constexpr UINT IDM_EXIT       = 40002;
 static constexpr UINT IDM_SKIP_SOUND = 40003;
 
-// シャットダウン・再起動フラグ
-static bool g_shutdownRequested = false;
-static bool g_restartRequested  = false;
+// シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
+static std::atomic<bool> g_shutdownRequested{false};
+static std::atomic<bool> g_restartRequested{false};
 
-// 次回通知の音声スキップフラグ（チェックで有効、通知後に自動解除）
-static bool g_skipNextSound = false;
+// 次回通知の音声スキップフラグ（WndProc でトグル、通知スレッドで消費）
+static std::atomic<bool> g_skipNextSound{false};
 static HWND g_hWnd = nullptr;
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
@@ -112,6 +117,13 @@ struct Config {
     std::vector<std::wstring> duckTargets; // 通知音再生中にミュートするプロセス名
     bool operator==(const Config&) const = default;
 };
+
+// メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
+static std::mutex              g_mtx;
+static std::condition_variable g_cv;
+static std::vector<CalendarEvent> g_pendingEvents;
+static Config                  g_currentConfig;
+static bool                    g_eventsUpdated = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
@@ -436,16 +448,6 @@ static ParseResult parseCalendarEvents(const std::string& json) {
         result.errorMsg = "JSON parse error: unknown exception";
     }
     return result;
-}
-
-// datetime >= nowUtc の最初のイベントを検索する（なければ nullptr）
-static const CalendarEvent* findNextEvent(
-    const std::vector<CalendarEvent>& events, const std::string& nowUtc)
-{
-    for (const auto& e : events) {
-        if (e.datetime >= nowUtc) return &e;
-    }
-    return nullptr;
 }
 
 // ==================== 設定読み込み ====================
@@ -971,18 +973,31 @@ static void removeTrayIcon(HWND hWnd) {
 
 // トレイアイコンのツールチップを更新する
 //
-// next が非 null の場合 "次: HH:MM タイトル"、null の場合 "本日の予定なし"
-static void updateTrayTooltip(HWND hWnd, const CalendarEvent* next) {
+// nowUtc 以降の直近同時刻イベントをすべて表示する。
+// 表示形式: "次: HH:MM タイトル1 / タイトル2"（szTip 上限 128 文字で切り捨て）
+static void updateTrayTooltip(HWND hWnd, const std::vector<CalendarEvent>& events,
+                              const std::string& nowUtc)
+{
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
-    if (next) {
-        auto timeW  = utcToJstHHMM(next->datetime);
-        auto titleW = toWide(next->content);
-        swprintf_s(nid.szTip, _countof(nid.szTip), L"次: %s %s",
-            timeW.c_str(), titleW.c_str());
+
+    // nowUtc 以降の直近イベントを検索
+    const CalendarEvent* first = nullptr;
+    for (const auto& e : events) {
+        if (e.datetime >= nowUtc) { first = &e; break; }
+    }
+
+    if (!first) {
+        wcscpy_s(nid.szTip, L"本日の予定なし");
     }
     else {
-        wcscpy_s(nid.szTip, L"本日の予定なし");
+        std::wstring tip = L"次: " + utcToJstHHMM(first->datetime) + L" " + toWide(first->content);
+        for (const auto& e : events) {
+            if (e.datetime != first->datetime || &e == first) continue;
+            tip += L" / " + toWide(e.content);
+        }
+        if (tip.size() >= _countof(nid.szTip)) tip.resize(_countof(nid.szTip) - 1);
+        wcscpy_s(nid.szTip, tip.c_str());
     }
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -1042,6 +1057,111 @@ static HWND createTrayWindow() {
     RegisterClassExW(&wc);
     return CreateWindowExW(0, L"gcalntfy_tray", nullptr, 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+}
+
+// ==================== 通知スレッド ====================
+
+// イベントの重複通知防止キーを生成する
+static inline std::string eventKey(const CalendarEvent& e) {
+    return e.datetime + "|" + e.content;
+}
+
+// notifiedSet の自然失効: 新リストに含まれないキーを削除する
+static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
+                             const std::vector<CalendarEvent>& events)
+{
+    std::set<std::string> validKeys;
+    for (const auto& e : events) validKeys.insert(eventKey(e));
+    for (auto it = notifiedSet.begin(); it != notifiedSet.end(); ) {
+        it = validKeys.count(*it) ? std::next(it) : notifiedSet.erase(it);
+    }
+}
+
+// 通知スレッド: メインスレッドから予定リストを受け取り、4分前に Toast 通知を実行する
+//
+// STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
+// 直近の未通知イベント群（同時刻含む）を特定して4分前まで wait_for し、
+// 4分前到達時にチャイム1回 + イベントごとの Toast を連続表示する。
+static void notifyThreadFunc(const std::wstring& exeDir) {
+    winrt::init_apartment();
+
+    std::set<std::string>      notifiedSet;
+    std::vector<CalendarEvent> localEvents;
+    Config                     localConfig;
+
+    while (!g_shutdownRequested) {
+        // 予定リスト更新を待機
+        {
+            std::unique_lock<std::mutex> lk(g_mtx);
+            g_cv.wait(lk, [] { return g_eventsUpdated || g_shutdownRequested.load(); });
+            if (g_shutdownRequested) break;
+            localEvents     = g_pendingEvents;
+            localConfig     = g_currentConfig;
+            g_eventsUpdated = false;
+        }
+        pruneNotifiedSet(notifiedSet, localEvents);
+
+        // 直近未通知イベントを順次通知する内側ループ
+        while (!g_shutdownRequested) {
+            auto nowUtc = getCurrentUtcISO();
+
+            // 未通知かつ nowUtc 以降の最小 datetime を探す
+            std::string targetDatetime;
+            for (const auto& e : localEvents) {
+                if (e.datetime < nowUtc) continue;
+                if (notifiedSet.count(eventKey(e))) continue;
+                targetDatetime = e.datetime;
+                break;
+            }
+            if (targetDatetime.empty()) break; // 通知すべき予定なし → 外側ループへ
+
+            // 同時刻のイベントをすべて収集
+            std::vector<const CalendarEvent*> group;
+            for (const auto& e : localEvents) {
+                if (e.datetime == targetDatetime) group.push_back(&e);
+            }
+
+            // 4 分前まで待機
+            long long diffMs = calcDiffMs(targetDatetime, nowUtc);
+            if (diffMs <= 0) {
+                // 開始済み: 通知せずに notifiedSet に追加
+                for (const auto* ev : group) notifiedSet.insert(eventKey(*ev));
+                continue;
+            }
+            if (diffMs > NOTIFY_LEAD_MS) {
+                std::unique_lock<std::mutex> lk(g_mtx);
+                auto wakeAt = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(diffMs - NOTIFY_LEAD_MS);
+                g_cv.wait_until(lk, wakeAt,
+                    [] { return g_eventsUpdated || g_shutdownRequested.load(); });
+                if (g_eventsUpdated) {
+                    localEvents     = g_pendingEvents;
+                    localConfig     = g_currentConfig;
+                    g_eventsUpdated = false;
+                    pruneNotifiedSet(notifiedSet, localEvents);
+                    continue; // 内側ループ先頭へ戻り再評価
+                }
+                if (g_shutdownRequested) break;
+            }
+
+            // 通知実行
+            auto jstTimeW = utcToJstHHMM(targetDatetime);
+            auto jstTime  = wideToUtf8(jstTimeW);
+            writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s))");
+            if (g_skipNextSound.exchange(false)) {
+                writeLog("sound skipped (one-shot mute)");
+            }
+            else {
+                launchSound(exeDir, localConfig);
+            }
+            for (const auto* ev : group) {
+                showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
+                notifiedSet.insert(eventKey(*ev));
+            }
+        }
+    }
+
+    winrt::uninit_apartment();
 }
 
 // ==================== エントリポイント ====================
@@ -1110,7 +1230,9 @@ int wmain() {
         writeLog("started");
         logSchedule(cfg.schedule);
 
-        std::set<std::string> notifiedSet;
+        // 通知スレッド起動
+        std::thread notifyThread(notifyThreadFunc, exeDir);
+
         int lastJstDay = -1;
         ULONGLONG lastConfigCheck = GetTickCount64();
         bool firstPoll = true; // 起動時は schedule に関わらず必ず1回ポーリング
@@ -1121,9 +1243,8 @@ int wmain() {
                 GetSystemTime(&utcNow);
                 auto jstNow = utcToJst(utcNow);
 
-                // 日付変更で通知済みセットをクリアし、当日の予定取得のため強制ポーリング
+                // 日付変更: 強制ポーリングを促す（notifiedSet は通知スレッドが自然失効で管理）
                 if (static_cast<int>(jstNow.wDay) != lastJstDay) {
-                    notifiedSet.clear();
                     lastJstDay = static_cast<int>(jstNow.wDay);
                     firstPoll = true;
                 }
@@ -1158,31 +1279,17 @@ int wmain() {
                     continue;
                 }
 
-                // schedule=0 の初回ポーリング: 次の非ゼロ時間帯までを通知窓とする
-                // intervalMs=0 のまま通知判定に進むと diffMs <= intervalMs が成立せず通知窓が機能しないため補正する
-                if (interval == 0) {
-                    long long msAhead = (long long)(60 - jstNow.wMinute) * 60000LL
-                        - (long long)jstNow.wSecond * 1000LL
-                        - (long long)jstNow.wMilliseconds;
-                    if (msAhead < 1000) msAhead = 1000;
-                    bool found = false;
-                    for (int i = 1; i < 24; i++) {  // i=1: 現在時間帯は interval==0 確認済みのためスキップ
-                        if (cfg.schedule[(jstNow.wHour + i) % 24] > 0) { found = true; break; }
-                        msAhead += 60LL * 60000;  // 1時間分加算
-                    }
-                    if (found) {
-                        intervalMs = static_cast<DWORD>(
-                            (std::min)(msAhead, (long long)(UINT32_MAX)));
-                    }
-                    // found=false (全時間帯 0): intervalMs=0 のまま維持 → waitWithMessages(0) で即座に通常動作へ
-                }
-
-                // API ポーリング
+                // API ポーリング（現在から 12 時間以内の全予定を取得）
                 auto dateJST = getCurrentDateTimeJST();
                 auto nowUtc  = getCurrentUtcISO();
+                auto endJst  = utcToJst(shiftSystemTime(utcNow, 12LL * 60 * 60 * 10'000'000LL));
+                wchar_t endBuf[32];
+                swprintf_s(endBuf, _countof(endBuf), L"%04d-%02d-%02d %02d:%02d",
+                    endJst.wYear, endJst.wMonth, endJst.wDay, endJst.wHour, endJst.wMinute);
                 std::string jsonBody = "{\"token\":\""
                     + escapeJson(wideToUtf8(cfg.apiToken)) + "\",\"date\":\""
-                    + escapeJson(wideToUtf8(dateJST))
+                    + escapeJson(wideToUtf8(dateJST)) + "\",\"end\":\""
+                    + escapeJson(wideToUtf8(endBuf))
                     + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\",\"permalink\"]}";
 
                 DWORD httpStatus = 0;
@@ -1205,54 +1312,30 @@ int wmain() {
                     writeLog("poll: " + std::to_string(events.size()) + " events");
                 }
 
-                // 次のイベント検索 → 通知判定
-                const CalendarEvent* next = errorMsg.empty() ? findNextEvent(events, nowUtc) : nullptr;
-                DWORD sleepMs = intervalMs;
-
-                if (g_hWnd) updateTrayTooltip(g_hWnd, next);
-
-                if (next) {
-                    std::string eventKey = next->datetime + "|" + next->content;
-                    long long diffMs = calcDiffMs(next->datetime, nowUtc);
-                    bool alreadyNotified = notifiedSet.count(eventKey) > 0;
-                    auto jstTimeW = utcToJstHHMM(next->datetime);
-                    auto jstTime  = wideToUtf8(jstTimeW);
-                    writeLog("next: " + jstTime + " " + next->content
-                        + " (" + std::to_string(diffMs) + "ms ahead)");
-
-                    if (diffMs <= 0) {
-                        // 既に開始済み
-                        notifiedSet.insert(eventKey);
+                // ポーリング結果を通知スレッドへ渡す
+                if (errorMsg.empty()) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_mtx);
+                        g_pendingEvents = events;
+                        g_currentConfig = cfg;
+                        g_eventsUpdated = true;
                     }
-                    else if (!alreadyNotified && diffMs <= static_cast<long long>(intervalMs)) {
-                        // ポーリング窓内: 4 分前まで待機して通知
-                        if (diffMs > NOTIFY_LEAD_MS) {
-                            waitWithMessages(static_cast<DWORD>(diffMs - NOTIFY_LEAD_MS));
-                            if (g_shutdownRequested) continue;
-                        }
-                        notifiedSet.insert(eventKey);
-                        writeLog("notify: " + jstTime + " " + next->content);
-                        if (g_skipNextSound) {
-                            writeLog("sound skipped (one-shot mute)");
-                            g_skipNextSound = false;
-                        }
-                        else {
-                            launchSound(exeDir, cfg);
-                        }
-                        showToast(jstTimeW, toWide(next->content),
-                                  toWide(next->permalink));
-                        sleepMs = 60000; // 通知直後は 1 分待って再ポーリング
-                    }
+                    g_cv.notify_one();
+                    if (g_hWnd) updateTrayTooltip(g_hWnd, events, nowUtc);
                 }
 
                 firstPoll = false;
-                waitWithMessages(sleepMs);
+                waitWithMessages(intervalMs);
             }
             catch (...) {
                 writeLog("unexpected error in polling loop");
                 waitWithMessages(RETRY_WAIT_MS);
             }
         }
+
+        // 通知スレッドを停止
+        g_cv.notify_one();
+        notifyThread.join();
 
         // ループ終了後のクリーンアップ
         removeTrayIcon(g_hWnd);
