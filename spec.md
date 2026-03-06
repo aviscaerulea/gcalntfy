@@ -30,7 +30,8 @@ Content-Type: application/json
 |---|---|---|
 | `token` | 必須 | API トークン。Script Properties の `API_TOKEN` と照合する |
 | `media` | 必須 | 取得対象。`chat` / `calendar` / `mail` / `drive` / `all` / `member` のいずれか |
-| `date` | media が member 以外の場合に必須 | 取得対象日時（JST 基準）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
+| `date` | media が member 以外の場合に必須 | 取得開始日時（JST 基準）。`YYYY-MM-DD` で当日 JST 00:00、`YYYY-MM-DD HH:MM` で指定時刻 |
+| `end` | 任意 | 取得終了日時（JST 基準）。`YYYY-MM-DD` でその日の終わり（翌日 JST 00:00）、`YYYY-MM-DD HH:MM` で指定時刻。省略時は `date` から 24 時間後。`date` より前の場合は自動で入れ替え |
 | `fields` | 任意 | 返却するフィールド名の配列。省略時は全フィールドを返す（後方互換）。`media=all` は無視される |
 | `emails` | media="member" の場合に必須 | 解決するメールアドレスの配列 |
 | `expandLimit` | media="member" の場合に任意 | グループ展開の上限数。`0`（デフォルト）で上限なし。`N>0` で展開後人数が N を超えるグループはグループ名を返す |
@@ -41,9 +42,13 @@ GAS の実行時間制限（6 分）を考慮し、全メディア同時取得�
 `fields` パラメータを使うと、必要なフィールドだけ取得して高コスト API 呼び出しをスキップできる。
 calendar メディアの場合、`attendees` / `sender` を省略すると People API 呼び出しが発生しないため大幅に高速化する。
 
-`date` パラメータの時刻指定について:
-- `YYYY-MM-DD` のみ: JST 00:00:00 〜 翌日 00:00:00（当日全体）
-- `YYYY-MM-DD HH:MM`: JST 指定時刻 〜 翌日 00:00:00（日付は跨がない）
+`date` / `end` パラメータについて:
+- `date: "YYYY-MM-DD"`: JST 00:00:00 を開始
+- `date: "YYYY-MM-DD HH:MM"`: JST 指定時刻を開始
+- `end` 省略: 開始から 24 時間後を終了（後方互換）
+- `end: "YYYY-MM-DD"`: その日の終わり（翌日 JST 00:00）を終了
+- `end: "YYYY-MM-DD HH:MM"`: JST 指定時刻を終了
+- `end` が `date` より前の場合は自動的に入れ替えて処理する
 
 ### トークン認証
 

@@ -5,6 +5,7 @@
  * 全メディアで共有する基盤機能を提供する。
  * - JSON レスポンス生成（成功/エラー）
  * - Google REST API の認証付き呼び出し（callApi）
+ * - JST 日時文字列パーサ（parseJstDateTime）
  * - JST 基準の日付範囲を UTC RFC3339 に変換（getDateRange）
  * - Chat API 用ユーザー ID 取得（getMyUserId）
  */
@@ -55,31 +56,60 @@ function callApi(baseUrl, path, params) {
 }
 
 /**
+ * JST 日時文字列を Date オブジェクトに変換する
+ *
+ * "YYYY-MM-DD" → JST 00:00:00、"YYYY-MM-DD HH:MM" → JST 指定時刻。
+ *
+ * @param {string} str - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式
+ * @returns {Date|null} 無効な場合は null
+ */
+function parseJstDateTime(str) {
+    const isoStr = str.includes(" ")
+        ? str.replace(" ", "T") + ":00+09:00"
+        : str + "T00:00:00+09:00";
+    const d = new Date(isoStr);
+    return isNaN(d.getTime()) ? null : d;
+}
+
+/**
  * 日付（時刻）文字列から JST 基準の開始・終了の UTC RFC3339 ペアを生成
  *
  * "YYYY-MM-DD" の場合は JST 当日 00:00:00 を開始とする。
  * "YYYY-MM-DD HH:MM" の場合は指定時刻を開始とする。
- * 終了は常に同日の翌日 JST 00:00:00 で固定（日付は跨がない）。
+ * endStr 省略時は start + 24h。endStr が "YYYY-MM-DD" の場合はその翌日 JST 00:00（その日の終わり）。
+ * end < start の場合は start と end を入れ替える。
  *
- * @param {string} dateStr - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式の文字列
- * @returns {{startTime: string, endTime: string}|null} - 無効な日付の場合は null
+ * @param {string} dateStr - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式
+ * @param {string} [endStr] - 終了日時。省略時は start + 24h
+ * @returns {{startTime: string, endTime: string}|null} startTime < endTime が保証される。無効な日付の場合は null
  */
-function getDateRange(dateStr) {
-    const hasTime = dateStr.length > 10;
-    const isoStr = hasTime
-        ? dateStr.replace(" ", "T") + ":00+09:00"
-        : dateStr + "T00:00:00+09:00";
+function getDateRange(dateStr, endStr) {
+    const start = parseJstDateTime(dateStr);
+    if (!start) return null;
 
-    const start = new Date(isoStr);
-    if (isNaN(start.getTime())) return null;
+    let end;
+    if (endStr) {
+        const endBase = parseJstDateTime(endStr);
+        if (!endBase) return null;
+        // "YYYY-MM-DD" のみの場合はその日の終わり（翌日 JST 00:00）
+        end = endStr.includes(" ") ? endBase : new Date(endBase.getTime() + MS_PER_DAY);
+    }
+    else {
+        end = new Date(start.getTime() + MS_PER_DAY);
+    }
 
-    // 終了は時刻指定の有無に関わらず同日の翌日 JST 0:00
-    const dayStart = new Date(dateStr.substring(0, 10) + "T00:00:00+09:00");
-    const end = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+    // start と end が同一時刻の場合はゼロ幅期間となるため無効
+    if (end.getTime() === start.getTime()) return null;
+
+    // start と end が逆転している場合は入れ替える
+    if (end < start) {
+        console.warn("getDateRange: start と end が逆転しているため入れ替えた");
+    }
+    const [s, e] = end < start ? [end, start] : [start, end];
 
     return {
-        startTime: start.toISOString(),
-        endTime: end.toISOString()
+        startTime: s.toISOString(),
+        endTime: e.toISOString()
     };
 }
 

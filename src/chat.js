@@ -75,7 +75,7 @@ function listAllSpaces() {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetChatActivities() {
-    const result = getChatActivities("2026-02-27");
+    const result = getChatActivities(getDateRange("2026-02-27"));
     console.log(`取得件数: ${result.length}`);
     for (const activity of result) {
         console.log(JSON.stringify(activity));
@@ -342,14 +342,10 @@ function fetchThreadHeads(threadInfos) {
  * 自分が送信したスペースを対象として全メッセージ（他者含む）を出力する。
  * 返信のスレッド親メッセージ（別日投稿を含む）も結果に含めて文脈を保持する。
  *
- * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
-function getChatActivities(dateStr) {
-    const range = getDateRange(dateStr);
-    if (!range) {
-        throw new Error("無効な日付形式: " + dateStr);
-    }
+function getChatActivities(range) {
 
     const myUserId = getMyUserId();
     console.log("自分のユーザーID:", myUserId);

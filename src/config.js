@@ -52,5 +52,8 @@ const MEDIA_ALL = "all";
 // 氏名解決のメディア種別識別子
 const MEDIA_MEMBER = "member";
 
+// 1日のミリ秒数（getDateRange のデフォルト期間計算用）
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
 // Script Properties のキー名（API トークン）
 const PROP_API_TOKEN = "API_TOKEN";

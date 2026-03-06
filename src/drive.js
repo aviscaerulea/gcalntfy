@@ -109,7 +109,7 @@ function buildDriveActivity(file, startTime, endTime) {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetDriveActivities() {
-    const result = getDriveActivities("2026-02-27");
+    const result = getDriveActivities(getDateRange("2026-02-27"));
     console.log(`取得件数: ${result.length}`);
     for (const activity of result) {
         console.log(JSON.stringify(activity));
@@ -122,12 +122,10 @@ function debugGetDriveActivities() {
  * 自分が更新したファイル（マイドライブ・共有ドライブ含む）を取得する。
  * フォルダとゴミ箱のファイルは除外する。
  *
- * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
-function getDriveActivities(dateStr) {
-    const range = getDateRange(dateStr);
-    if (!range) throw new Error("無効な日付形式: " + dateStr);
+function getDriveActivities(range) {
 
     const files = listMyModifiedFiles(range.startTime, range.endTime);
     console.log(`対象ファイル: ${files.length} 件取得`);

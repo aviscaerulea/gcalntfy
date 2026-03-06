@@ -132,7 +132,7 @@ function buildCalendarActivity(event, nameCache, fields) {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetCalendarActivities() {
-    const result = getCalendarActivities("2026-02-27");
+    const result = getCalendarActivities(getDateRange("2026-02-27"));
     console.log(`取得件数: ${result.length}`);
     for (const activity of result) {
         console.log(JSON.stringify(activity));
@@ -147,13 +147,11 @@ function debugGetCalendarActivities() {
  * 繰り返しイベントは singleEvents=true により個別に展開して取得する。
  * fields に sender / attendees が含まれない場合、People API 呼び出しをスキップする。
  *
- * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @param {string[]|null} fields - 返却するフィールド名の配列。null なら全フィールド
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
-function getCalendarActivities(dateStr, fields) {
-    const range = getDateRange(dateStr);
-    if (!range) throw new Error("無効な日付形式: " + dateStr);
+function getCalendarActivities(range, fields) {
 
     const events = listPrimaryCalendarEvents(range.startTime, range.endTime);
     console.log(`カレンダーイベント: ${events.length} 件取得`);

@@ -358,7 +358,7 @@ function buildParent(message, cache) {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetGmailActivities() {
-    const result = getGmailActivities("2026-02-26");
+    const result = getGmailActivities(getDateRange("2026-02-26"));
     console.log(`取得件数: ${result.length}`);
     for (const activity of result) {
         console.log(JSON.stringify(activity));
@@ -372,12 +372,10 @@ function debugGetGmailActivities() {
  * サーバー側で絞り込んでから fetchAll で並列バッチ取得する。
  * 返信メールには外部スレッド親メッセージを parent オブジェクトとして付与する。
  *
- * @param {string} dateStr - "YYYY-MM-DD" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @returns {Object[]} アクティビティオブジェクトの配列（未ソート）
  */
-function getGmailActivities(dateStr) {
-    const range = getDateRange(dateStr);
-    if (!range) throw new Error("無効な日付形式: " + dateStr);
+function getGmailActivities(range) {
 
     const ids = listSentMessages(range.startTime, range.endTime);
     console.log(`送信メッセージ: ${ids.length} 件取得`);

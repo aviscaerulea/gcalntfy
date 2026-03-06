@@ -27,7 +27,8 @@ Google Workspace 上のアクティビティを活用するための 2 コンポ
 |---|---|---|
 | `token` | 必須 | API トークン（Script Properties の `API_TOKEN` と照合） |
 | `media` | 必須 | 取得対象（下表参照） |
-| `date` | `member` 以外は必須 | 取得対象日時（JST）。`YYYY-MM-DD` で当日全体、`YYYY-MM-DD HH:MM` で指定時刻から当日終わりまで |
+| `date` | `member` 以外は必須 | 取得開始日時（JST）。`YYYY-MM-DD` で当日 00:00、`YYYY-MM-DD HH:MM` で指定時刻 |
+| `end` | 任意 | 取得終了日時（JST）。`YYYY-MM-DD` でその日の終わり、`YYYY-MM-DD HH:MM` で指定時刻。省略時は `date` + 24h |
 | `fields` | 任意 | 返却するフィールド名の配列。省略時は全フィールドを返す |
 
 ### media パラメータ
@@ -62,9 +63,17 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -H "Content-Type: application/json" \
   -d '{"token":"YOUR_SECRET","date":"2026-02-27","media":"all"}' "$BASE"
 
-# 時刻指定（16:00 以降のみ）
+# 時刻指定（16:00 から 24 時間分）
 curl -X POST -H "Content-Type: application/json" \
   -d '{"token":"YOUR_SECRET","date":"2026-02-27 16:00","media":"chat"}' "$BASE"
+
+# 期間指定（12 時間分）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-27 18:00","end":"2026-02-28 06:00","media":"calendar"}' "$BASE"
+
+# 期間指定（7 日分）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"YOUR_SECRET","date":"2026-02-21","end":"2026-02-27","media":"all"}' "$BASE"
 
 # フィールド絞り込み（attendees/sender の高コスト API 解決をスキップして高速化）
 curl -X POST -H "Content-Type: application/json" \
@@ -177,7 +186,7 @@ curl -X POST -H "Content-Type: application/json" \
 }
 ```
 
-詳細な仕様は [SPEC.md](SPEC.md) を参照。
+詳細な仕様は [spec.md](spec.md) を参照。
 
 ## セットアップ
 

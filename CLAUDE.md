@@ -1,5 +1,5 @@
 @README.md
-@SPEC.md
+@spec.md
 
 ## 開発環境
 

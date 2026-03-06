@@ -19,7 +19,12 @@
  *
  * date パラメータ:
  *   YYYY-MM-DD       当日全体（JST 00:00〜翌日 00:00）
- *   YYYY-MM-DD HH:MM 指定時刻から当日終わりまで
+ *   YYYY-MM-DD HH:MM 指定時刻から 24 時間分
+ *
+ * end パラメータ（任意）:
+ *   省略             date から 24 時間分
+ *   YYYY-MM-DD       その日の終わり（翌日 JST 00:00）まで
+ *   YYYY-MM-DD HH:MM 指定時刻まで
  *
  * レスポンス:
  *   個別成功時: { "<media>": [ { datetime, content, permalink, ... }, ... ] }
@@ -30,6 +35,9 @@
  * 認証方式: POST ボディ内トークン + Script Properties の API_TOKEN と照合
  * 実行モード: USER_DEPLOYING（デプロイ者の権限で実行）
  */
+
+// date / end パラメータのバリデーション正規表現（YYYY-MM-DD または YYYY-MM-DD HH:MM）
+const DATE_FORMAT_RE = /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$/;
 
 // 各メディアのアクティビティ取得関数のマッピング
 // MEDIA_ALL / MEDIA_MEMBER 以外のすべてのメディアを列挙する
@@ -47,12 +55,12 @@ const MEDIA_GETTERS = {
  * ソート後に指定フィールドのみ抽出して返す。getter は datetime を常に返す必要がある。
  *
  * @param {Function} getter - アクティビティ取得関数
- * @param {string} dateStr - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @param {string[]|null} fields - 返却するフィールド名の配列。null なら全フィールド
  * @returns {Array} datetime 昇順でソート済みのアクティビティ配列
  */
-function fetchSorted(getter, dateStr, fields) {
-    const activities = getter(dateStr, fields);
+function fetchSorted(getter, range, fields) {
+    const activities = getter(range, fields);
     activities.sort((a, b) => a.datetime.localeCompare(b.datetime));
     if (!fields) return activities;
     return activities.map(a => {
@@ -70,13 +78,13 @@ function fetchSorted(getter, dateStr, fields) {
  * 各メディアを個別に取得し、メディアキーをキーとするオブジェクトで返す。
  * 各メディアの配列は datetime 昇順でソート済み。
  *
- * @param {string} dateStr - "YYYY-MM-DD" または "YYYY-MM-DD HH:MM" 形式の日付
+ * @param {{startTime: string, endTime: string}} range - 取得期間
  * @returns {Object} { chat: [...], calendar: [...], mail: [...], drive: [...] }
  */
-function getAllActivities(dateStr) {
+function getAllActivities(range) {
     const result = {};
     for (const [media, getter] of Object.entries(MEDIA_GETTERS)) {
-        result[media] = fetchSorted(getter, dateStr);
+        result[media] = fetchSorted(getter, range);
     }
     return result;
 }
@@ -131,7 +139,7 @@ function resolveMemberEmails(emails, expandLimit) {
  * GAS エディタから直接実行するためのラッパー（本番では使用しない）
  */
 function debugGetAllActivities() {
-    const result = getAllActivities("2026-03-01");
+    const result = getAllActivities(getDateRange("2026-03-01"));
     console.log(JSON.stringify(result, null, 2));
 }
 
@@ -198,6 +206,7 @@ function doPost(e) {
 /**
  * アクティビティ取得処理（chat / calendar / mail / drive / all）
  *
+ * date と end から取得期間を計算し、各 getter に range オブジェクトを渡す。
  * fields パラメータが指定された場合は指定フィールドのみ返す（後方互換: 省略時は全フィールド）。
  * media=all の場合は fields を無視して常にフル取得する。
  */
@@ -206,12 +215,22 @@ function handleActivityFetch(body, media) {
     if (!dateStr) {
         return createErrorResponse("date パラメータが必要（形式: YYYY-MM-DD または YYYY-MM-DD HH:MM）");
     }
-    if (!/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$/.test(dateStr)) {
+    if (!DATE_FORMAT_RE.test(dateStr)) {
         return createErrorResponse("date の形式が不正（正しい形式: YYYY-MM-DD または YYYY-MM-DD HH:MM）");
     }
 
+    const endStr = body.end || null;
+    if (endStr && !DATE_FORMAT_RE.test(endStr)) {
+        return createErrorResponse("end の形式が不正（正しい形式: YYYY-MM-DD または YYYY-MM-DD HH:MM）");
+    }
+
+    const range = getDateRange(dateStr, endStr);
+    if (!range) {
+        return createErrorResponse("日付が不正");
+    }
+
     if (media === MEDIA_ALL) {
-        return createJsonResponse(getAllActivities(dateStr));
+        return createJsonResponse(getAllActivities(range));
     }
 
     const getter = MEDIA_GETTERS[media];
@@ -220,7 +239,7 @@ function handleActivityFetch(body, media) {
     }
 
     const fields = Array.isArray(body.fields) && body.fields.length > 0 ? body.fields : null;
-    return createJsonResponse({ [media]: fetchSorted(getter, dateStr, fields) });
+    return createJsonResponse({ [media]: fetchSorted(getter, range, fields) });
 }
 
 /**
