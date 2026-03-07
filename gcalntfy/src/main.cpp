@@ -86,6 +86,7 @@ static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED    = 40005;
 static constexpr UINT IDM_OPEN_CONFIG      = 40006;
+static constexpr UINT IDM_OPEN_LOG         = 40007;
 
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
@@ -1229,6 +1230,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイル");
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイル");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
@@ -1270,6 +1272,20 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             // 設定ファイルを OS デフォルトのエディタで開く
             std::wstring toml = getExeDir() + L"\\gcalntfy.toml";
             ShellExecuteW(nullptr, L"open", toml.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else if (id == IDM_OPEN_LOG) {
+            // 当日のログファイルを開く（なければ logs フォルダをエクスプローラで開く）
+            if (g_logDir.empty()) return 0;
+            SYSTEMTIME st;
+            GetSystemTime(&st);
+            st = utcToJst(st);
+            char dateBuf[12];
+            sprintf_s(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+            std::wstring logPath = g_logDir + L"\\" + toWide(dateBuf) + L".log";
+            DWORD attr = GetFileAttributesW(logPath.c_str());
+            bool logExists = (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+            const wchar_t* target = logExists ? logPath.c_str() : g_logDir.c_str();
+            ShellExecuteW(nullptr, L"open", target, nullptr, nullptr, SW_SHOWNORMAL);
         }
         else if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
             UINT idx = id - IDM_EVENT_BASE;
