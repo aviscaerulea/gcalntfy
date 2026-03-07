@@ -92,6 +92,10 @@ static constexpr UINT IDM_OPEN_LOG         = 40007;
 static constexpr UINT IDM_EVENT_BASE = 41000;
 static constexpr UINT IDM_EVENT_MAX  = 41050;
 
+// ツールチップ定期更新タイマー（1分間隔）
+static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
+static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
+
 // 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
 static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"この後の予定なし";
 
@@ -1137,6 +1141,7 @@ static void addTrayIcon(HWND hWnd) {
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
+    SetTimer(hWnd, IDT_TOOLTIP_REFRESH, TOOLTIP_REFRESH_MS, nullptr);
 }
 
 // トレイアイコンのツールチップをクリアする（ポップアップ表示前に呼ぶ）
@@ -1178,6 +1183,7 @@ static void updateTrayTooltip(HWND hWnd) {
 
 // トレイアイコンを除去する
 static void removeTrayIcon(HWND hWnd) {
+    KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -1281,6 +1287,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             g_popupShowing.store(false);
             updateTrayTooltip(hWnd);
         }
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == IDT_TOOLTIP_REFRESH) {
+        updateTrayTooltip(hWnd);
         return 0;
     }
     if (msg == WM_COMMAND) {
