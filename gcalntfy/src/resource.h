@@ -1,7 +1,5 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
-// 埋め込みリソース ID 定義
+// アプリケーションリソース ID 定義
 
 // アプリケーションアイコン
 #define IDI_APP_ICON    102
-// Intro chime sound
-#define IDR_INTRO_OPUS  103

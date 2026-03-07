@@ -4,7 +4,7 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を 4 分前に Toast 通知で知らせる。
- * schedule は 0 時〜 23 時の 24 要素配列（分単位のポーリング間隔、0=ポーリングしない）。
+ * schedule は 0 時〜 23 時の 24 要素配列（回/時、0=ポーリングしない）。
  * 通知済みイベントは datetime+title で記憶して重複防止する。
  *
  * 終了コード:
@@ -144,8 +144,8 @@ static bool                    g_eventsUpdated = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
-    HANDLE                                          hIntroProcess; // intro ffplay プロセスハンドル
-    std::wstring                                    bodyPath;      // gcalntfy.opus パス（空なら body なし）
+    HANDLE                                          hAudio1Process; // audio1 ffplay プロセスハンドル
+    std::wstring                                    bodyPath;      // audio2.opus パス（空なら body なし）
     std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;         // ミュート済みセッション（復元用）
 };
 
@@ -857,66 +857,19 @@ static bool isMeetingActive() {
 
 // ==================== 通知音再生 ====================
 
-// 埋め込みリソースのデータポインタとサイズを返す（ロード失敗時は nullptr）
-static const void* loadResource(int id, DWORD& outSize) {
-    HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(id), (LPCWSTR)RT_RCDATA);
-    if (!hRes) return nullptr;
-    HGLOBAL hGlobal = LoadResource(nullptr, hRes);
-    if (!hGlobal) return nullptr;
-    outSize = SizeofResource(nullptr, hRes);
-    return LockResource(hGlobal);
-}
-
-// 埋め込み音声をパイプ経由で ffplay に渡して再生する
-//
-// data/size: 再生する Opus データ
-// 戻り値: ffplay のプロセスハンドル（起動失敗時は INVALID_HANDLE_VALUE）
-// adelay=1000 で冒頭 1 秒の無音を挿入し、BLE ヘッドホンの接続遅延を吸収する。
-static HANDLE playViaPipe(const void* data, DWORD size) {
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength        = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE hReadPipe, hWritePipe;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return INVALID_HANDLE_VALUE;
-    SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si = {};
-    si.cb        = sizeof(si);
-    si.dwFlags   = STARTF_USESTDHANDLES;
-    si.hStdInput = hReadPipe;
-
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet"
-        L" -af adelay=1000:all=1 -i pipe:0";
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-            TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        writeLog("playViaPipe: CreateProcessW failed: " + std::to_string(GetLastError()));
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return INVALID_HANDLE_VALUE;
-    }
-
-    CloseHandle(hReadPipe);
-
-    DWORD written = 0;
-    WriteFile(hWritePipe, data, size, &written, nullptr);
-    CloseHandle(hWritePipe); // EOF
-
-    CloseHandle(pi.hThread);
-    return pi.hProcess;
-}
-
-// ファイルを ffplay で直接再生する
+// ファイルを ffplay で再生する
 //
 // path: 再生ファイルのフルパス
+// withDelay: true で adelay=1000:all=1 を付与する（BLE ヘッドホン対処: 冒頭 1 秒の無音を挿入）
 // 戻り値: ffplay のプロセスハンドル（起動失敗時は INVALID_HANDLE_VALUE）
-static HANDLE playViaFile(const std::wstring& path) {
+static HANDLE playViaFile(const std::wstring& path, bool withDelay = false) {
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
 
     PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet \"" + path + L"\"";
+    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet";
+    if (withDelay) cmd += L" -af adelay=1000:all=1";
+    cmd += L" \"" + path + L"\"";
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
             FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         writeLog("playViaFile: CreateProcessW failed: " + std::to_string(GetLastError()));
@@ -927,28 +880,31 @@ static HANDLE playViaFile(const std::wstring& path) {
     return pi.hProcess;
 }
 
-// intro 再生完了待機 → body 再生 → ダッキング解除するスレッド関数
+// audio1 再生完了待機 → body 再生 → ダッキング解除するスレッド関数
 //
 // STA で COM 初期化し、CoWaitForMultipleHandles でメッセージキューをポンピングする。
-// intro 終了後、bodyPath が空でなければ playViaFile で gcalntfy.opus を即起動する。
+// audio1 終了後、bodyPath が空でなければ playViaFile で audio2.opus を即起動する。
+// タイムアウト時は ffplay プロセスを強制終了して孤立を防ぐ。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     auto* ctx = static_cast<SoundContext*>(param);
-    bool comOk = SUCCEEDED(hr) || hr == S_FALSE;
+    bool comOk = (hr == S_OK); // S_FALSE（既初期化）は別スレッドでは通常起きないが念のため除外
 
     if (comOk) {
-        // intro 終了を待機（最大 30 秒）
+        // audio1 終了を待機（最大 30 秒）
         DWORD idx = 0;
-        CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
-            30000, 1, &ctx->hIntroProcess, &idx);
-        CloseHandle(ctx->hIntroProcess);
+        HRESULT waitHr = CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+            30000, 1, &ctx->hAudio1Process, &idx);
+        if (waitHr != S_OK) TerminateProcess(ctx->hAudio1Process, 1); // タイムアウト時に強制終了
+        CloseHandle(ctx->hAudio1Process);
 
-        // body 再生（gcalntfy.opus が存在する場合）
+        // body 再生（audio2.opus が存在する場合）
         if (!ctx->bodyPath.empty()) {
             HANDLE hBody = playViaFile(ctx->bodyPath);
             if (hBody != INVALID_HANDLE_VALUE) {
-                CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
+                waitHr = CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
                     60000, 1, &hBody, &idx);
+                if (waitHr != S_OK) TerminateProcess(hBody, 1); // タイムアウト時に強制終了
                 CloseHandle(hBody);
             }
         }
@@ -962,7 +918,7 @@ static DWORD WINAPI soundThread(LPVOID param) {
     }
     else {
         writeLog("soundThread: CoInitializeEx failed");
-        CloseHandle(ctx->hIntroProcess);
+        CloseHandle(ctx->hAudio1Process);
         if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
     }
 
@@ -974,57 +930,54 @@ static DWORD WINAPI soundThread(LPVOID param) {
 // ffplay で通知音を再生する
 //
 // 再生フロー:
-//   adelay=1000（1秒無音） → intro.opus（チャイム） → gcalntfy.opus（存在時のみ）
-// intro.opus は埋め込みリソースからパイプ経由で再生し、gcalntfy.opus は exe 同ディレクトリの
-// ファイルを直接指定して再生する。2 つの ffplay プロセスを逐次起動する方式により
+//   adelay=1000（1秒無音） → audio1.opus（チャイム） → audio2.opus（存在時のみ）
+// 両ファイルとも exe 同ディレクトリから読み込む。2 つの ffplay プロセスを逐次起動する方式により
 // Ogg チェイニングの制約（adelay 再適用等）を回避する。
-// gcalntfy.opus が存在しない場合は intro のみ再生して終了する。
+// audio1.opus が存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
 // ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
-// BLE ヘッドホン対処: intro 再生時に adelay=1000:all=1 で冒頭 1 秒の無音を追加する。
+// BLE ヘッドホン対処: audio1 再生時に adelay=1000:all=1 で冒頭 1 秒の無音を追加する。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
 //             末尾バッファは soundThread 内の Sleep(2000) で実現する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
-    // intro リソースをロード（失敗時は何も再生しない）
-    DWORD introSize = 0;
-    const void* introData = loadResource(IDR_INTRO_OPUS, introSize);
-    if (!introData || introSize == 0) {
-        writeLog("launchSound: loadResource failed");
+    // audio1.opus の存在確認（exe 同ディレクトリ）
+    std::wstring audio1Path = exeDir + L"\\audio1.opus";
+    if (GetFileAttributesW(audio1Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        writeLog("launchSound: audio1.opus not found, skipping sound");
         return;
     }
-    writeLog("launchSound: intro loaded (" + std::to_string(introSize) + " bytes)");
 
-    // gcalntfy.opus の存在確認（exe 同ディレクトリ）
-    std::wstring bodyPath = exeDir + L"\\gcalntfy.opus";
+    // audio2.opus の存在確認（exe 同ディレクトリ）
+    std::wstring bodyPath = exeDir + L"\\audio2.opus";
     bool hasBody = (GetFileAttributesW(bodyPath.c_str()) != INVALID_FILE_ATTRIBUTES);
-    writeLog("launchSound: body " + std::string(hasBody ? "found" : "not found"));
+    writeLog("launchSound: audio2 " + std::string(hasBody ? "found" : "not found"));
 
-    // ダッキング開始（intro 再生前にミュート）
+    // ダッキング開始（audio1 再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
-    // intro を再生（パイプ経由、adelay=1000 付き）
-    HANDLE hIntro = playViaPipe(introData, introSize);
-    if (hIntro == INVALID_HANDLE_VALUE) {
+    // audio1 を再生（adelay=1000 付き）
+    HANDLE hAudio1 = playViaFile(audio1Path, true);
+    if (hAudio1 == INVALID_HANDLE_VALUE) {
         if (!mutedSessions.empty()) unduckAudioSessions(mutedSessions);
         return;
     }
-    writeLog("launchSound: intro playing");
+    writeLog("launchSound: audio1 playing");
 
     // ダッキング無効かつ body なし → fire-and-forget
     if (mutedSessions.empty() && !hasBody) {
-        CloseHandle(hIntro);
+        CloseHandle(hAudio1);
         return;
     }
 
-    // スレッドで後続処理（intro 待機 → body 再生 → アンミュート）
+    // スレッドで後続処理（audio1 待機 → body 再生 → アンミュート）
     auto* ctx = new SoundContext{
-        .hIntroProcess = hIntro,
-        .bodyPath      = hasBody ? bodyPath : L"",
-        .muted         = std::move(mutedSessions)
+        .hAudio1Process = hAudio1,
+        .bodyPath       = hasBody ? bodyPath : L"",
+        .muted          = std::move(mutedSessions)
     };
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
         if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
-        CloseHandle(ctx->hIntroProcess);
+        CloseHandle(ctx->hAudio1Process);
         delete ctx;
         return;
     }
