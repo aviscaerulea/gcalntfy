@@ -110,6 +110,9 @@ static std::atomic<bool> g_muteInMeeting{true};
 
 static HWND g_hWnd = nullptr;
 
+// トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
+static std::atomic<bool> g_popupShowing{false};
+
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
 
@@ -1128,11 +1131,49 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 // トレイアイコンを登録する
 static void addTrayIcon(HWND hWnd) {
     auto nid = makeTrayNid(hWnd);
-    nid.uFlags           = NIF_ICON | NIF_MESSAGE;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
+    wcscpy_s(nid.szTip, L"読み込み中...");
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
+}
+
+// トレイアイコンのツールチップをクリアする（ポップアップ表示前に呼ぶ）
+static void clearTrayTooltip(HWND hWnd) {
+    auto nid = makeTrayNid(hWnd);
+    nid.uFlags  = NIF_TIP;
+    nid.szTip[0] = L'\0';
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+// トレイアイコンのツールチップを更新する
+// 現在JST時刻以降の当日イベント件数を「この後の予定：N 件」として表示する。
+// ポップアップメニュー表示中は更新しない
+static void updateTrayTooltip(HWND hWnd) {
+    if (g_popupShowing.load()) return;
+    std::vector<CalendarEvent> events;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        events = g_pendingEvents;
+    }
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    auto jstNow = utcToJst(utcNow);
+    std::string nowJst = systemTimeToIso(jstNow);
+    std::string today  = nowJst.substr(0, 10);
+    int count = 0;
+    for (const auto& ev : events) {
+        auto jst = utcIsoToJst(ev.datetime);
+        if (jst.substr(0, 10) == today && jst >= nowJst) ++count;
+    }
+    auto nid = makeTrayNid(hWnd);
+    nid.uFlags = NIF_TIP;
+    if (count > 0)
+        swprintf_s(nid.szTip, _countof(nid.szTip), L"この後の予定：%d 件", count);
+    else
+        wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 // トレイアイコンを除去する
@@ -1202,6 +1243,8 @@ static void showSchedulePopup(HWND hWnd) {
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+            g_popupShowing.store(true);
+            clearTrayTooltip(hWnd);
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
@@ -1228,9 +1271,15 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             SetForegroundWindow(hWnd);
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
             DestroyMenu(hMenu);
+            g_popupShowing.store(false);
+            updateTrayTooltip(hWnd);
         }
         else if (lParam == WM_LBUTTONUP) {
+            g_popupShowing.store(true);
+            clearTrayTooltip(hWnd);
             showSchedulePopup(hWnd);
+            g_popupShowing.store(false);
+            updateTrayTooltip(hWnd);
         }
         return 0;
     }
@@ -1584,6 +1633,7 @@ int wmain() {
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
+                    if (g_hWnd) updateTrayTooltip(g_hWnd);
                     }
 
                 firstPoll = false;
