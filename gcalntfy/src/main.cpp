@@ -364,6 +364,28 @@ static void logSchedule(const std::vector<int>& schedule) {
     writeLog(s);
 }
 
+// 次のポーリング予定時刻を "HH:MM" 形式で返す（calcSleepUntilNextPoll と同じロジック）
+static std::string nextPollTimeStr(int count) {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    int nextHour = now.wHour, nextMin;
+    if (count <= 0) {
+        nextMin  = 0;
+        nextHour = (now.wHour + 1) % 24;
+    }
+    else {
+        int intervalMin = 60 / count;
+        nextMin = intervalMin * (now.wMinute / intervalMin + 1);
+        if (nextMin >= 60) {
+            nextMin  = 0;
+            nextHour = (now.wHour + 1) % 24;
+        }
+    }
+    char buf[6];
+    sprintf_s(buf, sizeof(buf), "%02d:%02d", nextHour, nextMin);
+    return buf;
+}
+
 // 次のポーリング予定時刻までのスリープ時間（ms）を計算
 // 正時 :00 起点で 60/count 分間隔の次の予定分までの残り時間を返す
 static DWORD calcSleepUntilNextPoll(int count) {
@@ -1581,7 +1603,7 @@ int wmain() {
                     writeLog(errorMsg);
                 }
                 else {
-                    writeLog("poll: " + std::to_string(events.size()) + " events");
+                    writeLog("poll: " + std::to_string(events.size()) + " events, next: " + nextPollTimeStr(count));
                 }
 
                 // ポーリング結果を通知スレッドへ渡す
