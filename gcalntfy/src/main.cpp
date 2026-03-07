@@ -85,6 +85,7 @@ static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED    = 40005;
+static constexpr UINT IDM_OPEN_CONFIG      = 40006;
 
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
@@ -1274,6 +1275,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効");
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイル");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
             SetForegroundWindow(hWnd);
@@ -1309,6 +1312,11 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 g_muteInMeeting.store(!g_muteInMeeting.load());
                 writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
             }
+        }
+        else if (id == IDM_OPEN_CONFIG) {
+            // 設定ファイルを OS デフォルトのエディタで開く
+            std::wstring toml = getExeDir() + L"\\gcalntfy.toml";
+            ShellExecuteW(nullptr, L"open", toml.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         else if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
             UINT idx = id - IDM_EVENT_BASE;
