@@ -1128,10 +1128,9 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 // トレイアイコンを登録する
 static void addTrayIcon(HWND hWnd) {
     auto nid = makeTrayNid(hWnd);
-    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
-    wcscpy_s(nid.szTip, L"読み込み中...");
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
 }
@@ -1142,36 +1141,6 @@ static void removeTrayIcon(HWND hWnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-// トレイアイコンのツールチップを更新する
-//
-// nowUtc 以降の直近同時刻イベントをすべて表示する。
-// 表示形式: "次: HH:MM タイトル1 / タイトル2"（szTip 上限 128 文字で切り捨て）
-static void updateTrayTooltip(HWND hWnd, const std::vector<CalendarEvent>& events,
-                              const std::string& nowUtc)
-{
-    auto nid = makeTrayNid(hWnd);
-    nid.uFlags = NIF_TIP;
-
-    // nowUtc 以降の直近イベントを検索
-    const CalendarEvent* first = nullptr;
-    for (const auto& e : events) {
-        if (e.datetime >= nowUtc) { first = &e; break; }
-    }
-
-    if (!first) {
-        wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
-    }
-    else {
-        std::wstring tip = L"次: " + utcToJstHHMM(first->datetime) + L" " + toWide(first->content);
-        for (const auto& e : events) {
-            if (e.datetime != first->datetime || &e == first) continue;
-            tip += L" / " + toWide(e.content);
-        }
-        if (tip.size() >= _countof(nid.szTip)) tip.resize(_countof(nid.szTip) - 1);
-        wcscpy_s(nid.szTip, tip.c_str());
-    }
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
 
 // 左クリック予定一覧の permalink 配列（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
 static std::vector<std::wstring> g_eventPermalinks;
@@ -1615,8 +1584,7 @@ int wmain() {
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
-                    if (g_hWnd) updateTrayTooltip(g_hWnd, events, nowUtc);
-                }
+                    }
 
                 firstPoll = false;
                 waitWithMessages(calcSleepUntilNextPoll(count));
