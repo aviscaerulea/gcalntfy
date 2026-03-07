@@ -90,6 +90,9 @@ static constexpr UINT IDM_SOUND_ENABLED    = 40005;
 static constexpr UINT IDM_EVENT_BASE = 41000;
 static constexpr UINT IDM_EVENT_MAX  = 41050;
 
+// 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
+static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"この後の予定なし";
+
 // シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
 static std::atomic<bool> g_restartRequested{false};
@@ -234,16 +237,20 @@ static std::wstring utcToJstHHMM(const std::string& utcIso) {
     return buf;
 }
 
+// SYSTEMTIME を ISO 8601 文字列 "YYYY-MM-DDTHH:MM:SS" に変換する
+static std::string systemTimeToIso(const SYSTEMTIME& st) {
+    char buf[24];
+    sprintf_s(buf, "%04d-%02d-%02dT%02d:%02d:%02d",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
 // UTC ISO 8601 文字列を JST ISO 8601 文字列に変換する
 // 入力: "2026-03-07T10:00:00.000Z" → 出力: "2026-03-07T19:00:00"
 static std::string utcIsoToJst(const std::string& utcIso) {
     SYSTEMTIME st = {};
     if (!parseIsoToSystemTime(utcIso, st)) return utcIso;
-    auto jst = utcToJst(st);
-    char buf[24];
-    sprintf_s(buf, "%04d-%02d-%02dT%02d:%02d:%02d",
-        jst.wYear, jst.wMonth, jst.wDay, jst.wHour, jst.wMinute, jst.wSecond);
-    return buf;
+    return systemTimeToIso(utcToJst(st));
 }
 
 // Toast XML の特殊文字をエスケープする
@@ -1175,7 +1182,7 @@ static void updateTrayTooltip(HWND hWnd, const std::vector<CalendarEvent>& event
     }
 
     if (!first) {
-        wcscpy_s(nid.szTip, L"本日の予定なし");
+        wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
     }
     else {
         std::wstring tip = L"次: " + utcToJstHHMM(first->datetime) + L" " + toWide(first->content);
@@ -1192,8 +1199,8 @@ static void updateTrayTooltip(HWND hWnd, const std::vector<CalendarEvent>& event
 // 左クリック予定一覧の permalink 配列（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
 static std::vector<std::wstring> g_eventPermalinks;
 
-// 左クリック時の当日予定一覧ポップアップ表示
-// g_pendingEvents から当日（JST）のイベントを抽出してメニューに表示する
+// 左クリック時の予定一覧ポップアップ表示
+// g_pendingEvents から現在時刻以降の当日（JST）イベントを抽出してメニューに表示する
 // 選択時に参照する permalink を g_eventPermalinks に格納する
 static void showSchedulePopup(HWND hWnd) {
     std::vector<CalendarEvent> events;
@@ -1205,15 +1212,15 @@ static void showSchedulePopup(HWND hWnd) {
     SYSTEMTIME utcNow;
     GetSystemTime(&utcNow);
     auto jstNow = utcToJst(utcNow);
-    char todayBuf[11];
-    sprintf_s(todayBuf, "%04d-%02d-%02d", jstNow.wYear, jstNow.wMonth, jstNow.wDay);
-    std::string today(todayBuf);
+    std::string nowJst = systemTimeToIso(jstNow);
+    std::string today = nowJst.substr(0, 10);
 
     struct TodayEvent { std::wstring label; std::wstring permalink; };
     std::vector<TodayEvent> todayEvents;
     for (const auto& ev : events) {
         auto jst = utcIsoToJst(ev.datetime);
         if (jst.substr(0, 10) != today) continue;
+        if (jst < nowJst) continue;
         // "HH:MM タイトル" 形式
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
         todayEvents.push_back({label, toWide(ev.permalink)});
@@ -1222,7 +1229,7 @@ static void showSchedulePopup(HWND hWnd) {
     g_eventPermalinks.clear();
     HMENU hMenu = CreatePopupMenu();
     if (todayEvents.empty()) {
-        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"本日の予定なし");
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, NO_UPCOMING_EVENTS);
     }
     else {
         UINT idx = 0;
@@ -1233,7 +1240,7 @@ static void showSchedulePopup(HWND hWnd) {
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"本日の予定: " + std::to_wstring(g_eventPermalinks.size())
+        std::wstring footer = L"この後の予定: " + std::to_wstring(g_eventPermalinks.size())
                 + (todayEvents.size() > g_eventPermalinks.size() ? L"件（超過分省略）" : L"件");
         AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, footer.c_str());
     }
