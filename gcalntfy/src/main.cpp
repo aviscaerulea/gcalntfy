@@ -86,6 +86,10 @@ static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED    = 40005;
 
+// 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
+static constexpr UINT IDM_EVENT_BASE = 41000;
+static constexpr UINT IDM_EVENT_MAX  = 41050;
+
 // シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
 static std::atomic<bool> g_restartRequested{false};
@@ -122,7 +126,7 @@ struct ParseResult {
 struct Config {
     std::wstring              apiUrl;
     std::wstring              apiToken;
-    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時のポーリング間隔[分]）
+    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
     bool operator==(const Config&) const = default;
 };
@@ -230,6 +234,18 @@ static std::wstring utcToJstHHMM(const std::string& utcIso) {
     return buf;
 }
 
+// UTC ISO 8601 文字列を JST ISO 8601 文字列に変換する
+// 入力: "2026-03-07T10:00:00.000Z" → 出力: "2026-03-07T19:00:00"
+static std::string utcIsoToJst(const std::string& utcIso) {
+    SYSTEMTIME st = {};
+    if (!parseIsoToSystemTime(utcIso, st)) return utcIso;
+    auto jst = utcToJst(st);
+    char buf[24];
+    sprintf_s(buf, "%04d-%02d-%02dT%02d:%02d:%02d",
+        jst.wYear, jst.wMonth, jst.wDay, jst.wHour, jst.wMinute, jst.wSecond);
+    return buf;
+}
+
 // Toast XML の特殊文字をエスケープする
 static std::wstring escapeXml(const std::wstring& s) {
     std::wstring r;
@@ -333,10 +349,33 @@ static void logSchedule(const std::vector<int>& schedule) {
     for (size_t i = 0; i < schedule.size(); ++i) {
         if (i > 0) s += ',';
         s += std::to_string(schedule[i]);
-        if (schedule[i] > 0) total += 60 / schedule[i];
+        total += schedule[i];
     }
     s += "] (" + std::to_string(total) + " polls/day)";
     writeLog(s);
+}
+
+// 次のポーリング予定時刻までのスリープ時間（ms）を計算
+// 正時 :00 起点で 60/count 分間隔の次の予定分までの残り時間を返す
+static DWORD calcSleepUntilNextPoll(int count) {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    if (count <= 0) {
+        // count=0 の時間帯に firstPoll で呼ばれた場合: 次の正時までスリープ
+        long long remainMs = (long long)(60 - now.wMinute) * 60000LL
+                             - (long long)now.wSecond * 1000LL
+                             - (long long)now.wMilliseconds;
+        if (remainMs < 1000) remainMs = 1000;
+        return static_cast<DWORD>(remainMs);
+    }
+    int intervalMin = 60 / count;
+    int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
+    if (nextMin > 60) nextMin = 60;
+    long long sleepMs = (long long)(nextMin - now.wMinute) * 60000LL
+                        - (long long)now.wSecond * 1000LL
+                        - (long long)now.wMilliseconds;
+    if (sleepMs < 1000) sleepMs = 1000;
+    return static_cast<DWORD>(sleepMs);
 }
 
 // ==================== HTTP ====================
@@ -482,7 +521,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     std::vector<int> s;
     for (const auto& el : *arr) {
         if (s.size() >= 24) break;
-        s.push_back((std::max)(0, el.value_or(0)));
+        s.push_back((std::min)(60, (std::max)(0, el.value_or(0))));
     }
     while (s.size() < 24) s.push_back(0);
     return s;
@@ -1150,6 +1189,62 @@ static void updateTrayTooltip(HWND hWnd, const std::vector<CalendarEvent>& event
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// 左クリック予定一覧の permalink 配列（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
+static std::vector<std::wstring> g_eventPermalinks;
+
+// 左クリック時の当日予定一覧ポップアップ表示
+// g_pendingEvents から当日（JST）のイベントを抽出してメニューに表示する
+// 選択時に参照する permalink を g_eventPermalinks に格納する
+static void showSchedulePopup(HWND hWnd) {
+    std::vector<CalendarEvent> events;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        events = g_pendingEvents;
+    }
+
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    auto jstNow = utcToJst(utcNow);
+    char todayBuf[11];
+    sprintf_s(todayBuf, "%04d-%02d-%02d", jstNow.wYear, jstNow.wMonth, jstNow.wDay);
+    std::string today(todayBuf);
+
+    struct TodayEvent { std::wstring label; std::wstring permalink; };
+    std::vector<TodayEvent> todayEvents;
+    for (const auto& ev : events) {
+        auto jst = utcIsoToJst(ev.datetime);
+        if (jst.substr(0, 10) != today) continue;
+        // "HH:MM タイトル" 形式
+        std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
+        todayEvents.push_back({label, toWide(ev.permalink)});
+    }
+
+    g_eventPermalinks.clear();
+    HMENU hMenu = CreatePopupMenu();
+    if (todayEvents.empty()) {
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"本日の予定なし");
+    }
+    else {
+        UINT idx = 0;
+        for (const auto& te : todayEvents) {
+            if (idx >= (IDM_EVENT_MAX - IDM_EVENT_BASE)) break;
+            AppendMenuW(hMenu, MF_STRING, IDM_EVENT_BASE + idx, te.label.c_str());
+            g_eventPermalinks.push_back(te.permalink);
+            ++idx;
+        }
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        std::wstring footer = L"本日の予定: " + std::to_wstring(g_eventPermalinks.size())
+                + (todayEvents.size() > g_eventPermalinks.size() ? L"件（超過分省略）" : L"件");
+        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, footer.c_str());
+    }
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(hWnd);
+    TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+    DestroyMenu(hMenu);
+}
+
 // トレイアイコン用ウィンドウプロシージャ
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
@@ -1178,6 +1273,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
             DestroyMenu(hMenu);
         }
+        else if (lParam == WM_LBUTTONUP) {
+            showSchedulePopup(hWnd);
+        }
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -1203,6 +1301,13 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             if (g_soundEnabled.load()) {
                 g_muteInMeeting.store(!g_muteInMeeting.load());
                 writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
+            }
+        }
+        else if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
+            UINT idx = id - IDM_EVENT_BASE;
+            if (idx < g_eventPermalinks.size() && isHttpUrl(g_eventPermalinks[idx])) {
+                ShellExecuteW(nullptr, L"open", g_eventPermalinks[idx].c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
             }
         }
         return 0;
@@ -1450,11 +1555,10 @@ int wmain() {
                     }
                 }
 
-                int interval = cfg.schedule[jstNow.wHour];
-                DWORD intervalMs = static_cast<DWORD>(interval) * 60000u;
+                int count = cfg.schedule[jstNow.wHour];
 
                 // schedule=0 の時間帯: 次の正時までスリープ（初回は必ずポーリング）
-                if (interval == 0 && !firstPoll) {
+                if (count == 0 && !firstPoll) {
                     long long remainMs = (long long)(60 - jstNow.wMinute) * 60000LL
                         - (long long)jstNow.wSecond * 1000LL
                         - (long long)jstNow.wMilliseconds;
@@ -1509,7 +1613,7 @@ int wmain() {
                 }
 
                 firstPoll = false;
-                waitWithMessages(intervalMs);
+                waitWithMessages(calcSleepUntilNextPoll(count));
             }
             catch (...) {
                 writeLog("unexpected error in polling loop");
