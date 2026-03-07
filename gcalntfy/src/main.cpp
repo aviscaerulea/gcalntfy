@@ -84,16 +84,19 @@ static constexpr UINT IDM_RESTART          = 40001;
 static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
+static constexpr UINT IDM_SOUND_ENABLED    = 40005;
 
 // シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
 static std::atomic<bool> g_restartRequested{false};
 
+// 音声通知の有効/無効フラグ（レジストリで永続化、トレイメニューの親項目）
+static std::atomic<bool> g_soundEnabled{true};
+
 // 次回通知の音声スキップフラグ（WndProc でトグル、通知スレッドで消費）
 static std::atomic<bool> g_skipNextSound{false};
 
-// ミーティング中の音声自動ミュートフラグ（WndProc でトグル、通知スレッドで参照）
-// Config.muteInMeeting が起動時の初期値。トレイトグルによる変更はオンメモリのみで永続化しない
+// ミーティング中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{false};
 
 static HWND g_hWnd = nullptr;
@@ -121,7 +124,6 @@ struct Config {
     std::wstring              apiToken;
     std::vector<int>          schedule;       // 24 要素（0 時〜 23 時のポーリング間隔[分]）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
-    bool                      muteInMeeting = false; // 起動時デフォルト値（g_muteInMeeting の初期値に使用）
     bool operator==(const Config&) const = default;
 };
 
@@ -504,16 +506,6 @@ static Config loadConfig(const std::wstring& exeDir) {
         }
         return {};
     };
-    auto getBool = [&](const char* key, bool defaultVal) -> bool {
-        if (local) {
-            if (auto v = (*local)[key].value<bool>()) return *v;
-        }
-        if (base) {
-            if (auto v = (*base)[key].value<bool>()) return *v;
-        }
-        return defaultVal;
-    };
-
     // duck_targets 配列の読み込み（local 優先、なければ base）
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl) -> std::vector<std::wstring> {
         if (!tbl) return {};
@@ -542,8 +534,6 @@ static Config loadConfig(const std::wstring& exeDir) {
 
     cfg.duckTargets = readDuckTargets(local);
     if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
-
-    cfg.muteInMeeting = getBool("mute_in_meeting", false);
 
     return cfg;
 }
@@ -676,6 +666,38 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
         vol->SetMute(FALSE, nullptr);
     }
     muted.clear();
+}
+
+// ==================== レジストリ設定 ====================
+
+// レジストリパス（ユーザー設定の永続化先）
+static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
+static constexpr const wchar_t* REG_SOUND_ENABLED   = L"SoundEnabled";
+static constexpr const wchar_t* REG_MUTE_IN_MEETING = L"MuteInMeeting";
+
+// レジストリ DWORD 値の読み取り
+// キーまたは値が存在しない場合は defaultVal を返す
+static DWORD readRegDword(const wchar_t* valueName, DWORD defaultVal) {
+    DWORD value = 0, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY_PATH, valueName,
+            RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
+        return value;
+    return defaultVal;
+}
+
+// レジストリ DWORD 値の書き込み
+// キーが存在しない場合は自動作成する
+static void writeRegDword(const wchar_t* valueName, DWORD value) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, nullptr,
+            0, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+        writeLog("registry key create failed: " + wideToUtf8(valueName));
+        return;
+    }
+    if (RegSetValueExW(hKey, valueName, 0, REG_DWORD,
+            reinterpret_cast<const BYTE*>(&value), sizeof(value)) != ERROR_SUCCESS)
+        writeLog("registry write failed: " + wideToUtf8(valueName));
+    RegCloseKey(hKey);
 }
 
 // ==================== ミーティング検出 ====================
@@ -1137,10 +1159,18 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             HMENU hMenu = CreatePopupMenu();
             AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"gcalntfy v" APP_VERSION);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
-                IDM_SKIP_SOUND, L"次回の音声通知を無効");
-            AppendMenuW(hMenu, MF_STRING | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
-                IDM_MUTE_IN_MEETING, L"ミーティング中は無効化");
+
+            // 音声通知（親: レジストリ永続化）
+            AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
+                IDM_SOUND_ENABLED, L"音声通知");
+
+            // 子項目: 親が OFF なら非活性
+            UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
+            AppendMenuW(hMenu, MF_STRING | childFlags | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
+                IDM_SKIP_SOUND, L"  次回のみ音声通知無効");
+            AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
+                IDM_MUTE_IN_MEETING, L"  ミーティング中は常に無効");
+
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
@@ -1159,11 +1189,21 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         else if (id == IDM_EXIT) {
             g_shutdownRequested = true;
         }
+        else if (id == IDM_SOUND_ENABLED) {
+            // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
+            g_soundEnabled.store(!g_soundEnabled.load());
+            writeRegDword(REG_SOUND_ENABLED, g_soundEnabled.load() ? 1u : 0u);
+        }
         else if (id == IDM_SKIP_SOUND) {
-            g_skipNextSound = !g_skipNextSound;
+            // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
+            if (g_soundEnabled.load()) g_skipNextSound = !g_skipNextSound;
         }
         else if (id == IDM_MUTE_IN_MEETING) {
-            g_muteInMeeting = !g_muteInMeeting;
+            // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
+            if (g_soundEnabled.load()) {
+                g_muteInMeeting.store(!g_muteInMeeting.load());
+                writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
+            }
         }
         return 0;
     }
@@ -1279,8 +1319,12 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             auto jstTimeW = utcToJstHHMM(targetDatetime);
             auto jstTime  = wideToUtf8(jstTimeW);
             writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s))");
-            // 音声スキップ判定: ワンショットミュート > ミーティング中ミュート > 通常再生
-            if (g_skipNextSound.exchange(false)) {
+            // 音声スキップ判定: 音声通知OFF > ワンショットミュート > ミーティング中ミュート > 通常再生
+            if (!g_soundEnabled) {
+                g_skipNextSound.exchange(false); // OFF 中もフラグを消費して ON 復帰後の残存を防ぐ
+                writeLog("sound skipped (sound disabled)");
+            }
+            else if (g_skipNextSound.exchange(false)) {
                 writeLog("sound skipped (one-shot mute)");
             }
             else if (g_muteInMeeting && isMeetingActive()) {
@@ -1362,7 +1406,11 @@ int wmain() {
         }
 
         addTrayIcon(g_hWnd);
-        g_muteInMeeting = cfg.muteInMeeting; // 起動時の初期値を TOML から反映
+
+        // レジストリから設定を復元（キー未作成時はデフォルト値）
+        g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
+        g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 0u) != 0;
+
         writeLog("started");
         logSchedule(cfg.schedule);
 
@@ -1395,7 +1443,6 @@ int wmain() {
                             writeLog("config reloaded");
                             logSchedule(newCfg.schedule);
                         }
-                        g_muteInMeeting = newCfg.muteInMeeting;
                         cfg = std::move(newCfg);
                     }
                     else {
