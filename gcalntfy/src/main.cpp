@@ -104,7 +104,7 @@ static std::atomic<bool> g_soundEnabled{true};
 static std::atomic<bool> g_skipNextSound{false};
 
 // ミーティング中の音声自動ミュートフラグ（レジストリで永続化）
-static std::atomic<bool> g_muteInMeeting{false};
+static std::atomic<bool> g_muteInMeeting{true};
 
 static HWND g_hWnd = nullptr;
 
@@ -1271,7 +1271,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
                 IDM_SKIP_SOUND, L"  次回のみ音声通知無効");
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
-                IDM_MUTE_IN_MEETING, L"  ミーティング中は常に無効");
+                IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効");
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
@@ -1521,7 +1521,7 @@ int wmain() {
 
         // レジストリから設定を復元（キー未作成時はデフォルト値）
         g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
-        g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 0u) != 0;
+        g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
