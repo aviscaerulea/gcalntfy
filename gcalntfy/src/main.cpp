@@ -80,9 +80,10 @@ static constexpr ULONGLONG CONFIG_CHECK_INTERVAL_MS = 5uLL * 60 * 1000;
 static constexpr UINT WM_TRAYICON = WM_USER + 1;
 
 // コンテキストメニューコマンド ID
-static constexpr UINT IDM_RESTART    = 40001;
-static constexpr UINT IDM_EXIT       = 40002;
-static constexpr UINT IDM_SKIP_SOUND = 40003;
+static constexpr UINT IDM_RESTART          = 40001;
+static constexpr UINT IDM_EXIT             = 40002;
+static constexpr UINT IDM_SKIP_SOUND       = 40003;
+static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 
 // シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
@@ -90,6 +91,11 @@ static std::atomic<bool> g_restartRequested{false};
 
 // 次回通知の音声スキップフラグ（WndProc でトグル、通知スレッドで消費）
 static std::atomic<bool> g_skipNextSound{false};
+
+// ミーティング中の音声自動ミュートフラグ（WndProc でトグル、通知スレッドで参照）
+// Config.muteInMeeting が起動時の初期値。トレイトグルによる変更はオンメモリのみで永続化しない
+static std::atomic<bool> g_muteInMeeting{false};
+
 static HWND g_hWnd = nullptr;
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
@@ -113,8 +119,9 @@ struct ParseResult {
 struct Config {
     std::wstring              apiUrl;
     std::wstring              apiToken;
-    std::vector<int>          schedule;    // 24 要素（0 時〜 23 時のポーリング間隔[分]）
-    std::vector<std::wstring> duckTargets; // 通知音再生中にミュートするプロセス名
+    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時のポーリング間隔[分]）
+    std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
+    bool                      muteInMeeting = false; // 起動時デフォルト値（g_muteInMeeting の初期値に使用）
     bool operator==(const Config&) const = default;
 };
 
@@ -497,6 +504,15 @@ static Config loadConfig(const std::wstring& exeDir) {
         }
         return {};
     };
+    auto getBool = [&](const char* key, bool defaultVal) -> bool {
+        if (local) {
+            if (auto v = (*local)[key].value<bool>()) return *v;
+        }
+        if (base) {
+            if (auto v = (*base)[key].value<bool>()) return *v;
+        }
+        return defaultVal;
+    };
 
     // duck_targets 配列の読み込み（local 優先、なければ base）
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl) -> std::vector<std::wstring> {
@@ -526,6 +542,8 @@ static Config loadConfig(const std::wstring& exeDir) {
 
     cfg.duckTargets = readDuckTargets(local);
     if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
+
+    cfg.muteInMeeting = getBool("mute_in_meeting", false);
 
     return cfg;
 }
@@ -658,6 +676,114 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
         vol->SetMute(FALSE, nullptr);
     }
     muted.clear();
+}
+
+// ==================== ミーティング検出 ====================
+
+// レジストリ（CapabilityAccessManager）でデバイス使用中かを判定する
+//
+// deviceType: "microphone" または "webcam"
+// LastUsedTimeStop == 0 のサブキーがあれば使用中（UWP 配下 + NonPackaged 配下の両方を走査）。
+static bool isRegistryDeviceInUse(const wchar_t* deviceType) {
+    std::wstring basePath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion"
+        L"\\CapabilityAccessManager\\ConsentStore\\";
+    basePath += deviceType;
+
+    auto checkSubKeys = [](const std::wstring& keyPath, bool skipNonPackaged) -> bool {
+        // RAII ガード: 例外（std::bad_alloc 等）でもハンドルを確実に閉じる
+        struct Guard { HKEY h = nullptr; ~Guard() { if (h) RegCloseKey(h); } };
+
+        Guard kg;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath.c_str(), 0, KEY_READ, &kg.h) != ERROR_SUCCESS)
+            return false;
+
+        bool inUse = false;
+        wchar_t subName[256];
+        DWORD subNameSize;
+
+        for (DWORD idx = 0; !inUse; idx++) {
+            subNameSize = _countof(subName);
+            if (RegEnumKeyExW(kg.h, idx, subName, &subNameSize,
+                    nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            if (skipNonPackaged && wcscmp(subName, L"NonPackaged") == 0) continue;
+
+            Guard sg;
+            std::wstring subPath = keyPath + L"\\" + subName;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, subPath.c_str(), 0, KEY_READ, &sg.h) != ERROR_SUCCESS)
+                continue;
+
+            DWORD64 lastUsedTimeStop = 0;
+            DWORD dataSize = sizeof(lastUsedTimeStop);
+            DWORD dataType;
+            if (RegQueryValueExW(sg.h, L"LastUsedTimeStop", nullptr, &dataType,
+                    reinterpret_cast<LPBYTE>(&lastUsedTimeStop), &dataSize) == ERROR_SUCCESS
+                && dataType == REG_QWORD && lastUsedTimeStop == 0) {
+                inUse = true;
+            }
+        }
+        return inUse;
+    };
+
+    if (checkSubKeys(basePath, true))                              return true; // UWP
+    if (checkSubKeys(basePath + L"\\NonPackaged", false))          return true; // Win32
+    return false;
+}
+
+// WASAPI でマイクキャプチャセッションがアクティブかを判定する
+//
+// 通知スレッドの STA COM を利用（CoInitialize 呼び出し不要）。
+// レジストリで検出できない仮想オーディオデバイス経由の使用を補完検出する。
+static bool isMicCaptureActive() {
+    winrt::com_ptr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), enumerator.put_void())))
+        return false;
+
+    winrt::com_ptr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, collection.put())))
+        return false;
+
+    UINT deviceCount = 0;
+    collection->GetCount(&deviceCount);
+
+    for (UINT i = 0; i < deviceCount; i++) {
+        winrt::com_ptr<IMMDevice> device;
+        if (FAILED(collection->Item(i, device.put()))) continue;
+
+        winrt::com_ptr<IAudioSessionManager2> mgr;
+        if (FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                nullptr, mgr.put_void()))) continue;
+
+        winrt::com_ptr<IAudioSessionEnumerator> sessionEnum;
+        if (FAILED(mgr->GetSessionEnumerator(sessionEnum.put()))) continue;
+
+        int sessionCount = 0;
+        sessionEnum->GetCount(&sessionCount);
+
+        for (int s = 0; s < sessionCount; s++) {
+            winrt::com_ptr<IAudioSessionControl> ctrl;
+            if (FAILED(sessionEnum->GetSession(s, ctrl.put()))) continue;
+
+            // システムサウンドセッションはスキップ
+            auto ctrl2 = ctrl.try_as<IAudioSessionControl2>();
+            if (ctrl2 && ctrl2->IsSystemSoundsSession() == S_OK) continue;
+
+            AudioSessionState state;
+            if (SUCCEEDED(ctrl->GetState(&state)) && state == AudioSessionStateActive)
+                return true;
+        }
+    }
+    return false;
+}
+
+// マイクまたはカメラが使用中ならミーティング中と判定する
+//
+// レジストリ → WASAPI の順で検出し、いずれかが true ならミーティング中。
+static bool isMeetingActive() {
+    if (isRegistryDeviceInUse(L"microphone")) return true;
+    if (isRegistryDeviceInUse(L"webcam"))     return true;
+    return isMicCaptureActive(); // レジストリ未検出分の補完
 }
 
 // ==================== 通知音再生 ====================
@@ -1013,6 +1139,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
                 IDM_SKIP_SOUND, L"次回の音声通知を無効");
+            AppendMenuW(hMenu, MF_STRING | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
+                IDM_MUTE_IN_MEETING, L"ミーティング中は無効化");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
@@ -1033,6 +1161,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         else if (id == IDM_SKIP_SOUND) {
             g_skipNextSound = !g_skipNextSound;
+        }
+        else if (id == IDM_MUTE_IN_MEETING) {
+            g_muteInMeeting = !g_muteInMeeting;
         }
         return 0;
     }
@@ -1148,8 +1279,12 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             auto jstTimeW = utcToJstHHMM(targetDatetime);
             auto jstTime  = wideToUtf8(jstTimeW);
             writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s))");
+            // 音声スキップ判定: ワンショットミュート > ミーティング中ミュート > 通常再生
             if (g_skipNextSound.exchange(false)) {
                 writeLog("sound skipped (one-shot mute)");
+            }
+            else if (g_muteInMeeting && isMeetingActive()) {
+                writeLog("sound skipped (meeting detected)");
             }
             else {
                 launchSound(exeDir, localConfig);
@@ -1227,6 +1362,7 @@ int wmain() {
         }
 
         addTrayIcon(g_hWnd);
+        g_muteInMeeting = cfg.muteInMeeting; // 起動時の初期値を TOML から反映
         writeLog("started");
         logSchedule(cfg.schedule);
 
@@ -1259,6 +1395,7 @@ int wmain() {
                             writeLog("config reloaded");
                             logSchedule(newCfg.schedule);
                         }
+                        g_muteInMeeting = newCfg.muteInMeeting;
                         cfg = std::move(newCfg);
                     }
                     else {
