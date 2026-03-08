@@ -83,9 +83,6 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
-// 設定ファイル再読み込みの間隔（5分）
-static constexpr ULONGLONG CONFIG_CHECK_INTERVAL_MS = 5uLL * 60 * 1000;
-
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON = WM_USER + 1;
 
@@ -193,7 +190,6 @@ struct Config {
     std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;   // 通知リード時間（ミリ秒、TOML では分で指定）
-    bool operator==(const Config&) const = default;
 };
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
@@ -1812,7 +1808,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             }
         }
         else if (id == IDM_OPEN_CONFIG) {
-            // 設定ファイルを OS デフォルトのエディタで開く
+            // 設定ファイルを OS デフォルトのエディタで開く（変更反映には再起動が必要）
             std::wstring toml = getExeDir() + L"\\gcalntfy.toml";
             ShellExecuteW(nullptr, L"open", toml.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
@@ -2031,6 +2027,7 @@ int wmain() {
         g_hWnd = createTrayWindow();
         WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
         auto cfg = loadConfig(exeDir);
+        g_currentConfig = cfg;  // 通知スレッドへの初期設定（起動時のみ）
 
         addTrayIcon(g_hWnd);
 
@@ -2045,7 +2042,6 @@ int wmain() {
         std::thread notifyThread(notifyThreadFunc, exeDir);
 
         int lastJstDay = -1;
-        ULONGLONG lastConfigCheck = GetTickCount64();
         bool firstPoll = true; // 起動時は schedule に関わらず必ず1回ポーリング
 
         while (!g_shutdownRequested) {
@@ -2075,18 +2071,6 @@ int wmain() {
                 if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                     lastJstDay = static_cast<int>(jstNow.wDay);
                     firstPoll = true;
-                }
-
-                // 設定再読み込み（5分間隔、バリデーションエラー時は前回設定を維持）
-                ULONGLONG nowTick = GetTickCount64();
-                if (nowTick - lastConfigCheck >= CONFIG_CHECK_INTERVAL_MS) {
-                    lastConfigCheck = nowTick;
-                    auto newCfg = loadConfig(exeDir);
-                    if (newCfg != cfg) {
-                        writeLog("config reloaded");
-                        logSchedule(newCfg.schedule);
-                    }
-                    cfg = std::move(newCfg);
                 }
 
                 int count = cfg.schedule[jstNow.wHour];
@@ -2151,7 +2135,6 @@ int wmain() {
                     {
                         std::lock_guard<std::mutex> lk(g_mtx);
                         g_pendingEvents = events;
-                        g_currentConfig = cfg;
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
