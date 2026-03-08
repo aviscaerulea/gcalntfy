@@ -27,6 +27,8 @@
 #include <winrt/Windows.Data.Xml.Dom.h>
 #include <winrt/Windows.UI.Notifications.h>
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #undef GetObject  // GDI マクロを解除（winrt::IJsonValue::GetObject と競合するため）
 #include <winhttp.h>
@@ -38,6 +40,7 @@
 #include <propvarutil.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
+#include <bcrypt.h>
 
 #include "toml.hpp"
 
@@ -60,9 +63,12 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 #include "resource.h"
 #include "version.h"  // ビルド時生成（APP_VERSION を定義）
+#include "oauth.h"    // ビルド時生成（OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET を定義）
 
 // アプリケーション識別子（Toast 通知に使用）
 static const wchar_t* APP_AUMID = L"com.gcalntfy";
@@ -99,6 +105,22 @@ static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 // 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
 static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"この後の予定なし";
 
+// Google OAuth 2.0
+static constexpr const wchar_t* OAUTH_AUTH_URL   = L"https://accounts.google.com/o/oauth2/v2/auth";
+static constexpr const wchar_t* OAUTH_TOKEN_HOST = L"oauth2.googleapis.com";
+static constexpr const wchar_t* OAUTH_TOKEN_PATH = L"/token";
+static constexpr const wchar_t* OAUTH_SCOPE      = L"https://www.googleapis.com/auth/calendar.readonly";
+
+// Google Calendar API v3
+static constexpr const wchar_t* CALENDAR_API_HOST = L"www.googleapis.com";
+static constexpr const wchar_t* CALENDAR_API_PATH = L"/calendar/v3/calendars/primary/events";
+
+// PKCE code_verifier のバイト数（Base64url で 86 文字）
+static constexpr size_t PKCE_VERIFIER_BYTES = 64;
+
+// レジストリ値名（refresh token）
+static constexpr const wchar_t* REG_REFRESH_TOKEN = L"RefreshToken";
+
 // シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
 static std::atomic<bool> g_restartRequested{false};
@@ -120,6 +142,16 @@ static std::atomic<bool> g_popupShowing{false};
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
 
+// OAuth アクセストークンと有効期限（FILETIME 単位、100 ナノ秒）
+static std::wstring   g_accessToken;
+static ULARGE_INTEGER g_tokenExpiry = {};
+
+// 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
+static void showToast(const std::wstring& timeJST, const std::wstring& title,
+                      const std::wstring& permalink);
+static std::wstring readRegString(const wchar_t* valueName);
+static void writeRegString(const wchar_t* valueName, const std::wstring& value);
+
 // ==================== データ構造 ====================
 
 struct CalendarEvent {
@@ -136,8 +168,6 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::wstring              apiUrl;
-    std::wstring              apiToken;
     std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
     bool operator==(const Config&) const = default;
@@ -280,7 +310,7 @@ static std::wstring escapeXml(const std::wstring& s) {
 
 // https:// または http:// のみ許可する（任意プロトコルハンドラ悪用防止）
 static bool isHttpUrl(const std::wstring& url) {
-    return url.substr(0, 8) == L"https://" || url.substr(0, 7) == L"http://";
+    return url.starts_with(L"https://") || url.starts_with(L"http://");
 }
 
 // UTF-8 std::string を UTF-16 std::wstring に変換する
@@ -299,27 +329,6 @@ static std::string wideToUtf8(const std::wstring& w) {
     std::string s(n - 1, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
     return s;
-}
-
-// JSON 文字列値をエスケープする（RFC 8259 準拠: " \ と U+001F 以下の制御文字）
-static std::string escapeJson(const std::string& s) {
-    std::string r;
-    r.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        switch (c) {
-        case '"':  r += "\\\""; break;
-        case '\\': r += "\\\\"; break;
-        case '\n': r += "\\n";  break;
-        case '\r': r += "\\r";  break;
-        case '\t': r += "\\t";  break;
-        case '\b': r += "\\b";  break;
-        case '\f': r += "\\f";  break;
-        default:
-            if (c < 0x20) { char buf[8]; sprintf_s(buf, "\\u%04x", c); r += buf; }
-            else           r += static_cast<char>(c);
-        }
-    }
-    return r;
 }
 
 // ==================== ログ出力 ====================
@@ -418,42 +427,38 @@ static DWORD calcSleepUntilNextPoll(int count) {
 
 // ==================== HTTP ====================
 
-// WinHTTP で HTTPS POST しレスポンスボディを返す
-// GAS Web App は POST を受け取って処理後に 302 リダイレクトを返す。
-// WinHTTP は 302 で POST→GET に変換するが、GAS の仕様上リダイレクト先は GET で取得するため正常動作する。
+// WinHTTP で HTTPS リクエストを実行する
+// method: L"GET" or L"POST"
+// authHeader: 空でなければ Authorization: Bearer ヘッダとして付与
 // outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む（失敗時は 0）
-static std::string httpPost(const std::wstring& url, const std::string& jsonBody,
-    DWORD* outStatusCode = nullptr) {
+static std::string httpRequest(const wchar_t* method, const std::wstring& url,
+    const std::string& body, const wchar_t* contentType,
+    const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
+{
     if (outStatusCode) *outStatusCode = 0;
     HINTERNET hSession = WinHttpOpen(L"gcalntfy/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
-    // 接続 15秒、送受信 30秒
     WinHttpSetTimeouts(hSession, 0, 15000, 30000, 30000);
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
     wchar_t host[256] = {}, path[4096] = {};
-    uc.lpszHostName    = host;
+    uc.lpszHostName     = host;
     uc.dwHostNameLength = _countof(host);
-    uc.lpszUrlPath     = path;
-    uc.dwUrlPathLength = _countof(path);
-
+    uc.lpszUrlPath      = path;
+    uc.dwUrlPathLength  = _countof(path);
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
         WinHttpCloseHandle(hSession);
         return "";
     }
 
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
 
     DWORD reqFlags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path,
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
@@ -461,11 +466,18 @@ static std::string httpPost(const std::wstring& url, const std::string& jsonBody
         return "";
     }
 
-    auto* bodyData = static_cast<LPVOID>(const_cast<char*>(jsonBody.c_str()));
-    auto  bodyLen  = static_cast<DWORD>(jsonBody.size());
+    // ヘッダ構築
+    std::wstring headers;
+    if (contentType && contentType[0]) headers += std::wstring(L"Content-Type: ") + contentType + L"\r\n";
+    if (!authHeader.empty())           headers += L"Authorization: Bearer " + authHeader + L"\r\n";
+
+    auto* bodyData = body.empty() ? nullptr : static_cast<LPVOID>(const_cast<char*>(body.c_str()));
+    auto  bodyLen  = static_cast<DWORD>(body.size());
     bool ok = WinHttpSendRequest(hRequest,
-        L"Content-Type: application/json\r\n", -1L,
-        bodyData, bodyLen, bodyLen, 0) && WinHttpReceiveResponse(hRequest, nullptr);
+        headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+        headers.empty() ? 0 : static_cast<DWORD>(-1),
+        bodyData, bodyLen, bodyLen, 0)
+        && WinHttpReceiveResponse(hRequest, nullptr);
     if (!ok) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
@@ -473,57 +485,467 @@ static std::string httpPost(const std::wstring& url, const std::string& jsonBody
         return "";
     }
 
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
     WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
     if (outStatusCode) *outStatusCode = statusCode;
-    if (statusCode != 200) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
 
-    std::string body;
+    std::string respBody;
     std::vector<char> buf;
     DWORD avail = 0;
     while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
         if (buf.size() < avail) buf.resize(avail);
         DWORD read = 0;
-        if (WinHttpReadData(hRequest, buf.data(), avail, &read)) {
-            body.append(buf.data(), read);
-        }
+        if (WinHttpReadData(hRequest, buf.data(), avail, &read)) respBody.append(buf.data(), read);
     }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
-    return body;
+    return respBody;
+}
+
+// Calendar API 用 GET（Bearer トークン付き）
+static std::string httpGet(const std::wstring& url, const std::wstring& accessToken,
+    DWORD* outStatusCode = nullptr)
+{
+    return httpRequest(L"GET", url, "", nullptr, accessToken, outStatusCode);
+}
+
+// トークンエンドポイント用 POST（application/x-www-form-urlencoded）
+static std::string httpPostForm(const std::wstring& url, const std::string& formBody,
+    DWORD* outStatusCode = nullptr)
+{
+    return httpRequest(L"POST", url, formBody, L"application/x-www-form-urlencoded", {}, outStatusCode);
+}
+
+// ==================== PKCE・エンコードユーティリティ ====================
+
+// バイト列を Base64url エンコード（パディングなし、RFC 7636 準拠）
+static std::string base64urlEncode(const unsigned char* data, size_t len) {
+    static constexpr char TABLE[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve((len * 4 + 2) / 3);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned int b = static_cast<unsigned int>(data[i]) << 16;
+        if (i + 1 < len) b |= static_cast<unsigned int>(data[i + 1]) << 8;
+        if (i + 2 < len) b |= data[i + 2];
+        out += TABLE[(b >> 18) & 0x3F];
+        out += TABLE[(b >> 12) & 0x3F];
+        if (i + 1 < len) out += TABLE[(b >> 6) & 0x3F];
+        if (i + 2 < len) out += TABLE[b & 0x3F];
+    }
+    return out;
+}
+
+// PKCE code_verifier 生成（BCryptGenRandom + Base64url）
+// BCryptGenRandom 失敗時は空文字列を返す（安全でない rand() へのフォールバックは行わない）
+static std::string generateCodeVerifier() {
+    unsigned char buf[PKCE_VERIFIER_BYTES];
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, buf, sizeof(buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        writeLog("BCryptGenRandom failed");
+        return {};
+    }
+    return base64urlEncode(buf, sizeof(buf));
+}
+
+// PKCE code_challenge 生成（SHA-256 + Base64url）
+// 各 BCrypt API の失敗時はリソースを解放して空文字列を返す
+static std::string generateCodeChallenge(const std::string& verifier) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+        return {};
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    unsigned char hash[32] = {};
+    bool ok = BCRYPT_SUCCESS(BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0))
+        && BCRYPT_SUCCESS(BCryptHashData(hHash,
+               reinterpret_cast<PUCHAR>(const_cast<char*>(verifier.c_str())),
+               static_cast<ULONG>(verifier.size()), 0))
+        && BCRYPT_SUCCESS(BCryptFinishHash(hHash, hash, sizeof(hash), 0));
+    if (hHash) BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!ok) {
+        writeLog("BCrypt SHA-256 failed");
+        return {};
+    }
+    return base64urlEncode(hash, sizeof(hash));
+}
+
+// URL クエリ値のパーセントエンコード
+static std::string urlEncode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        }
+        else {
+            char buf[4];
+            sprintf_s(buf, "%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+// ==================== OAuth 2.0 フロー ====================
+
+// ループバック HTTP サーバをランダムポートで起動する
+// 戻り値: 実際のポート番号（失敗時 0）
+static int startLoopbackServer(SOCKET& serverSocket) {
+    WSADATA wsa = {};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+
+    serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (serverSocket == INVALID_SOCKET) { WSACleanup(); return 0; }
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0; // OS にポートを割り当てさせる
+    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0
+        || listen(serverSocket, 1) != 0) {
+        closesocket(serverSocket);
+        WSACleanup();
+        serverSocket = INVALID_SOCKET;
+        return 0;
+    }
+
+    int addrLen = sizeof(addr);
+    if (getsockname(serverSocket, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
+        closesocket(serverSocket);
+        WSACleanup();
+        serverSocket = INVALID_SOCKET;
+        return 0;
+    }
+    return ntohs(addr.sin_port);
+}
+
+// OAuth 認証 URL を構築してブラウザを開く
+static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier) {
+    auto challenge = generateCodeChallenge(codeVerifier);
+    std::string redirectUri = "http://127.0.0.1:" + std::to_string(redirectPort);
+    std::string url = wideToUtf8(OAUTH_AUTH_URL);
+    url += "?client_id="             + urlEncode(wideToUtf8(OAUTH_CLIENT_ID));
+    url += "&redirect_uri="          + urlEncode(redirectUri);
+    url += "&response_type=code";
+    url += "&scope="                 + urlEncode(wideToUtf8(OAUTH_SCOPE));
+    url += "&code_challenge="        + urlEncode(challenge);
+    url += "&code_challenge_method=S256";
+    url += "&access_type=offline";
+    url += "&prompt=consent";
+    ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// ループバックサーバで認証コードを待ち受ける（120秒タイムアウト）
+// select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
+// \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
+static std::string waitForAuthCode(SOCKET serverSocket) {
+    // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(serverSocket, &readSet);
+    timeval tv = { 120, 0 };
+    if (select(0, &readSet, nullptr, nullptr, &tv) <= 0) return {};
+
+    SOCKET client = accept(serverSocket, nullptr, nullptr);
+    if (client == INVALID_SOCKET) return {};
+
+    // recv タイムアウトは client ソケットに設定する
+    DWORD recvTimeout = 10000;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
+
+    // \r\n\r\n が届くまでループ受信（HTTP リクエストヘッダ全体を確実に取得する）
+    std::string req;
+    char chunk[1024];
+    while (req.find("\r\n\r\n") == std::string::npos && req.size() < 8192) {
+        int n = recv(client, chunk, sizeof(chunk), 0);
+        if (n <= 0) break;
+        req.append(chunk, static_cast<size_t>(n));
+    }
+
+    static const char* response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE5\xAE\x8C\xE4\xBA\x86\xE3\x80\x82"
+        "\xE3\x81\x93\xE3\x81\xAE\xE3\x82\xBF\xE3\x83\x96\xE3\x81\xAF\xE9\x96\x89\xE3"
+        "\x81\x98\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80"
+        "\x82</p></body></html>";
+    send(client, response, static_cast<int>(strlen(response)), 0);
+    closesocket(client);
+
+    // GET /?code=xxxx から auth_code を抽出
+    size_t codePos = req.find("code=");
+    if (codePos == std::string::npos) return {};
+    codePos += 5;
+    size_t codeEnd = req.find_first_of("& \r\n", codePos);
+    if (codeEnd == std::string::npos) codeEnd = req.size();
+    return req.substr(codePos, codeEnd - codePos);
+}
+
+// トークンレスポンス JSON からアクセストークンと有効期限を更新する
+// access_token が含まれない場合は false を返す
+static bool applyTokenResponse(const winrt::Windows::Data::Json::JsonObject& obj) {
+    if (!obj.HasKey(L"access_token")) return false;
+    g_accessToken = obj.GetNamedString(L"access_token", L"").c_str();
+
+    double expiresIn = obj.GetNamedNumber(L"expires_in", 3600);
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+    g_tokenExpiry.LowPart  = ft.dwLowDateTime;
+    g_tokenExpiry.HighPart = ft.dwHighDateTime;
+    g_tokenExpiry.QuadPart += static_cast<ULONGLONG>(expiresIn * 10'000'000.0);
+    return true;
+}
+
+// 認証コードをアクセストークン・リフレッシュトークンに交換する
+// 成功時: g_accessToken / g_tokenExpiry を更新し、refresh_token をレジストリに保存
+static bool exchangeCodeForTokens(const std::string& authCode,
+    int redirectPort, const std::string& codeVerifier)
+{
+    std::string redirectUri = "http://127.0.0.1:" + std::to_string(redirectPort);
+    std::string body =
+        "grant_type=authorization_code"
+        "&code="          + urlEncode(authCode) +
+        "&client_id="     + urlEncode(wideToUtf8(OAUTH_CLIENT_ID)) +
+        "&client_secret=" + urlEncode(wideToUtf8(OAUTH_CLIENT_SECRET)) +
+        "&redirect_uri="  + urlEncode(redirectUri) +
+        "&code_verifier=" + urlEncode(codeVerifier);
+
+    DWORD httpStatus = 0;
+    std::wstring url = std::wstring(L"https://") + OAUTH_TOKEN_HOST + OAUTH_TOKEN_PATH;
+    auto resp = httpPostForm(url, body, &httpStatus);
+    if (resp.empty() || httpStatus != 200) {
+        writeLog("token exchange failed: status " + std::to_string(httpStatus));
+        return false;
+    }
+
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+        if (!applyTokenResponse(obj)) {
+            writeLog("token exchange: no access_token in response");
+            return false;
+        }
+
+        if (obj.HasKey(L"refresh_token")) {
+            std::wstring rt = obj.GetNamedString(L"refresh_token", L"").c_str();
+            writeRegString(REG_REFRESH_TOKEN, rt);
+            writeLog("refresh_token saved to registry");
+        }
+        else {
+            writeLog("warning: no refresh_token in response");
+        }
+        writeLog("token exchange succeeded");
+        return true;
+    }
+    catch (...) {
+        writeLog("token exchange: JSON parse error");
+        return false;
+    }
+}
+
+// リフレッシュトークンでアクセストークンを更新する
+static bool refreshAccessToken(const std::wstring& refreshToken) {
+    std::string body =
+        "grant_type=refresh_token"
+        "&refresh_token=" + urlEncode(wideToUtf8(refreshToken)) +
+        "&client_id="     + urlEncode(wideToUtf8(OAUTH_CLIENT_ID)) +
+        "&client_secret=" + urlEncode(wideToUtf8(OAUTH_CLIENT_SECRET));
+
+    DWORD httpStatus = 0;
+    std::wstring url = std::wstring(L"https://") + OAUTH_TOKEN_HOST + OAUTH_TOKEN_PATH;
+    auto resp = httpPostForm(url, body, &httpStatus);
+    if (resp.empty() || httpStatus != 200) {
+        writeLog("refresh token failed: status " + std::to_string(httpStatus));
+        return false;
+    }
+
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+        if (!applyTokenResponse(obj)) return false;
+
+        writeLog("access token refreshed");
+        return true;
+    }
+    catch (...) {
+        writeLog("refresh token: JSON parse error");
+        return false;
+    }
+}
+
+// アクセストークン確保のオーケストレータ
+//
+// 1. 有効期限内（5分マージン）なら即 return true
+// 2. レジストリの refresh_token でリフレッシュを試みる
+// 3. 失敗なら Toast 通知でブラウザ認証フロー起動
+static bool ensureAccessToken() {
+    // 有効期限確認（5分のマージンを持たせる）
+    if (!g_accessToken.empty()) {
+        FILETIME ft = {};
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER now;
+        now.LowPart  = ft.dwLowDateTime;
+        now.HighPart = ft.dwHighDateTime;
+        if (now.QuadPart + 5uLL * 60 * 10'000'000 < g_tokenExpiry.QuadPart)
+            return true;
+    }
+
+    // refresh_token でリフレッシュを試みる
+    auto refreshToken = readRegString(REG_REFRESH_TOKEN);
+    if (!refreshToken.empty()) {
+        if (refreshAccessToken(refreshToken)) return true;
+        writeLog("refresh failed, falling back to full auth flow");
+    }
+
+    // フル認証フロー（ブラウザで OAuth 同意画面を開く）
+    writeLog("starting OAuth authorization flow");
+    showToast(L"認証が必要", L"ブラウザで Google 認証してください", L"");
+
+    SOCKET serverSocket = INVALID_SOCKET;
+    int port = startLoopbackServer(serverSocket);
+    if (port == 0) {
+        writeLog("failed to start loopback server");
+        return false;
+    }
+
+    auto codeVerifier = generateCodeVerifier();
+    if (codeVerifier.empty()) {
+        writeLog("failed to generate PKCE code verifier");
+        closesocket(serverSocket);
+        WSACleanup();
+        return false;
+    }
+    openBrowserForAuth(port, codeVerifier);
+
+    auto authCode = waitForAuthCode(serverSocket);
+    closesocket(serverSocket);
+    WSACleanup();
+
+    if (authCode.empty()) {
+        writeLog("OAuth auth code not received (timeout?)");
+        return false;
+    }
+    return exchangeCodeForTokens(authCode, port, codeVerifier);
 }
 
 // ==================== Calendar イベント処理 ====================
 
-// JSON レスポンスを CalendarEvent 配列に変換する
-// "error" フィールドがある場合は errorMsg に "API error: <メッセージ>" をセットして空配列を返す
-// パースエラーの場合は errorMsg に "JSON parse error" をセットして空配列を返す
+// "+09:00" や "Z" 付き日時を UTC ISO 8601 "YYYY-MM-DDTHH:MM:SS.000Z" に正規化する
+// 終日イベント（"YYYY-MM-DD" 形式）は JST 00:00 として UTC 変換する
+static std::string normalizeToUtcIso(const std::string& dt) {
+    if (dt.empty()) return dt;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+
+    // 終日イベント: "YYYY-MM-DD" 形式（10文字）
+    if (dt.size() == 10) {
+        if (sscanf_s(dt.c_str(), "%d-%d-%d", &y, &mo, &d) != 3) return dt;
+        SYSTEMTIME st = {};
+        st.wYear = static_cast<WORD>(y); st.wMonth = static_cast<WORD>(mo); st.wDay = static_cast<WORD>(d);
+        st = jstToUtc(st);
+        char buf[32];
+        sprintf_s(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        return buf;
+    }
+
+    // 時刻あり: "YYYY-MM-DDTHH:MM:SS..." 形式
+    if (sscanf_s(dt.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) return dt;
+
+    // "Z" は UTC
+    if (dt.back() == 'Z') {
+        char buf[32];
+        sprintf_s(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.000Z", y, mo, d, h, mi, s);
+        return buf;
+    }
+
+    // "+HH:MM" または "-HH:MM" を 10 文字以降で探す
+    int tzH = 0, tzM = 0;
+    bool negative = false;
+    size_t plusPos  = dt.rfind('+');
+    size_t minusPos = dt.rfind('-');
+    if (plusPos != std::string::npos && plusPos > 10) {
+        sscanf_s(dt.c_str() + plusPos + 1, "%d:%d", &tzH, &tzM);
+    }
+    else if (minusPos != std::string::npos && minusPos > 10) {
+        sscanf_s(dt.c_str() + minusPos + 1, "%d:%d", &tzH, &tzM);
+        negative = true;
+    }
+
+    SYSTEMTIME st = {};
+    st.wYear = static_cast<WORD>(y); st.wMonth = static_cast<WORD>(mo); st.wDay = static_cast<WORD>(d);
+    st.wHour = static_cast<WORD>(h); st.wMinute = static_cast<WORD>(mi); st.wSecond = static_cast<WORD>(s);
+
+    // UTC に変換（タイムゾーンオフセット分を引く）
+    long long offsetHns = ((long long)tzH * 60 + tzM) * 60LL * 10'000'000LL;
+    if (negative) offsetHns = -offsetHns;
+    auto uli = systemTimeToUli(st);
+    uli.QuadPart -= offsetHns;
+    st = uliToSystemTime(uli);
+
+    char buf[32];
+    sprintf_s(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+// Calendar API v3 JSON レスポンスを CalendarEvent 配列に変換する
+// "error" フィールドがある場合は errorMsg に "API error" をセット
+// パースエラーの場合は errorMsg に "JSON parse error" をセット
 static ParseResult parseCalendarEvents(const std::string& json) {
     ParseResult result;
     try {
         auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(json));
 
         if (obj.HasKey(L"error")) {
-            result.errorMsg = "API error: " + winrt::to_string(obj.GetNamedString(L"error", L"unknown"));
+            result.errorMsg = "API error";
             return result;
         }
 
-        auto arr = obj.GetNamedArray(L"calendar");
+        auto arr = obj.GetNamedArray(L"items");
         for (auto item : arr) {
             auto ev = item.GetObject();
+
+            // イベントタイプフィルタ（outOfOffice / workingLocation / focusTime を除外）
+            auto evType = winrt::to_string(ev.GetNamedString(L"eventType", L"default"));
+            if (evType == "outOfOffice" || evType == "workingLocation" || evType == "focusTime")
+                continue;
+
+            // キャンセル済みを除外
+            if (winrt::to_string(ev.GetNamedString(L"status", L"")) == "cancelled") continue;
+
+            // 自分が欠席（declined）のイベントを除外
+            if (ev.HasKey(L"attendees")) {
+                bool declined = false;
+                for (auto att : ev.GetNamedArray(L"attendees")) {
+                    auto a = att.GetObject();
+                    if (a.GetNamedBoolean(L"self", false)
+                        && winrt::to_string(a.GetNamedString(L"responseStatus", L"")) == "declined") {
+                        declined = true;
+                        break;
+                    }
+                }
+                if (declined) continue;
+            }
+
             CalendarEvent e;
-            e.datetime  = winrt::to_string(ev.GetNamedString(L"datetime",  L""));
-            e.content   = winrt::to_string(ev.GetNamedString(L"content",   L""));
-            e.permalink = winrt::to_string(ev.GetNamedString(L"permalink", L""));
+
+            // 開始日時の UTC 正規化（dateTime または date）
+            if (ev.HasKey(L"start")) {
+                auto startObj = ev.GetNamedObject(L"start");
+                if (startObj.HasKey(L"dateTime"))
+                    e.datetime = normalizeToUtcIso(
+                        winrt::to_string(startObj.GetNamedString(L"dateTime", L"")));
+                else if (startObj.HasKey(L"date"))
+                    e.datetime = normalizeToUtcIso(
+                        winrt::to_string(startObj.GetNamedString(L"date", L"")));
+            }
+
+            e.content   = winrt::to_string(ev.GetNamedString(L"summary",  L""));
+            e.permalink = winrt::to_string(ev.GetNamedString(L"htmlLink", L""));
+
             if (!e.datetime.empty() && !e.content.empty()) result.events.push_back(std::move(e));
         }
     }
@@ -574,15 +996,6 @@ static Config loadConfig(const std::wstring& exeDir) {
     auto local = loadToml(exeDir + L"\\gcalntfy.local.toml");
     if (local) writeLog("Loaded gcalntfy.local.toml (override active)");
 
-    auto getString = [&](const char* key) -> std::wstring {
-        if (local) {
-            if (auto v = (*local)[key].value<std::string>()) return toWide(*v);
-        }
-        if (base) {
-            if (auto v = (*base)[key].value<std::string>()) return toWide(*v);
-        }
-        return {};
-    };
     // duck_targets 配列の読み込み（local 優先、なければ base）
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl) -> std::vector<std::wstring> {
         if (!tbl) return {};
@@ -596,9 +1009,6 @@ static Config loadConfig(const std::wstring& exeDir) {
     };
 
     Config cfg;
-    cfg.apiUrl   = getString("api_url");
-    cfg.apiToken = getString("api_token");
-
     if (auto s = readSchedule(local)) {
         cfg.schedule = std::move(*s);
     }
@@ -773,6 +1183,37 @@ static void writeRegDword(const wchar_t* valueName, DWORD value) {
     }
     if (RegSetValueExW(hKey, valueName, 0, REG_DWORD,
             reinterpret_cast<const BYTE*>(&value), sizeof(value)) != ERROR_SUCCESS)
+        writeLog("registry write failed: " + wideToUtf8(valueName));
+    RegCloseKey(hKey);
+}
+
+// レジストリ REG_SZ 値の読み取り
+// キーまたは値が存在しない場合は空文字列を返す
+static std::wstring readRegString(const wchar_t* valueName) {
+    DWORD type = 0, size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY_PATH, valueName,
+            RRF_RT_REG_SZ, &type, nullptr, &size) != ERROR_SUCCESS || size == 0)
+        return {};
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY_PATH, valueName,
+            RRF_RT_REG_SZ, &type, value.data(), &size) != ERROR_SUCCESS)
+        return {};
+    // RegGetValueW は null 終端を含むサイズを返すため、末尾の null を除去
+    if (!value.empty() && value.back() == L'\0') value.pop_back();
+    return value;
+}
+
+// レジストリ REG_SZ 値の書き込み
+static void writeRegString(const wchar_t* valueName, const std::wstring& value) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, nullptr,
+            0, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+        writeLog("registry key create failed: " + wideToUtf8(valueName));
+        return;
+    }
+    DWORD byteSize = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
+    if (RegSetValueExW(hKey, valueName, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(value.c_str()), byteSize) != ERROR_SUCCESS)
         writeLog("registry write failed: " + wideToUtf8(valueName));
     RegCloseKey(hKey);
 }
@@ -1531,19 +1972,6 @@ int wmain() {
         g_hWnd = createTrayWindow();
         auto cfg = loadConfig(exeDir);
 
-        if (cfg.apiUrl.empty()) {
-            writeLog("api_url is not set in gcalntfy.toml");
-            return 1;
-        }
-        if (!isHttpUrl(cfg.apiUrl)) {
-            writeLog("api_url is invalid (must start with https://)");
-            return 1;
-        }
-        if (cfg.apiToken.empty()) {
-            writeLog("api_token is not set in gcalntfy.toml");
-            return 1;
-        }
-
         addTrayIcon(g_hWnd);
 
         // レジストリから設定を復元（キー未作成時はデフォルト値）
@@ -1577,50 +2005,58 @@ int wmain() {
                 if (nowTick - lastConfigCheck >= CONFIG_CHECK_INTERVAL_MS) {
                     lastConfigCheck = nowTick;
                     auto newCfg = loadConfig(exeDir);
-                    if (!newCfg.apiUrl.empty() && !newCfg.apiToken.empty() && isHttpUrl(newCfg.apiUrl)) {
-                        if (newCfg != cfg) {
-                            writeLog("config reloaded");
-                            logSchedule(newCfg.schedule);
-                        }
-                        cfg = std::move(newCfg);
+                    if (newCfg != cfg) {
+                        writeLog("config reloaded");
+                        logSchedule(newCfg.schedule);
                     }
-                    else {
-                        writeLog("config reload skipped: invalid settings");
-                    }
+                    cfg = std::move(newCfg);
                 }
 
                 int count = cfg.schedule[jstNow.wHour];
 
                 // schedule=0 の時間帯: 次の正時までスリープ（初回は必ずポーリング）
                 if (count == 0 && !firstPoll) {
-                    long long remainMs = (long long)(60 - jstNow.wMinute) * 60000LL
-                        - (long long)jstNow.wSecond * 1000LL
-                        - (long long)jstNow.wMilliseconds;
-                    if (remainMs < 1000) remainMs = 1000;
-                    waitWithMessages(static_cast<DWORD>(remainMs));
+                    waitWithMessages(calcSleepUntilNextPoll(0));
                     continue;
                 }
 
-                // API ポーリング（現在から 12 時間以内の全予定を取得）
-                auto dateJST = getCurrentDateTimeJST();
-                auto nowUtc  = getCurrentUtcISO();
-                auto endJst  = utcToJst(shiftSystemTime(utcNow, 12LL * 60 * 60 * 10'000'000LL));
-                wchar_t endBuf[32];
-                swprintf_s(endBuf, _countof(endBuf), L"%04d-%02d-%02d %02d:%02d",
-                    endJst.wYear, endJst.wMonth, endJst.wDay, endJst.wHour, endJst.wMinute);
-                std::string jsonBody = "{\"token\":\""
-                    + escapeJson(wideToUtf8(cfg.apiToken)) + "\",\"date\":\""
-                    + escapeJson(wideToUtf8(dateJST)) + "\",\"end\":\""
-                    + escapeJson(wideToUtf8(endBuf))
-                    + "\",\"media\":\"calendar\",\"fields\":[\"datetime\",\"content\",\"permalink\"]}";
+                // アクセストークン確保（有効期限内 → 即 return、それ以外 → リフレッシュまたは完全認証）
+                if (!ensureAccessToken()) {
+                    writeLog("OAuth authentication failed");
+                    waitWithMessages(RETRY_WAIT_MS);
+                    continue;
+                }
+
+                // Calendar API v3 URL 構築（現在から 12 時間以内の予定を取得）
+                auto nowUtc = getCurrentUtcISO();
+                auto endUtc = systemTimeToIso(
+                    shiftSystemTime(utcNow, 12LL * 60 * 60 * 10'000'000LL)) + ".000Z";
+                std::wstring calUrl = L"https://";
+                calUrl += CALENDAR_API_HOST;
+                calUrl += CALENDAR_API_PATH;
+                calUrl += L"?singleEvents=true&orderBy=startTime&maxResults=50";
+                calUrl += L"&fields=items(summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
+                calUrl += L"&timeMin=" + toWide(urlEncode(nowUtc));
+                calUrl += L"&timeMax=" + toWide(urlEncode(endUtc));
 
                 DWORD httpStatus = 0;
-                auto body = httpPost(cfg.apiUrl, jsonBody, &httpStatus);
+                auto body = httpGet(calUrl, g_accessToken, &httpStatus);
+
+                // 401: アクセストークン失効 → リフレッシュしてリトライ
+                if (httpStatus == 401) {
+                    writeLog("access token expired (401), refreshing...");
+                    g_accessToken.clear();
+                    g_tokenExpiry = {};
+                    if (!ensureAccessToken()) {
+                        waitWithMessages(RETRY_WAIT_MS);
+                        continue;
+                    }
+                    body = httpGet(calUrl, g_accessToken, &httpStatus);
+                }
+
                 if (body.empty()) {
                     std::string err = "HTTP request failed";
-                    if (httpStatus != 0) {
-                        err += " (status " + std::to_string(httpStatus) + ")";
-                    }
+                    if (httpStatus != 0) err += " (status " + std::to_string(httpStatus) + ")";
                     writeLog(err);
                     waitWithMessages(RETRY_WAIT_MS);
                     continue;
@@ -1644,7 +2080,7 @@ int wmain() {
                     }
                     g_cv.notify_one();
                     if (g_hWnd) updateTrayTooltip(g_hWnd);
-                    }
+                }
 
                 firstPoll = false;
                 waitWithMessages(calcSleepUntilNextPoll(count));

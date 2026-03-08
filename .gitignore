@@ -8,6 +8,7 @@ node_modules/
 gcalntfy/out/
 
 # gcalntfy ユーザ環境固有ファイル
+gcalntfy/.env
 gcalntfy/*.local.toml
 gcalntfy/*.local.opus
 

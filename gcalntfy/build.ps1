@@ -18,9 +18,24 @@ if ($LASTEXITCODE) { exit 1 }
 
 "#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
 
+# .env から OAuth クレデンシャルを読み込んで oauth.h を生成
+$envFile = Join-Path $PSScriptRoot ".env"
+if (-not (Test-Path $envFile)) { Write-Error ".env が見つからない（gcalntfy/.env を作成して GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET を設定してください）"; exit 1 }
+$envVars = @{}
+Get-Content $envFile | ForEach-Object {
+    if ($_ -match '^\s*([^#=]+?)\s*=\s*(.+?)\s*$') { $envVars[$Matches[1]] = $Matches[2] }
+}
+if (-not $envVars['GOOGLE_CLIENT_ID'] -or -not $envVars['GOOGLE_CLIENT_SECRET']) {
+    Write-Error ".env に GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET が未設定"; exit 1
+}
+@"
+#define OAUTH_CLIENT_ID L"$($envVars['GOOGLE_CLIENT_ID'])"
+#define OAUTH_CLIENT_SECRET L"$($envVars['GOOGLE_CLIENT_SECRET'])"
+"@ | Set-Content -Encoding UTF8NoBOM out\oauth.h
+
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `
-    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
+    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib
 if ($LASTEXITCODE) { exit 1 }

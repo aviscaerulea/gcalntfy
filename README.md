@@ -3,7 +3,7 @@
 Google Workspace 上のアクティビティを活用するための 2 コンポーネント構成のプロジェクト。
 
 - **GAS Web App**: 指定日の Chat メッセージ・Calendar イベント・Gmail 送信メール・Drive 更新ファイルを JSON で返す REST API。活動の振り返りや週次報告の材料収集（「誰と何をしたか」）に使う
-- **gcalntfy**: GAS Web App の calendar API を定期ポーリングし、予定を 4 分前に Windows Toast 通知する常駐デーモン（Windows 用）
+- **gcalntfy**: Google Calendar API v3 を直接ポーリングし、予定を 4 分前に Windows Toast 通知する常駐デーモン（Windows 用）
 
 ## 機能
 
@@ -229,7 +229,7 @@ GAS プロジェクトに紐づく Google Cloud Project で以下の API を有�
 
 ## gcalntfy
 
-GAS Web App の calendar API を定期ポーリングし、次の予定を 4 分前に Windows Toast 通知する常駐デーモン。
+Google Calendar API v3 を直接ポーリングし、次の予定を 4 分前に Windows Toast 通知する常駐デーモン。OAuth 2.0 + PKCE でセキュアに認証する。
 
 ### 動作
 
@@ -258,20 +258,34 @@ task build
 
 Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
 
+ビルド前に `gcalntfy/.env` を作成して GCP の OAuth クライアント情報を設定すること（後述）。
+
 ### 設定
 
 `gcalntfy.toml`（または `gcalntfy.local.toml`）を exe と同フォルダに配置する。
 
 ```toml
-# GAS Web App のデプロイ URL
-api_url = "https://script.google.com/macros/s/{DEPLOY_ID}/exec"
-# API トークン（setupApiToken 関数で設定した値）
-api_token = "YOUR_SECRET"
 # 0時〜23時のポーリング回数（回/時）。正時起点の等間隔。0=ポーリングしない
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
 # 通知音再生中にミュートするプロセス名（空配列で無効）
 # duck_targets = ["chrome.exe", "msedge.exe"]
 ```
+
+### OAuth 2.0 セットアップ（開発者向け）
+
+1. [GCP コンソール](https://console.cloud.google.com/) で Google Calendar API を有効化
+2. 「認証情報」→「OAuth クライアント ID を作成」→ **デスクトップアプリ** を選択
+3. OAuth 同意画面のユーザータイプ：Google Workspace 組織なら **Internal** を選択（審査不要）
+4. 発行された Client ID / Secret を `gcalntfy/.env` に記述（git 管理外）：
+
+```
+GOOGLE_CLIENT_ID=xxxxxxxxxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxx
+```
+
+### 初回起動時の認証
+
+初回起動時はアクセストークンがないため、Toast 通知でブラウザが開く。Google アカウントで「許可」をクリックすると認証が完了し、リフレッシュトークンがレジストリ（`HKCU\SOFTWARE\gcalntfy`）に保存される。以降の起動では再認証不要。
 
 ## 技術スタック
 
@@ -288,8 +302,11 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 ### gcalntfy
 
 - C++20（MSVC）
+- Google Calendar API v3（OAuth 2.0 + PKCE 直接アクセス）
 - WinRT Toast Notifications（Windows.UI.Notifications）
 - WASAPI Core Audio API（ダッキング）
 - WinHTTP（HTTPS ポーリング）
+- BCrypt（PKCE SHA-256、乱数生成）
+- Winsock2（OAuth ループバックサーバ）
 - toml++（TOML 設定パーサ）
 - ffplay（通知音再生）
