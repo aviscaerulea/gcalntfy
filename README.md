@@ -43,30 +43,7 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 # duck_targets = ["chrome.exe", "msedge.exe"]
 ```
 
-## OAuth 2.0 セットアップ（開発者向け）
-
-1. [GCP コンソール](https://console.cloud.google.com/) で Google Calendar API を有効化
-2. 「認証情報」→「OAuth クライアント ID を作成」→ **デスクトップアプリ** を選択
-3. OAuth 同意画面のユーザータイプ：Google Workspace 組織なら **Internal** を選択（審査不要）
-4. 発行された Client ID / Secret を `.env` に記述（git 管理外）：
-
-```
-GOOGLE_CLIENT_ID=xxxxxxxxxxxx.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxx
-```
-
 ## 初回起動時の認証
 
 初回起動時はアクセストークンがないため、Toast 通知でブラウザが開く。Google アカウントで「許可」をクリックすると認証が完了し、リフレッシュトークンがレジストリ（`HKCU\SOFTWARE\gcalntfy`）に保存される。以降の起動では再認証不要。
 
-## 技術スタック
-
-- C++20（MSVC）
-- Google Calendar API v3（OAuth 2.0 + PKCE 直接アクセス）
-- WinRT Toast Notifications（Windows.UI.Notifications）
-- WASAPI Core Audio API（ダッキング）
-- WinHTTP（HTTPS ポーリング）
-- BCrypt（PKCE SHA-256、乱数生成）
-- Winsock2（OAuth ループバックサーバ）
-- toml++（TOML 設定パーサ）
-- ffplay（通知音再生）
