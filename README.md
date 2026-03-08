@@ -30,7 +30,7 @@ task build
 
 Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
 
-ビルド前に `.env` を作成して GCP の OAuth クライアント情報を設定すること（後述）。
+ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定すること。
 
 ## 設定
 
