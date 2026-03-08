@@ -107,6 +107,9 @@ static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 // 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
+// エラー Toast の最小間隔（30 分）
+static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
+
 // 前回ポーリングからこの時間が経過したら即時ポーリング（1 時間）
 static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 
@@ -152,6 +155,9 @@ static std::atomic<bool> g_forcePoll{false};
 
 // 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
 static std::atomic<ULONGLONG> g_lastPollTick{0};
+
+// 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。ポーリング成功時に 0 リセット）
+static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
@@ -1556,6 +1562,18 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title,
     notifier.Show(notification);
 }
 
+// エラー Toast 表示（クールダウン制御付き）
+//
+// 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
+// ポーリング成功時に g_lastErrorToastTime = 0 でリセットすること。
+static void showErrorToast(const std::wstring& title, const std::wstring& body)
+{
+    ULONGLONG now = GetTickCount64();
+    if (now - g_lastErrorToastTime.load() < ERROR_TOAST_COOLDOWN_MS) return;
+    g_lastErrorToastTime.store(now);
+    showToast(title, body, L"");
+}
+
 // ==================== トレイアイコン ====================
 
 // メッセージポンプしつつ指定時間（ミリ秒）待機する Sleep() 代替
@@ -2056,6 +2074,7 @@ int wmain() {
                 // アクセストークン確保（有効期限内 → 即 return、それ以外 → リフレッシュまたは完全認証）
                 if (!ensureAccessToken()) {
                     writeLog("OAuth authentication failed");
+                    showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
                     waitWithMessages(RETRY_WAIT_MS);
                     continue;
                 }
@@ -2091,6 +2110,7 @@ int wmain() {
                     std::string err = "HTTP request failed";
                     if (httpStatus != 0) err += " (status " + std::to_string(httpStatus) + ")";
                     writeLog(err);
+                    showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
                     waitWithMessages(RETRY_WAIT_MS);
                     continue;
                 }
@@ -2098,8 +2118,10 @@ int wmain() {
                 auto [events, errorMsg] = parseCalendarEvents(body);
                 if (!errorMsg.empty()) {
                     writeLog(errorMsg);
+                    showErrorToast(L"API エラー", L"Calendar データの取得に失敗しました");
                 }
                 else {
+                    g_lastErrorToastTime.store(0);  // エラー通知クールダウンをリセット
                     writeLog("poll: " + std::to_string(events.size()) + " events, next: " + nextPollTimeStr(count));
                 }
 
