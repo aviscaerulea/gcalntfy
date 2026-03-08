@@ -1,19 +1,16 @@
-.clasp.json
-node_modules/
-
 # Claude Code ローカル設定（環境固有のため除外）
 .claude/CLAUDE.local.md
 
 # ナレッジノート（Obsidian Vault からのハードリンク、環境固有）
 .claude/rules/README_*.md
 
-# gcalntfy ビルド成果物（out/ ディレクトリ全体）
-gcalntfy/out/
+# ビルド成果物
+out/
 
-# gcalntfy ユーザ環境固有ファイル
-gcalntfy/.env
-gcalntfy/*.local.toml
-gcalntfy/*.local.opus
+# ユーザ環境固有ファイル
+.env
+*.local.toml
+*.local.opus
 
-# gcalntfy チャイム素材（ソース mp3 はコミット対象外）
-gcalntfy/intro.mp3
+# チャイム素材（ソース mp3 はコミット対象外）
+intro.mp3

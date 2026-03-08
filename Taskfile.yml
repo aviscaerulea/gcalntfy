@@ -7,13 +7,11 @@ vars:
 tasks:
   clean:
     desc: ビルド成果物を削除
-    dir: gcalntfy
     cmds:
       - rm -rf out
 
   build:
     desc: gcalntfy をビルド
-    dir: gcalntfy
     cmds:
       - taskkill //F //IM gcalntfy.exe 2>/dev/null || true
       - mkdir -p out
@@ -26,7 +24,6 @@ tasks:
 
   release:
     desc: リリースビルドと zip 作成
-    dir: gcalntfy
     deps: [build]
     cmds:
       - >-
