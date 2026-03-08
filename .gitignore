@@ -4,6 +4,9 @@ node_modules/
 # Claude Code ローカル設定（環境固有のため除外）
 .claude/CLAUDE.local.md
 
+# ナレッジノート（Obsidian Vault からのハードリンク、環境固有）
+.claude/rules/README_*.md
+
 # gcalntfy ビルド成果物（out/ ディレクトリ全体）
 gcalntfy/out/
 
