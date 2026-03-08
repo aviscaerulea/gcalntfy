@@ -1,6 +1,11 @@
 # ナレッジノート（Obsidian Vault からのハードリンク、環境固有）
 .claude/rules/README_*.md
 
+# Claude Code・ツール設定（環境固有）
+.claude/
+.clasp.json
+.mcp.json
+
 # ビルド成果物
 out/
 
