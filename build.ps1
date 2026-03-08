@@ -20,7 +20,7 @@ if ($LASTEXITCODE) { exit 1 }
 
 # .env から OAuth クレデンシャルを読み込んで oauth.h を生成
 $envFile = Join-Path $PSScriptRoot ".env"
-if (-not (Test-Path $envFile)) { Write-Error ".env が見つからない（gcalntfy/.env を作成して GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET を設定してください）"; exit 1 }
+if (-not (Test-Path $envFile)) { Write-Error ".env が見つからない（プロジェクトルートに .env を作成して GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET を設定してください）"; exit 1 }
 $envVars = @{}
 Get-Content $envFile | ForEach-Object {
     if ($_ -match '^\s*([^#=]+?)\s*=\s*(.+?)\s*$') { $envVars[$Matches[1]] = $Matches[2] }
