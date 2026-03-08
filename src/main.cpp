@@ -12,8 +12,8 @@
  *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
  *   2  - 予期しない初期化エラー
  *
- * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
- * 外部依存: ffplay (PATH 上に存在すること、未インストールでも Toast 通知は表示される)
+ * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys, libopus/libopusfile (スタティックリンク)
+ * 外部依存: なし
  * ビルド: rc /nologo resource.rc
  *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
  *             /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
@@ -40,7 +40,10 @@
 #include <propvarutil.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
+#include <audioclient.h>
 #include <bcrypt.h>
+
+#include <opus/opusfile.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
 
@@ -105,6 +108,12 @@ static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
 // 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
+
+// BLE ヘッドホン対処：冒頭無音の時間（ミリ秒）
+static constexpr int BLE_SILENCE_MS = 2000;
+
+// 通知音再生完了後、ダッキング解除前のトレーリング無音（ミリ秒）
+static constexpr int DUCK_TRAILING_MS = 2000;
 
 // エラー Toast の最小間隔（30 分）
 static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
@@ -201,9 +210,9 @@ static bool                    g_eventsUpdated = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
-    HANDLE                                          hAudio1Process; // audio1 ffplay プロセスハンドル
-    std::wstring                                    bodyPath;      // audio2.opus パス（空なら body なし）
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;         // ミュート済みセッション（復元用）
+    std::wstring                                    audio1Path; // audio1.opus フルパス
+    std::wstring                                    audio2Path; // audio2.opus フルパス（空なら再生しない）
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;      // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -1356,68 +1365,205 @@ static bool isMeetingActive() {
 
 // ==================== 通知音再生 ====================
 
-// ファイルを ffplay で再生する
+// Opus ファイルを WASAPI 共有モードで再生する
 //
 // path: 再生ファイルのフルパス
-// withDelay: true で adelay=1000:all=1 を付与する（BLE ヘッドホン対処: 冒頭 1 秒の無音を挿入）
-// 戻り値: ffplay のプロセスハンドル（起動失敗時は INVALID_HANDLE_VALUE）
-static HANDLE playViaFile(const std::wstring& path, bool withDelay = false) {
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
+// withLeadingSilence: true で冒頭 BLE_SILENCE_MS 分の無音を挿入する（BLE ヘッドホン対処）
+// 戻り値: 再生成功なら true
+//
+// WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
+// op_read_float_stereo() で常にステレオ出力するため、デバイスのチャンネル設定に依存しない。
+// g_shutdownRequested が true になると再生を中断する。
+static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) {
+    // Opus ファイルを開く（wstring → UTF-8 変換）
+    int len = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) {
+        writeLog("playOpusToWasapi: WideCharToMultiByte failed");
+        return false;
+    }
+    std::string pathUtf8(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, pathUtf8.data(), len, nullptr, nullptr);
 
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"ffplay -nodisp -autoexit -loglevel quiet";
-    if (withDelay) cmd += L" -af adelay=1000:all=1";
-    cmd += L" \"" + path + L"\"";
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-            FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        writeLog("playViaFile: CreateProcessW failed: " + std::to_string(GetLastError()));
-        return INVALID_HANDLE_VALUE;
+    int err = 0;
+    OggOpusFile* of = op_open_file(pathUtf8.c_str(), &err);
+    if (!of) {
+        writeLog("playOpusToWasapi: op_open_file failed: " + std::to_string(err));
+        return false;
     }
 
-    CloseHandle(pi.hThread);
-    return pi.hProcess;
-}
+    // WASAPI デバイス初期化
+    WAVEFORMATEX* mixFmt = nullptr;
+    HANDLE hEvent        = nullptr;
+    bool ok              = false;
 
-// audio1 再生完了待機 → body 再生 → ダッキング解除するスレッド関数
-//
-// STA で COM 初期化し、CoWaitForMultipleHandles でメッセージキューをポンピングする。
-// audio1 終了後、bodyPath が空でなければ playViaFile で audio2.opus を即起動する。
-// タイムアウト時は ffplay プロセスを強制終了して孤立を防ぐ。
-static DWORD WINAPI soundThread(LPVOID param) {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    auto* ctx = static_cast<SoundContext*>(param);
-    bool comOk = (hr == S_OK); // S_FALSE（既初期化）は別スレッドでは通常起きないが念のため除外
+    winrt::com_ptr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), enumerator.put_void()))) {
+        writeLog("playOpusToWasapi: CoCreateInstance IMMDeviceEnumerator failed");
+        goto cleanup;
+    }
 
-    if (comOk) {
-        // audio1 終了を待機（最大 30 秒）
-        DWORD idx = 0;
-        HRESULT waitHr = CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
-            30000, 1, &ctx->hAudio1Process, &idx);
-        if (waitHr != S_OK) TerminateProcess(ctx->hAudio1Process, 1); // タイムアウト時に強制終了
-        CloseHandle(ctx->hAudio1Process);
-
-        // body 再生（audio2.opus が存在する場合）
-        if (!ctx->bodyPath.empty()) {
-            HANDLE hBody = playViaFile(ctx->bodyPath);
-            if (hBody != INVALID_HANDLE_VALUE) {
-                waitHr = CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES,
-                    60000, 1, &hBody, &idx);
-                if (waitHr != S_OK) TerminateProcess(hBody, 1); // タイムアウト時に強制終了
-                CloseHandle(hBody);
-            }
+    {
+        winrt::com_ptr<IMMDevice> device;
+        if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.put()))) {
+            writeLog("playOpusToWasapi: GetDefaultAudioEndpoint failed");
+            goto cleanup;
         }
 
-        // ダッキング解除
+        winrt::com_ptr<IAudioClient> client;
+        if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client.put_void()))) {
+            writeLog("playOpusToWasapi: Activate IAudioClient failed");
+            goto cleanup;
+        }
+
+        if (FAILED(client->GetMixFormat(&mixFmt))) {
+            writeLog("playOpusToWasapi: GetMixFormat failed");
+            goto cleanup;
+        }
+
+        // 共有モードで Opus ネイティブフォーマット（48kHz, ステレオ, 32bit float）を要求する。
+        // OS のオーディオエンジンが必要に応じてリサンプリングする。
+        // op_read_float_stereo() の出力と一致するフォーマット。
+        constexpr UINT32 OPUS_CHANNELS    = 2;
+        constexpr UINT32 OPUS_SAMPLE_RATE = 48000;
+        constexpr UINT32 OPUS_BPS         = 32;
+        constexpr UINT32 OPUS_BLOCK_ALIGN = OPUS_CHANNELS * OPUS_BPS / 8; // 8 bytes/frame
+
+        WAVEFORMATEXTENSIBLE opusFmt = {};
+        opusFmt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+        opusFmt.Format.nChannels       = OPUS_CHANNELS;
+        opusFmt.Format.nSamplesPerSec  = OPUS_SAMPLE_RATE;
+        opusFmt.Format.wBitsPerSample  = OPUS_BPS;
+        opusFmt.Format.nBlockAlign     = OPUS_BLOCK_ALIGN;
+        opusFmt.Format.nAvgBytesPerSec = OPUS_SAMPLE_RATE * OPUS_BLOCK_ALIGN;
+        opusFmt.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        opusFmt.Samples.wValidBitsPerSample = OPUS_BPS;
+        opusFmt.dwChannelMask          = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+        opusFmt.SubFormat              = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+        // 共有モードの Initialize では OS のオーディオエンジンがフォーマット変換を担うため、
+        // IsFormatSupported の事前チェックは行わず、Initialize の成否で判定する。
+        WAVEFORMATEX* useFmt = reinterpret_cast<WAVEFORMATEX*>(&opusFmt);
+
+        hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!hEvent) goto cleanup;
+
+        constexpr REFERENCE_TIME bufDuration = 500'000; // 50ms = 500,000 * 100ns
+        // AUTOCONVERTPCM + SRC_DEFAULT_QUALITY で BLE 等フォーマットが異なるデバイスにも対応する。
+        constexpr DWORD initFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                                  | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                                  | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags,
+                bufDuration, 0, useFmt, nullptr))) {
+            writeLog("playOpusToWasapi: IAudioClient::Initialize failed");
+            goto cleanup;
+        }
+
+        client->SetEventHandle(hEvent);
+
+        winrt::com_ptr<IAudioRenderClient> render;
+        if (FAILED(client->GetService(__uuidof(IAudioRenderClient), render.put_void()))) {
+            writeLog("playOpusToWasapi: GetService IAudioRenderClient failed");
+            goto cleanup;
+        }
+
+        UINT32 bufFrames = 0;
+        client->GetBufferSize(&bufFrames);
+
+        // 冒頭無音挿入（BLE ヘッドホン対処）
+        if (withLeadingSilence) {
+            UINT32 silenceFrames = useFmt->nSamplesPerSec * BLE_SILENCE_MS / 1000;
+            UINT32 written       = 0;
+            client->Start();
+            while (written < silenceFrames && !g_shutdownRequested) {
+                WaitForSingleObject(hEvent, 200);
+                UINT32 padding = 0;
+                client->GetCurrentPadding(&padding);
+                UINT32 avail  = bufFrames - padding;
+                UINT32 frames = min(avail, silenceFrames - written);
+                if (frames == 0) continue;
+                BYTE* buf = nullptr;
+                if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
+                    memset(buf, 0, frames * useFmt->nBlockAlign);
+                    render->ReleaseBuffer(frames, 0);
+                }
+                written += frames;
+            }
+            client->Stop();
+            client->Reset();
+        }
+
+        // Opus デコード → WASAPI バッファ供給ループ
+        // useFmt は IEEE_FLOAT 48kHz ステレオが保証されているため OPUS_BLOCK_ALIGN で固定。
+        bool eof = false;
+        client->Start();
+        while (!eof && !g_shutdownRequested) {
+            WaitForSingleObject(hEvent, 200);
+            UINT32 padding = 0;
+            client->GetCurrentPadding(&padding);
+            UINT32 avail = bufFrames - padding;
+            if (avail == 0) continue;
+
+            // 一時バッファに Opus をデコード（最大 avail フレーム分）
+            std::vector<float> pcm(static_cast<size_t>(avail) * OPUS_CHANNELS);
+            int decoded = op_read_float_stereo(of, pcm.data(), static_cast<int>(pcm.size()));
+            if (decoded < 0) {
+                writeLog("playOpusToWasapi: op_read_float_stereo error: " + std::to_string(decoded));
+                break;
+            }
+            if (decoded == 0) {
+                eof = true;
+                // 残りバッファが再生されるまで待機（最大約 1 秒）
+                for (int i = 0; i < 100; i++) {
+                    UINT32 rem = 0;
+                    client->GetCurrentPadding(&rem);
+                    if (rem == 0) break;
+                    Sleep(10);
+                }
+                break;
+            }
+
+            // memcpy サイズは Opus デコード出力に合わせる（useFmt が mixFmt の場合でも
+            // デコーダ出力は常にステレオ float なので OPUS_BLOCK_ALIGN が正しい）
+            BYTE* buf = nullptr;
+            if (SUCCEEDED(render->GetBuffer(static_cast<UINT32>(decoded), &buf))) {
+                memcpy(buf, pcm.data(), static_cast<size_t>(decoded) * OPUS_BLOCK_ALIGN);
+                render->ReleaseBuffer(static_cast<UINT32>(decoded), 0);
+            }
+        }
+        client->Stop();
+        ok = eof;
+    }
+
+cleanup:
+    if (hEvent) CloseHandle(hEvent);
+    if (mixFmt) CoTaskMemFree(mixFmt);
+    op_free(of);
+    return ok;
+}
+
+// audio1 → audio2 を逐次再生し、ダッキング解除するスレッド関数
+//
+// STA で COM 初期化し、playOpusToWasapi を同期呼び出しで逐次実行する。
+// audio1 完了後、audio2Path が空でなければ audio2 を再生する。
+// 全再生完了後に DUCK_TRAILING_MS の無音バッファを経てダッキングを解除する。
+static DWORD WINAPI soundThread(LPVOID param) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    auto* ctx  = static_cast<SoundContext*>(param);
+    bool comOk = (hr == S_OK || hr == S_FALSE);
+
+    if (comOk) {
+        playOpusToWasapi(ctx->audio1Path, true);
+        if (!ctx->audio2Path.empty()) playOpusToWasapi(ctx->audio2Path, false);
+
         if (!ctx->muted.empty()) {
-            Sleep(2000); // ダッキング解除の遷移バッファ
+            Sleep(DUCK_TRAILING_MS);
             unduckAudioSessions(ctx->muted);
             writeLog("unduckAudioSessions: restored");
         }
     }
     else {
         writeLog("soundThread: CoInitializeEx failed");
-        CloseHandle(ctx->hAudio1Process);
         if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
     }
 
@@ -1426,17 +1572,13 @@ static DWORD WINAPI soundThread(LPVOID param) {
     return 0;
 }
 
-// ffplay で通知音を再生する
+// libopus + WASAPI で通知音を再生する
 //
 // 再生フロー:
-//   adelay=1000（1秒無音） → audio1.opus（チャイム） → audio2.opus（存在時のみ）
-// 両ファイルとも exe 同ディレクトリから読み込む。2 つの ffplay プロセスを逐次起動する方式により
-// Ogg チェイニングの制約（adelay 再適用等）を回避する。
+//   BLE 無音（BLE_SILENCE_MS） → audio1.opus（チャイム） → audio2.opus（存在時のみ）
 // audio1.opus が存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
-// ffplay が未インストールの場合は何もしない（Toast 通知は表示される）。
-// BLE ヘッドホン対処: audio1 再生時に adelay=1000:all=1 で冒頭 1 秒の無音を追加する。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
-//             末尾バッファは soundThread 内の Sleep(2000) で実現する。
+//             末尾バッファは soundThread 内の Sleep(DUCK_TRAILING_MS) で実現する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // audio1.opus の存在確認（exe 同ディレクトリ）
     std::wstring audio1Path = exeDir + L"\\audio1.opus";
@@ -1446,37 +1588,22 @@ static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     }
 
     // audio2.opus の存在確認（exe 同ディレクトリ）
-    std::wstring bodyPath = exeDir + L"\\audio2.opus";
-    bool hasBody = (GetFileAttributesW(bodyPath.c_str()) != INVALID_FILE_ATTRIBUTES);
-    writeLog("launchSound: audio2 " + std::string(hasBody ? "found" : "not found"));
+    std::wstring audio2Path = exeDir + L"\\audio2.opus";
+    bool hasAudio2 = (GetFileAttributesW(audio2Path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    writeLog("launchSound: audio2 " + std::string(hasAudio2 ? "found" : "not found"));
 
     // ダッキング開始（audio1 再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
-    // audio1 を再生（adelay=1000 付き）
-    HANDLE hAudio1 = playViaFile(audio1Path, true);
-    if (hAudio1 == INVALID_HANDLE_VALUE) {
-        if (!mutedSessions.empty()) unduckAudioSessions(mutedSessions);
-        return;
-    }
-    writeLog("launchSound: audio1 playing");
-
-    // ダッキング無効かつ body なし → fire-and-forget
-    if (mutedSessions.empty() && !hasBody) {
-        CloseHandle(hAudio1);
-        return;
-    }
-
-    // スレッドで後続処理（audio1 待機 → body 再生 → アンミュート）
+    // スレッドで再生（audio1 → audio2 → ダッキング解除）
     auto* ctx = new SoundContext{
-        .hAudio1Process = hAudio1,
-        .bodyPath       = hasBody ? bodyPath : L"",
-        .muted          = std::move(mutedSessions)
+        .audio1Path = audio1Path,
+        .audio2Path = hasAudio2 ? audio2Path : L"",
+        .muted      = std::move(mutedSessions)
     };
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
         if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
-        CloseHandle(ctx->hAudio1Process);
         delete ctx;
         return;
     }
@@ -1987,7 +2114,7 @@ int wmain() {
     CreateDirectoryW(g_logDir.c_str(), nullptr);
 
     // 多重起動制御（新プロセス優先）
-    // 名前付き Job Object で旧プロセスと関連子プロセス（ffplay）をまとめて終了させる。
+    // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
     HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {

@@ -33,9 +33,10 @@ if (-not $envVars['GOOGLE_CLIENT_ID'] -or -not $envVars['GOOGLE_CLIENT_SECRET'])
 #define OAUTH_CLIENT_SECRET L"$($envVars['GOOGLE_CLIENT_SECRET'])"
 "@ | Set-Content -Encoding UTF8NoBOM out\oauth.h
 
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ `
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ /I src\deps\opus\include `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `
-    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib
+    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib `
+    src\deps\opus\lib\opusfile.lib src\deps\opus\lib\opus.lib src\deps\opus\lib\ogg.lib
 if ($LASTEXITCODE) { exit 1 }
