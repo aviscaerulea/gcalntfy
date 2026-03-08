@@ -1,14 +1,15 @@
 ## gcalntfy
 
-Google Calendar API v3 を直接ポーリングし、予定の数分前に Windows Toast 通知する常駐デーモン（Windows 用）。OAuth 2.0 + PKCE でセキュアに認証する。
+Google Calendar の予定を数分前に Windows 通知で知らせる常駐アプリ。
 
 ## 動作
 
+- OAuth 2.0 で Google Calendar API をポーリングし、当日の予定を取得
 - 起動すると常駐し、`gcalntfy.toml` の `schedule` に従って当日の Calendar イベントをポーリング
 - 次のイベントの `notify_minutes` 分前（デフォルト 5 分）に Windows Toast 通知を表示し、exe 同フォルダの `audio1.opus`（チャイム音）を再生。`audio2.opus` があれば続けて再生。音声ファイルがない場合は Toast 通知のみ
 - 日付が変わると通知済みセットをリセットして当日分を再取得
 
-## 特徴
+## 機能
 
 - **時間帯別ポーリング回数**: `schedule` に 24 要素の配列（回/時）で各時間帯のポーリング頻度を設定可能
 - **スリープ復帰・ロック解除の即時ポーリング**: PC スリープ復帰やセッションロック解除時に即座にポーリングを実行
@@ -20,16 +21,6 @@ Google Calendar API v3 を直接ポーリングし、予定の数分前に Windo
 - **設定オーバーライド**: `gcalntfy.local.toml` があればキー単位で優先適用（変更はアプリ再起動で反映）
 - **システムトレイ**: ホバーで残り予定件数表示、左クリックで予定一覧、右クリックで各種設定メニューを操作可能
 - **音声設定の永続化**: 音声通知と「マイク/カメラ使用中は無効」の設定は再起動後も維持
-
-## ビルド
-
-```shell
-task build
-```
-
-Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
-
-ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定すること。
 
 ## 設定
 
@@ -46,4 +37,14 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 ## 初回起動時の認証
 
 初回起動時はアクセストークンがないため、Toast 通知でブラウザが開く。Google アカウントで「許可」をクリックすると認証が完了し、リフレッシュトークンがレジストリ（`HKCU\SOFTWARE\gcalntfy`）に保存される。以降の起動では再認証不要。
+
+## ビルド
+
+```shell
+task build
+```
+
+Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
+
+ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定すること。
 
