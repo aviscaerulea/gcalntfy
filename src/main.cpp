@@ -75,8 +75,10 @@
 // アプリケーション識別子（Toast 通知に使用）
 static const wchar_t* APP_AUMID = L"com.gcalntfy";
 
-// 4 分前通知のリード時間（ミリ秒）
-static constexpr long long NOTIFY_LEAD_MS = 4LL * 60 * 1000;
+// 通知リード時間のデフォルト（分）と有効範囲
+static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
+static constexpr int MIN_NOTIFY_MINUTES = 0;
+static constexpr int MAX_NOTIFY_MINUTES = 30;
 
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
@@ -190,6 +192,7 @@ struct ParseResult {
 struct Config {
     std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
+    long long                 notifyLeadMs;   // 通知リード時間（ミリ秒、TOML では分で指定）
     bool operator==(const Config&) const = default;
 };
 
@@ -1042,6 +1045,15 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.duckTargets = readDuckTargets(local);
     if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
 
+    // notify_minutes（通知リード時間、分単位。デフォルト 5 分、0〜30 にクランプ）
+    long long notifyMin = DEFAULT_NOTIFY_MINUTES;
+    if (local && (*local)["notify_minutes"].is_integer())
+        notifyMin = **(*local)["notify_minutes"].as_integer();
+    else if (base && (*base)["notify_minutes"].is_integer())
+        notifyMin = **(*base)["notify_minutes"].as_integer();
+    notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
+    cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
+
     return cfg;
 }
 
@@ -1875,7 +1887,7 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
     }
 }
 
-// 通知スレッド: メインスレッドから予定リストを受け取り、4分前に Toast 通知を実行する
+// 通知スレッド: メインスレッドから予定リストを受け取り、notify_minutes 分前に Toast 通知を実行する
 //
 // STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
 // 直近の未通知イベント群（同時刻含む）を特定して4分前まで wait_for し、
@@ -1919,17 +1931,17 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 if (e.datetime == targetDatetime) group.push_back(&e);
             }
 
-            // 4 分前まで待機
+            // 設定された通知リード時間前まで待機
             long long diffMs = calcDiffMs(targetDatetime, nowUtc);
             if (diffMs <= 0) {
                 // 開始済み: 通知せずに notifiedSet に追加
                 for (const auto* ev : group) notifiedSet.insert(eventKey(*ev));
                 continue;
             }
-            if (diffMs > NOTIFY_LEAD_MS) {
+            if (diffMs > localConfig.notifyLeadMs) {
                 std::unique_lock<std::mutex> lk(g_mtx);
                 auto wakeAt = std::chrono::steady_clock::now()
-                    + std::chrono::milliseconds(diffMs - NOTIFY_LEAD_MS);
+                    + std::chrono::milliseconds(diffMs - localConfig.notifyLeadMs);
                 g_cv.wait_until(lk, wakeAt,
                     [] { return g_eventsUpdated || g_shutdownRequested.load(); });
                 if (g_eventsUpdated) {

@@ -1,11 +1,11 @@
 ## gcalntfy
 
-Google Calendar API v3 を直接ポーリングし、予定を 4 分前に Windows Toast 通知する常駐デーモン（Windows 用）。OAuth 2.0 + PKCE でセキュアに認証する。
+Google Calendar API v3 を直接ポーリングし、予定の数分前に Windows Toast 通知する常駐デーモン（Windows 用）。OAuth 2.0 + PKCE でセキュアに認証する。
 
 ## 動作
 
 - 起動すると常駐し、`gcalntfy.toml` の `schedule` に従って当日の Calendar イベントをポーリング
-- 次のイベントの 4 分前に Windows Toast 通知を表示し、exe 同フォルダの `audio1.opus`（チャイム音）を再生。`audio2.opus` があれば続けて再生。音声ファイルがない場合は Toast 通知のみ
+- 次のイベントの `notify_minutes` 分前（デフォルト 5 分）に Windows Toast 通知を表示し、exe 同フォルダの `audio1.opus`（チャイム音）を再生。`audio2.opus` があれば続けて再生。音声ファイルがない場合は Toast 通知のみ
 - 日付が変わると通知済みセットをリセットして当日分を再取得
 
 ## 特徴
@@ -38,6 +38,8 @@ Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物�
 
 ```toml
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
+# イベント開始何分前に通知するか（0〜30、デフォルト 5）
+# notify_minutes = 5
 # 通知音再生中にミュートするプロセス名（空配列で無効）
 # duck_targets = ["chrome.exe", "msedge.exe"]
 ```
