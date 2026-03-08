@@ -1,12 +1,12 @@
 ---
 created: 2026-03-01 10:31:00
-updated: 2026-03-02 02:32:31
+updated: 2026-03-08 12:25:50
 tags:
   - carecom/84/0
   - knowledge
-  - project/my-google-activities
+  - project/my-activity
   - AIgen
-project: my-google-activities
+project: my-activity
 ---
 ## 概要
 
@@ -146,6 +146,48 @@ Calendar 参加者・Gmail 宛先の氏名解決を共通化。People API 個人
 
 `media: "member"` で `emails` 配列を POST すると、各メールアドレスを氏名解決して返す。グループアドレスは `expandGroupMembers` で個人に展開し、`expandLimit` を超える場合はグループ表示名を返す（`GroupsApp.getGroupByEmail(email).getName()`）。
 
+### gcalntfy の直接 Calendar API アクセス設計（調査段階）
+
+gcalntfy は当初 GAS Web App 経由で Calendar データを取得していたが、GAS を中間層として経由する必要性を排除し、デスクトップアプリが直接 Google Calendar API にアクセスする構成を検討した。以下は実装前の設計調査の結果である。
+
+#### 認証フロー
+
+OAuth 2.0 Authorization Code Flow + PKCE + ループバックリダイレクトを採用する。デスクトップアプリ向けの標準的な認証フローで、初回のみブラウザが開いて「許可」をクリックする。`127.0.0.1` のランダムポートでローカル HTTP サーバーを一時起動し、認証コードを受け取る。
+
+#### Internal vs External ユーザータイプ
+
+Google Workspace 組織（Carecom）のアカウントであれば GCP の OAuth 同意画面で Internal ユーザータイプを選択できる。Internal の利点は以下の通り。
+
+- リフレッシュトークンの 7 日失効制限がない（事実上無期限）
+- `calendar.readonly` は sensitive scope だが、Internal では Google のスコープ審査が不要
+- 組織内ユーザーのみアクセス可能なので外部公開リスクがない
+
+組織アカウントでない場合は External + testing モードにフォールバックする設計とする。testing モードではリフレッシュトークンが 7 日で失効するため、再認証が必要になる頻度が上がる。ただし実装の複雑度は軽微で、同意画面タイプの判定ロジックを追加するだけで対応できる。
+
+#### リフレッシュトークンの永続化
+
+取得したリフレッシュトークンはレジストリ `HKCU\SOFTWARE\gcalntfy` に保存する。既存の音声設定（「音声通知」ON/OFF など）と同じ永続化メカニズムを流用できる。トークンが失効・取り消された場合はブラウザで再認証フローが起動する。
+
+#### client_id / client_secret の管理
+
+デスクトップアプリでは `client_secret` は秘密として扱えない（バイナリから抽出可能）。Google もこれを想定しており、PKCE がセキュリティを担保する。ビルド時に `build.local.env` から読み込んでバイナリに埋め込む方式を採用する。
+
+```
+# build.local.env（gitignore 対象）
+CLIENT_ID=xxxx.apps.googleusercontent.com
+CLIENT_SECRET=GOCSPX-xxxx
+```
+
+`build.ps1` で正規表現パースしてコンパイラに `/D` オプションで渡す。`.env` 形式を採用した理由は「コミットしない環境変数が書かれている」ことがファイル名から自明であるため。
+
+#### ユーザ側の作業
+
+初回のみブラウザで OAuth 同意画面の「許可」をクリックするだけ。GCP コンソールでの作業は不要。開発者が発行した `client_id` / `client_secret` がバイナリに埋め込まれているため、ユーザが個別に OAuth クライアントを作成する必要はない。
+
+#### 開発者の GCP 設定
+
+一度だけ GCP コンソールで Desktop app タイプの OAuth クライアント ID を発行する。ユーザがアプリを使用すると Google の認証サーバーにアクセスするが、開発者の GCP プロジェクトへの直接アクセスは発生しない。GCP プロジェクトには API 使用量のメトリクスが記録されるのみ。
+
 ## 知見
 
 ### 成功した方法
@@ -250,9 +292,19 @@ curl -s "$redirect"
 
 `callApi` の通常クエリ構築（`Object.entries` ベース）では対応できないため、`?resourceNames=people/A&resourceNames=people/B` のように手動で URL を組み立てる必要がある。Calendar API の `eventTypes` と同じ制約。
 
+## Q&A
+
+### 2026-03-08
+
+- **リフレッシュトークン失効時の挙動は？** → ブラウザで OAuth 同意画面が再度開き、ユーザーが「許可」をクリックするだけで再認証が完了する。アプリの再インストールは不要
+- **Carecom で Internal ユーザータイプが使える理由は？** → Google Workspace の組織アカウントであるため。Internal は組織内ユーザーのみに制限される代わりにスコープ審査やトークン失効制限が緩和される。個人 Gmail では External のみ選択可能
+- **client_id / client_secret を GitHub に公開して問題ないか？** → Google のデスクトップアプリ向けガイドラインでは client_secret は秘密として保護できないことを前提としており、PKCE でセキュリティを担保する設計。ただし悪用リスク（クォータ消費、フィッシング）を考慮して `build.local.env` で gitignore 対象とし、ビルド時に埋め込む方式を採用
+- **OAuth クライアント ID はビルドの度に変わるか？** → 変わらない。GCP コンソールで一度発行すれば固定値。ビルドのたびに新規発行する必要はない
+- **開発者が発行した client_id で他ユーザーがアプリを使うと開発者の GCP にアクセスが発生するか？** → Google の認証サーバー（accounts.google.com）と Calendar API サーバーにアクセスするのみで、開発者の GCP プロジェクトへの直接アクセスは発生しない。GCP プロジェクトには API 使用量メトリクスが記録される
+
 ## 関連リソース
 
-- [[my-google-activities]] - プロジェクト本体
+- [[my-activity]] - プロジェクト本体
 - [Google Chat REST API - Messages: list](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/list)
 - [OAuth2 userinfo endpoint](https://developers.google.com/identity/protocols/oauth2/openid-connect#obtainuserinfo)
 - [Google Calendar REST API - Events: list](https://developers.google.com/calendar/api/v3/reference/events/list)
@@ -260,3 +312,5 @@ curl -s "$redirect"
 - [Google Drive REST API - Files: list](https://developers.google.com/drive/api/reference/rest/v3/files/list)
 - [People API - searchContacts](https://developers.google.com/people/api/rest/v1/people/searchContacts)
 - [Google Chat - Identify and reference users](https://developers.google.com/workspace/chat/identify-reference-users)
+- [OAuth 2.0 for Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)
+- [Using OAuth 2.0 with PKCE](https://developers.google.com/identity/protocols/oauth2/native-app#pkce)
