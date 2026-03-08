@@ -1565,13 +1565,21 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title,
 // エラー Toast 表示（クールダウン制御付き）
 //
 // 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
-// ポーリング成功時に g_lastErrorToastTime = 0 でリセットすること。
+// showToast の第 1 引数（時刻欄）にエラー種別を流用して表示する。
 static void showErrorToast(const std::wstring& title, const std::wstring& body)
 {
     ULONGLONG now = GetTickCount64();
     if (now - g_lastErrorToastTime.load() < ERROR_TOAST_COOLDOWN_MS) return;
     g_lastErrorToastTime.store(now);
-    showToast(title, body, L"");
+    try {
+        showToast(title, body, L"");
+    }
+    catch (winrt::hresult_error const& e) {
+        writeLog("showErrorToast failed: " + winrt::to_string(e.message()));
+    }
+    catch (...) {
+        writeLog("showErrorToast failed: unknown exception");
+    }
 }
 
 // ==================== トレイアイコン ====================
@@ -2122,7 +2130,7 @@ int wmain() {
                     showErrorToast(L"API エラー", L"Calendar データの取得に失敗しました");
                 }
                 else {
-                    g_lastErrorToastTime.store(0);  // エラー通知クールダウンをリセット
+                    g_lastErrorToastTime.store(0);
                     writeLog("poll: " + std::to_string(events.size()) + " events, next: " + nextPollTimeStr(count));
                 }
 
