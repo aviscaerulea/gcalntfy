@@ -37,7 +37,6 @@ Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物�
 `gcalntfy.toml`（または `gcalntfy.local.toml`）を exe と同フォルダに配置する。
 
 ```toml
-# 0時〜23時のポーリング回数（回/時）。正時起点の等間隔。最低 1 を推奨（0 はポーリングなし）
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
 # 通知音再生中にミュートするプロセス名（空配列で無効）
 # duck_targets = ["chrome.exe", "msedge.exe"]
