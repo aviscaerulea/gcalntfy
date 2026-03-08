@@ -4,7 +4,7 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を 4 分前に Toast 通知で知らせる。
- * schedule は 0 時〜 23 時の 24 要素配列（回/時、0=ポーリングしない）。
+ * schedule は 0 時〜 23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは datetime+title で記憶して重複防止する。
  *
  * 終了コード:
@@ -41,6 +41,8 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <bcrypt.h>
+#include <wtsapi32.h>
+#pragma comment(lib, "wtsapi32.lib")
 
 #include "toml.hpp"
 
@@ -102,8 +104,14 @@ static constexpr UINT IDM_EVENT_MAX  = 41050;
 static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
+// 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
+static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
+
+// 前回ポーリングからこの時間が経過したら即時ポーリング（1 時間）
+static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
+
 // 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
-static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"この後の予定なし";
+static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"本日の以降予定：なし";
 
 // Google OAuth 2.0
 static constexpr const wchar_t* OAUTH_AUTH_URL   = L"https://accounts.google.com/o/oauth2/v2/auth";
@@ -139,6 +147,12 @@ static HWND g_hWnd = nullptr;
 // トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
 static std::atomic<bool> g_popupShowing{false};
 
+// スリープ復帰・ロック解除時の即時ポーリングフラグ
+static std::atomic<bool> g_forcePoll{false};
+
+// 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
+static std::atomic<ULONGLONG> g_lastPollTick{0};
+
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
 
@@ -168,7 +182,7 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数）
+    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
     bool operator==(const Config&) const = default;
 };
@@ -981,9 +995,9 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     std::vector<int> s;
     for (const auto& el : *arr) {
         if (s.size() >= 24) break;
-        s.push_back((std::min)(60, (std::max)(0, el.value_or(0))));
+        s.push_back((std::min)(60, (std::max)(1, el.value_or(1))));
     }
-    while (s.size() < 24) s.push_back(0);
+    while (s.size() < 24) s.push_back(1);
     return s;
 }
 
@@ -1016,7 +1030,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         cfg.schedule = std::move(*s);
     }
     else {
-        cfg.schedule.resize(24, 0);
+        cfg.schedule.resize(24, 1);
     }
 
     cfg.duckTargets = readDuckTargets(local);
@@ -1546,10 +1560,10 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title,
 
 // メッセージポンプしつつ指定時間（ミリ秒）待機する Sleep() 代替
 //
-// g_shutdownRequested が true になった時点で即座にリターンする。
+// g_shutdownRequested または g_forcePoll が true になった時点で即座にリターンする。
 static void waitWithMessages(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested) {
+    while (!g_shutdownRequested && !g_forcePoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         DWORD remain = static_cast<DWORD>(
@@ -1594,7 +1608,7 @@ static void clearTrayTooltip(HWND hWnd) {
 }
 
 // トレイアイコンのツールチップを更新する
-// 現在JST時刻以降の当日イベント件数を「この後の予定：N 件」として表示する。
+// 現在JST時刻以降の当日イベント件数を「本日の以降予定：N 件」として表示する。
 // ポップアップメニュー表示中は更新しない
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
@@ -1616,7 +1630,7 @@ static void updateTrayTooltip(HWND hWnd) {
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
     if (count > 0)
-        swprintf_s(nid.szTip, _countof(nid.szTip), L"この後の予定：%d 件", count);
+        swprintf_s(nid.szTip, _countof(nid.szTip), L"本日の以降予定：%d 件", count);
     else
         wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -1674,7 +1688,7 @@ static void showSchedulePopup(HWND hWnd) {
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"この後の予定: " + std::to_wstring(g_eventPermalinks.size())
+        std::wstring footer = L"本日の以降予定：" + std::to_wstring(g_eventPermalinks.size())
                 + (todayEvents.size() > g_eventPermalinks.size() ? L"件（超過分省略）" : L"件");
         AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, footer.c_str());
     }
@@ -1791,6 +1805,13 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         PostQuitMessage(0);
         return 0;
     }
+    // スリープ復帰・ロック解除: 即時ポーリングをトリガー
+    if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
+        (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
+        g_forcePoll.store(true);
+        writeLog(msg == WM_POWERBROADCAST ? "resume from sleep" : "session unlock");
+        return msg == WM_POWERBROADCAST ? TRUE : 0;
+    }
     if (WM_TASKBAR_CREATED != 0 && msg == WM_TASKBAR_CREATED) {
         addTrayIcon(hWnd);
         return 0;
@@ -1807,7 +1828,7 @@ static HWND createTrayWindow() {
     wc.lpszClassName = L"gcalntfy_tray";
     RegisterClassExW(&wc);
     return CreateWindowExW(0, L"gcalntfy_tray", nullptr, 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
 }
 
 // ==================== 通知スレッド ====================
@@ -1970,6 +1991,7 @@ int wmain() {
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
         g_hWnd = createTrayWindow();
+        WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
         auto cfg = loadConfig(exeDir);
 
         addTrayIcon(g_hWnd);
@@ -1990,6 +2012,23 @@ int wmain() {
 
         while (!g_shutdownRequested) {
             try {
+                // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
+                bool forceTriggered = g_forcePoll.exchange(false);
+                ULONGLONG tickNow   = GetTickCount64();
+                ULONGLONG lastTick  = g_lastPollTick.load();
+                bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
+
+                if ((forceTriggered || stale) && !firstPoll) {
+                    if (lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
+                        if (forceTriggered) writeLog("force poll skipped (cooldown)");
+                    }
+                    else {
+                        if (forceTriggered) writeLog("force poll triggered");
+                        if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
+                        firstPoll = true;
+                    }
+                }
+
                 SYSTEMTIME utcNow;
                 GetSystemTime(&utcNow);
                 auto jstNow = utcToJst(utcNow);
@@ -2013,12 +2052,6 @@ int wmain() {
                 }
 
                 int count = cfg.schedule[jstNow.wHour];
-
-                // schedule=0 の時間帯: 次の正時までスリープ（初回は必ずポーリング）
-                if (count == 0 && !firstPoll) {
-                    waitWithMessages(calcSleepUntilNextPoll(0));
-                    continue;
-                }
 
                 // アクセストークン確保（有効期限内 → 即 return、それ以外 → リフレッシュまたは完全認証）
                 if (!ensureAccessToken()) {
@@ -2083,6 +2116,7 @@ int wmain() {
                 }
 
                 firstPoll = false;
+                g_lastPollTick.store(GetTickCount64());
                 waitWithMessages(calcSleepUntilNextPoll(count));
             }
             catch (...) {
@@ -2096,6 +2130,7 @@ int wmain() {
         notifyThread.join();
 
         // ループ終了後のクリーンアップ
+        WTSUnRegisterSessionNotification(g_hWnd);
         removeTrayIcon(g_hWnd);
         DestroyWindow(g_hWnd);
 
