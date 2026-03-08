@@ -2100,6 +2100,7 @@ int wmain() {
                     g_accessToken.clear();
                     g_tokenExpiry = {};
                     if (!ensureAccessToken()) {
+                        showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
                         waitWithMessages(RETRY_WAIT_MS);
                         continue;
                     }
