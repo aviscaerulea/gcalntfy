@@ -719,7 +719,7 @@ static bool exchangeCodeForTokens(const std::string& authCode,
     std::wstring url = std::wstring(L"https://") + OAUTH_TOKEN_HOST + OAUTH_TOKEN_PATH;
     auto resp = httpPostForm(url, body, &httpStatus);
     if (resp.empty() || httpStatus != 200) {
-        writeLog("token exchange failed: status " + std::to_string(httpStatus));
+        writeLog("token exchange failed: status " + std::to_string(httpStatus) + " body=" + resp);
         return false;
     }
 
