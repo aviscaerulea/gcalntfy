@@ -97,6 +97,9 @@ static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED    = 40005;
 static constexpr UINT IDM_OPEN_CONFIG      = 40006;
 static constexpr UINT IDM_OPEN_LOG         = 40007;
+static constexpr UINT IDM_OPEN_GITHUB      = 40008; // GitHub リポジトリページを開く
+
+static constexpr wchar_t GITHUB_URL[] = L"https://github.com/aviscaerulea/gcalntfy";
 
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
@@ -1870,7 +1873,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"gcalntfy v" APP_VERSION);
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"gcalntfy v" APP_VERSION);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
             // 音声通知（親: レジストリ永続化）
@@ -1933,6 +1936,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 g_muteInMeeting.store(!g_muteInMeeting.load());
                 writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
             }
+        }
+        else if (id == IDM_OPEN_GITHUB) {
+            ShellExecuteW(nullptr, L"open", GITHUB_URL, nullptr, nullptr, SW_SHOWNORMAL);
         }
         else if (id == IDM_OPEN_CONFIG) {
             // 設定ファイルを OS デフォルトのエディタで開く（変更反映には再起動が必要）
