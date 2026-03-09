@@ -1397,8 +1397,7 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
     }
 
     // WASAPI デバイス初期化
-    WAVEFORMATEX* mixFmt = nullptr;
-    HANDLE hEvent        = nullptr;
+    HANDLE hEvent = nullptr;
     bool ok              = false;
 
     winrt::com_ptr<IMMDeviceEnumerator> enumerator;
@@ -1418,11 +1417,6 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
         winrt::com_ptr<IAudioClient> client;
         if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client.put_void()))) {
             writeLog("playOpusToWasapi: Activate IAudioClient failed");
-            goto cleanup;
-        }
-
-        if (FAILED(client->GetMixFormat(&mixFmt))) {
-            writeLog("playOpusToWasapi: GetMixFormat failed");
             goto cleanup;
         }
 
@@ -1528,8 +1522,7 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
                 break;
             }
 
-            // memcpy サイズは Opus デコード出力に合わせる（useFmt が mixFmt の場合でも
-            // デコーダ出力は常にステレオ float なので OPUS_BLOCK_ALIGN が正しい）
+            // memcpy サイズは Opus デコード出力（ステレオ float）に合わせて OPUS_BLOCK_ALIGN を使う
             BYTE* buf = nullptr;
             if (SUCCEEDED(render->GetBuffer(static_cast<UINT32>(decoded), &buf))) {
                 memcpy(buf, pcm.data(), static_cast<size_t>(decoded) * OPUS_BLOCK_ALIGN);
@@ -1542,7 +1535,6 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
 
 cleanup:
     if (hEvent) CloseHandle(hEvent);
-    if (mixFmt) CoTaskMemFree(mixFmt);
     op_free(of);
     return ok;
 }
