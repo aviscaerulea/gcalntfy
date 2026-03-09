@@ -46,6 +46,8 @@
 #include <opus/opusfile.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
+#include <netioapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 
 #include "toml.hpp"
 
@@ -2105,6 +2107,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
                 notifiedSet.insert(eventKey(*ev));
             }
+            g_forcePoll.store(true);
+            writeLog("notification fired, requesting poll");
         }
     }
 
@@ -2112,6 +2116,18 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
 }
 
 // ==================== エントリポイント ====================
+
+// ネットワークインターフェース変化コールバック
+//
+// MibAddInstance（新規追加）と MibParameterNotification（パラメータ変更）で発火する。
+// MibParameterNotification はルーティング変更等でも頻発するが、60 秒クールダウン期間中の
+// トリガーはポーリングループでスキップされる（クールダウン後に 1 回ポーリングが走る）。
+// MibDeleteInstance（切断）は無視する。後続の MibAddInstance で対応されるため不要。
+// ※ システムスレッドプールから呼ばれるため、ここでは atomic 操作のみ行う。
+static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE type) {
+    if (type != MibAddInstance && type != MibParameterNotification) return;
+    g_forcePoll.store(true);
+}
 
 int wmain() {
     // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
@@ -2159,6 +2175,15 @@ int wmain() {
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
         g_hWnd = createTrayWindow();
         WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
+
+        // NIC 変化（Wi-Fi 接続/切断、LAN 抜き差し等）の監視を登録
+        // FALSE: 登録時に既存インターフェースの初期通知は不要
+        HANDLE hNetNotify = nullptr;
+        if (NotifyIpInterfaceChange(AF_UNSPEC, onNetworkChange, nullptr, FALSE, &hNetNotify) != NO_ERROR) {
+            writeLog("NotifyIpInterfaceChange failed: " + std::to_string(GetLastError()));
+            hNetNotify = nullptr;
+        }
+
         auto cfg = loadConfig(exeDir);
         g_currentConfig = cfg;  // 通知スレッドへの初期設定（起動時のみ）
 
@@ -2216,10 +2241,14 @@ int wmain() {
                     continue;
                 }
 
-                // Calendar API v3 URL 構築（現在から 12 時間以内の予定を取得）
+                // Calendar API v3 URL 構築（現在時刻以降、翌日 JST 23:59:59 までの予定を取得）
                 auto nowUtc = getCurrentUtcISO();
-                auto endUtc = systemTimeToIso(
-                    shiftSystemTime(utcNow, 12LL * 60 * 60 * 10'000'000LL)) + ".000Z";
+                // JST の今日 00:00:00 に +48h - 1s = 翌日 JST 23:59:59。UTC に変換（-9h）して timeMax とする
+                SYSTEMTIME jstMidnight = utcToJst(utcNow);
+                jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
+                auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
+                auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
+                auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
                 std::wstring calUrl = L"https://";
                 calUrl += CALENDAR_API_HOST;
                 calUrl += CALENDAR_API_PATH;
@@ -2229,6 +2258,7 @@ int wmain() {
                 calUrl += L"&timeMax=" + toWide(urlEncode(endUtc));
 
                 DWORD httpStatus = 0;
+                ULONGLONG t0 = GetTickCount64();
                 auto body = httpGet(calUrl, g_accessToken, &httpStatus);
 
                 // 401: アクセストークン失効 → リフレッシュしてリトライ
@@ -2241,8 +2271,10 @@ int wmain() {
                         waitWithMessages(RETRY_WAIT_MS);
                         continue;
                     }
+                    t0 = GetTickCount64();
                     body = httpGet(calUrl, g_accessToken, &httpStatus);
                 }
+                ULONGLONG elapsed = GetTickCount64() - t0;
 
                 if (body.empty()) {
                     std::string err = "HTTP request failed";
@@ -2260,7 +2292,8 @@ int wmain() {
                 }
                 else {
                     g_lastErrorToastTime.store(0);
-                    writeLog("poll: " + std::to_string(events.size()) + " events, next: " + nextPollTimeStr(count));
+                    writeLog("poll: " + std::to_string(events.size()) + " events ("
+                        + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(count));
                 }
 
                 // ポーリング結果を通知スレッドへ渡す
@@ -2283,6 +2316,10 @@ int wmain() {
                 waitWithMessages(RETRY_WAIT_MS);
             }
         }
+
+        // NIC 変化監視を解除してからスレッドを停止（コールバック発火を先に止める）
+        // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
+        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
 
         // 通知スレッドを停止
         g_cv.notify_one();
