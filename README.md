@@ -2,6 +2,15 @@
 
 Google Calendar の予定を数分前に Windows 通知で知らせる常駐アプリ。
 
+## インストール
+
+[Scoop](https://scoop.sh/) でインストールできる。
+
+```powershell
+scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
+scoop install gcalntfy
+```
+
 ## 動作
 
 - OAuth 2.0 で Google Calendar API をポーリングし、当日の予定を取得
