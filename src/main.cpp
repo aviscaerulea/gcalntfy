@@ -1883,7 +1883,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイル");
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイル");
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログ");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
