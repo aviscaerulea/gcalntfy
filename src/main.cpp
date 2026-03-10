@@ -96,12 +96,14 @@ static constexpr UINT IDM_RESTART          = 40001;
 static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
-static constexpr UINT IDM_SOUND_ENABLED    = 40005;
-static constexpr UINT IDM_OPEN_CONFIG      = 40006;
-static constexpr UINT IDM_OPEN_LOG         = 40007;
-static constexpr UINT IDM_OPEN_GITHUB      = 40008; // GitHub リポジトリページを開く
+static constexpr UINT IDM_SOUND_ENABLED       = 40005;
+static constexpr UINT IDM_OPEN_CONFIG         = 40006;
+static constexpr UINT IDM_OPEN_LOG            = 40007;
+static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
+static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
 
-static constexpr wchar_t GITHUB_URL[] = L"https://github.com/aviscaerulea/gcalntfy";
+static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
+static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/day";
 
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
@@ -1835,7 +1837,7 @@ static void showSchedulePopup(HWND hWnd) {
     g_eventPermalinks.clear();
     HMENU hMenu = CreatePopupMenu();
     if (todayEvents.empty()) {
-        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, NO_UPCOMING_EVENTS);
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, NO_UPCOMING_EVENTS);
     }
     else {
         UINT idx = 0;
@@ -1847,8 +1849,8 @@ static void showSchedulePopup(HWND hWnd) {
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         std::wstring footer = L"本日の以降予定：" + std::to_wstring(g_eventPermalinks.size())
-                + (todayEvents.size() > g_eventPermalinks.size() ? L"件（超過分省略）" : L"件");
-        AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, footer.c_str());
+                + (todayEvents.size() > g_eventPermalinks.size() ? L" 件（超過分省略）" : L" 件");
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, footer.c_str());
     }
 
     POINT pt;
@@ -1933,6 +1935,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         else if (id == IDM_OPEN_GITHUB) {
             ShellExecuteW(nullptr, L"open", GITHUB_URL, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else if (id == IDM_OPEN_CALENDAR_TODAY) {
+            ShellExecuteW(nullptr, L"open", CALENDAR_TODAY_URL, nullptr, nullptr, SW_SHOWNORMAL);
         }
         else if (id == IDM_OPEN_CONFIG) {
             // 設定ファイルを OS デフォルトのエディタで開く（変更反映には再起動が必要）
