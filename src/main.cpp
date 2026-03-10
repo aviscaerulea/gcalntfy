@@ -105,6 +105,9 @@ static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日
 static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/day";
 
+// イベントキャッシュファイル名（exe 同フォルダに保存）
+static constexpr wchar_t CACHE_FILENAME[] = L"events.json";
+
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
 static constexpr UINT IDM_EVENT_MAX  = 41050;
@@ -991,6 +994,101 @@ static ParseResult parseCalendarEvents(const std::string& json) {
         result.errorMsg = "JSON parse error: unknown exception";
     }
     return result;
+}
+
+// ==================== イベントキャッシュ ====================
+
+// イベントキャッシュの保存
+// ポーリング成功時に呼び出し、イベントリストを JSON ファイルに上書き保存する。
+// ファイル I/O はロック外で呼ぶこと（events は呼び出し元のローカルコピー）。
+static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEvent>& events) {
+    using namespace winrt::Windows::Data::Json;
+    try {
+        JsonArray arr;
+        for (const auto& e : events) {
+            JsonObject obj;
+            obj.Insert(L"datetime",  JsonValue::CreateStringValue(winrt::to_hstring(e.datetime)));
+            obj.Insert(L"content",   JsonValue::CreateStringValue(winrt::to_hstring(e.content)));
+            obj.Insert(L"permalink", JsonValue::CreateStringValue(winrt::to_hstring(e.permalink)));
+            arr.Append(obj);
+        }
+        auto json = winrt::to_string(arr.Stringify());
+
+        auto path = dir + L"\\" + CACHE_FILENAME;
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            writeLog("cache: save failed (CreateFileW error " + std::to_string(GetLastError()) + ")");
+            return;
+        }
+        DWORD written = 0;
+        BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+        CloseHandle(hFile);
+        if (!writeOk || written != static_cast<DWORD>(json.size())) {
+            writeLog("cache: write failed (" + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+        }
+    }
+    catch (...) {
+        writeLog("cache: save failed (exception)");
+    }
+}
+
+// イベントキャッシュの読み込み
+// 起動時に呼び出し、キャッシュファイルからイベントリストを復元する。
+// 全イベントの datetime が現在 UTC 時刻より前の場合は空ベクタを返す（古いデータの破棄）。
+// ファイル未存在・パースエラー時も空ベクタを返す。
+static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
+    using namespace winrt::Windows::Data::Json;
+    auto path = dir + L"\\" + CACHE_FILENAME;
+
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {};
+
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0 || fileSize > 1024 * 1024) {
+        CloseHandle(hFile);
+        if (fileSize != 0) writeLog("cache: unexpected file size (" + std::to_string(fileSize) + ")");
+        return {};
+    }
+    std::string buf(fileSize, '\0');
+    DWORD readBytes = 0;
+    BOOL ok = ReadFile(hFile, buf.data(), fileSize, &readBytes, nullptr);
+    CloseHandle(hFile);
+
+    if (!ok || readBytes != fileSize) {
+        writeLog("cache: read failed (" + std::to_string(readBytes) + "/" + std::to_string(fileSize) + " bytes)");
+        return {};
+    }
+
+    try {
+        auto arr = JsonArray::Parse(winrt::to_hstring(buf));
+        std::vector<CalendarEvent> events;
+        events.reserve(arr.Size());
+        for (auto item : arr) {
+            auto obj = item.GetObject();
+            CalendarEvent e;
+            e.datetime  = winrt::to_string(obj.GetNamedString(L"datetime",  L""));
+            e.content   = winrt::to_string(obj.GetNamedString(L"content",   L""));
+            e.permalink = winrt::to_string(obj.GetNamedString(L"permalink", L""));
+            if (!e.datetime.empty() && !e.content.empty()) events.push_back(std::move(e));
+        }
+
+        // 全イベントが過去なら破棄（ISO 8601 UTC 文字列の辞書順で比較可能）
+        auto nowUtc = getCurrentUtcISO();
+        bool allPast = !events.empty() && std::all_of(events.begin(), events.end(),
+            [&](const CalendarEvent& e) { return e.datetime <= nowUtc; });
+        if (allPast) {
+            writeLog("cache: all events are past, discarding");
+            return {};
+        }
+
+        return events;
+    }
+    catch (...) {
+        writeLog("cache: parse failed");
+        return {};
+    }
 }
 
 // ==================== 設定読み込み ====================
@@ -2196,6 +2294,21 @@ int wmain() {
         // 通知スレッド起動
         std::thread notifyThread(notifyThreadFunc, exeDir);
 
+        // キャッシュからイベントデータを復元（起動直後のポーリング失敗に備える）
+        auto cachedEvents = loadCacheFile(exeDir);
+        if (!cachedEvents.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_pendingEvents = cachedEvents;
+                g_eventsUpdated = true;
+            }
+            // g_eventsUpdated = true が条件変数の述語になっているため、
+            // notify_one が通知スレッドの wait 到達前に呼ばれても次の wait 時に述語が true で即解放される
+            g_cv.notify_one();
+            if (g_hWnd) updateTrayTooltip(g_hWnd);
+            writeLog("cache: loaded " + std::to_string(cachedEvents.size()) + " events from cache");
+        }
+
         int lastJstDay = -1;
         bool firstPoll = true; // 起動時は schedule に関わらず必ず1回ポーリング
 
@@ -2301,6 +2414,7 @@ int wmain() {
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
+                    saveCacheFile(exeDir, events);
                     if (g_hWnd) updateTrayTooltip(g_hWnd);
                 }
 
