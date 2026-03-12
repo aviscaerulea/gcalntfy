@@ -160,7 +160,7 @@ static std::atomic<bool> g_restartRequested{false};
 // 音声通知の有効/無効フラグ（レジストリで永続化、トレイメニューの親項目）
 static std::atomic<bool> g_soundEnabled{true};
 
-// ミーティング中の音声自動ミュートフラグ（レジストリで永続化）
+// マイク/カメラ使用中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{true};
 
 // 直前通知（60 秒前）の有効/無効フラグ（レジストリで永続化、デフォルト ON）
@@ -1364,7 +1364,7 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value) 
     RegCloseKey(hKey);
 }
 
-// ==================== ミーティング検出 ====================
+// ==================== マイク/カメラ使用検出 ====================
 
 // レジストリ（CapabilityAccessManager）でデバイス使用中かを判定する
 //
@@ -1463,9 +1463,9 @@ static bool isMicCaptureActive() {
     return false;
 }
 
-// マイクまたはカメラが使用中ならミーティング中と判定する
+// マイクまたはカメラの使用状態を判定する
 //
-// レジストリ → WASAPI の順で検出し、いずれかが true ならミーティング中。
+// レジストリ → WASAPI の順で検出し、いずれかが true なら使用中。
 static bool isMeetingActive() {
     if (isRegistryDeviceInUse(L"microphone")) return true;
     if (isRegistryDeviceInUse(L"webcam"))     return true;
@@ -1986,7 +1986,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             // 子項目: 親が OFF なら非活性
             UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
-                IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効にする");
+                IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
@@ -2235,12 +2235,12 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             auto jstTime  = wideToUtf8(jstTimeW);
             writeLog(std::string("notify[") + phase + "]: " + jstTime
                 + " (" + std::to_string(group.size()) + " event(s))");
-            // 音声スキップ判定: 音声通知OFF > ミーティング中ミュート > 通常再生
+            // 音声スキップ判定: 音声通知OFF > マイク/カメラ使用中ミュート > 通常再生
             if (!g_soundEnabled) {
                 writeLog("sound skipped (sound disabled)");
             }
             else if (g_muteInMeeting && isMeetingActive()) {
-                writeLog("sound skipped (meeting detected)");
+                writeLog("sound skipped (mic/camera in use)");
             }
             else {
                 launchSound(exeDir, localConfig);
