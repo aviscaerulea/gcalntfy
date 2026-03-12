@@ -1,10 +1,17 @@
-# vi: ts=2 sw=2 ff=unix fenc=utf-8
+# vim: set ft=yaml fenc=utf-8 ff=unix sw=2 ts=2 et :
+$schema: https://taskfile.dev/schema.json
 version: '3'
 
 vars:
   VERSION: '2.3.0'
 
 tasks:
+  default:
+    desc: クリーンビルドを実行する。
+    cmds:
+      - task clean
+      - task build
+
   clean:
     desc: ビルド成果物を削除
     cmds:
