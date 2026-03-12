@@ -85,6 +85,9 @@ static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
 static constexpr int MIN_NOTIFY_MINUTES = 0;
 static constexpr int MAX_NOTIFY_MINUTES = 30;
 
+// 直前通知のリード時間（固定 60 秒）
+static constexpr long long IMMINENT_NOTIFY_MS = 60LL * 1000LL;
+
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
@@ -94,13 +97,13 @@ static constexpr UINT WM_TRAYICON = WM_USER + 1;
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_RESTART          = 40001;
 static constexpr UINT IDM_EXIT             = 40002;
-static constexpr UINT IDM_SKIP_SOUND       = 40003;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED       = 40005;
 static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
+static constexpr UINT IDM_IMMINENT_NOTIFY     = 40010; // 直前通知（1分前）
 
 static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
@@ -157,11 +160,11 @@ static std::atomic<bool> g_restartRequested{false};
 // 音声通知の有効/無効フラグ（レジストリで永続化、トレイメニューの親項目）
 static std::atomic<bool> g_soundEnabled{true};
 
-// 次回通知の音声スキップフラグ（WndProc でトグル、通知スレッドで消費）
-static std::atomic<bool> g_skipNextSound{false};
-
 // ミーティング中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{true};
+
+// 直前通知（60 秒前）の有効/無効フラグ（レジストリで永続化、デフォルト ON）
+static std::atomic<bool> g_imminentNotifyEnabled{true};
 
 static HWND g_hWnd = nullptr;
 
@@ -1301,8 +1304,9 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 
 // レジストリパス（ユーザー設定の永続化先）
 static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
-static constexpr const wchar_t* REG_SOUND_ENABLED   = L"SoundEnabled";
-static constexpr const wchar_t* REG_MUTE_IN_MEETING = L"MuteInMeeting";
+static constexpr const wchar_t* REG_SOUND_ENABLED    = L"SoundEnabled";
+static constexpr const wchar_t* REG_MUTE_IN_MEETING  = L"MuteInMeeting";
+static constexpr const wchar_t* REG_IMMINENT_NOTIFY  = L"ImminentNotify";
 
 // レジストリ DWORD 値の読み取り
 // キーまたは値が存在しない場合は defaultVal を返す
@@ -1970,14 +1974,17 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
+            // 直前通知（レジストリ永続化）
+            AppendMenuW(hMenu, MF_STRING | (g_imminentNotifyEnabled ? MF_CHECKED : MF_UNCHECKED),
+                IDM_IMMINENT_NOTIFY, L"直前通知（1分前）");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
             // 音声通知（親: レジストリ永続化）
             AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
                 IDM_SOUND_ENABLED, L"音声通知");
 
             // 子項目: 親が OFF なら非活性
             UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
-            AppendMenuW(hMenu, MF_STRING | childFlags | (g_skipNextSound ? MF_CHECKED : MF_UNCHECKED),
-                IDM_SKIP_SOUND, L"  次回のみ音声通知無効");
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
                 IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効");
 
@@ -2015,14 +2022,15 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         else if (id == IDM_EXIT) {
             g_shutdownRequested = true;
         }
+        else if (id == IDM_IMMINENT_NOTIFY) {
+            bool v = !g_imminentNotifyEnabled.load();
+            g_imminentNotifyEnabled.store(v);
+            writeRegDword(REG_IMMINENT_NOTIFY, v ? 1u : 0u);
+        }
         else if (id == IDM_SOUND_ENABLED) {
             // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
             g_soundEnabled.store(!g_soundEnabled.load());
             writeRegDword(REG_SOUND_ENABLED, g_soundEnabled.load() ? 1u : 0u);
-        }
-        else if (id == IDM_SKIP_SOUND) {
-            // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
-            if (g_soundEnabled.load()) g_skipNextSound = !g_skipNextSound;
         }
         else if (id == IDM_MUTE_IN_MEETING) {
             // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
@@ -2098,8 +2106,10 @@ static HWND createTrayWindow() {
 // ==================== 通知スレッド ====================
 
 // イベントの重複通知防止キーを生成する
-static inline std::string eventKey(const CalendarEvent& e) {
-    return e.datetime + "|" + e.content;
+//
+// phase には "L"（Lead 通知）または "I"（Imminent 直前通知）を指定する。
+static inline std::string eventKey(const CalendarEvent& e, const char* phase = "L") {
+    return std::string(phase) + "|" + e.datetime + "|" + e.content;
 }
 
 // notifiedSet の自然失効: 新リストに含まれないキーを削除する
@@ -2107,17 +2117,21 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
                              const std::vector<CalendarEvent>& events)
 {
     std::set<std::string> validKeys;
-    for (const auto& e : events) validKeys.insert(eventKey(e));
+    for (const auto& e : events) {
+        validKeys.insert(eventKey(e, "L"));
+        validKeys.insert(eventKey(e, "I"));
+    }
     for (auto it = notifiedSet.begin(); it != notifiedSet.end(); ) {
         it = validKeys.count(*it) ? std::next(it) : notifiedSet.erase(it);
     }
 }
 
-// 通知スレッド: メインスレッドから予定リストを受け取り、notify_minutes 分前に Toast 通知を実行する
+// 通知スレッド: メインスレッドから予定リストを受け取り、通知を実行する
 //
 // STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
-// 直近の未通知イベント群（同時刻含む）を特定して4分前まで wait_for し、
-// 4分前到達時にチャイム1回 + イベントごとの Toast を連続表示する。
+// イベントごとに Lead 通知（notify_minutes 前）と Imminent 通知（60 秒前）を発火する。
+// 両フェーズを notifiedSet のプレフィックス（"L|" / "I|"）で管理し、
+// 全イベントを走査して最小発火時間を求めてから wait_until で待機する。
 static void notifyThreadFunc(const std::wstring& exeDir) {
     winrt::init_apartment();
 
@@ -2141,33 +2155,32 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
         while (!g_shutdownRequested) {
             auto nowUtc = getCurrentUtcISO();
 
-            // 未通知かつ nowUtc 以降の最小 datetime を探す
-            std::string targetDatetime;
+            // 全イベントを走査して最小発火待機時間を計算
+            long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
-                if (e.datetime < nowUtc) continue;
-                if (notifiedSet.count(eventKey(e))) continue;
-                targetDatetime = e.datetime;
-                break;
+                long long diffMs = calcDiffMs(e.datetime, nowUtc);
+                if (diffMs <= 0) {
+                    // 開始済み: 両フェーズを通知済みにマーク
+                    notifiedSet.insert(eventKey(e, "L"));
+                    notifiedSet.insert(eventKey(e, "I"));
+                    continue;
+                }
+                // Lead 通知
+                if (!notifiedSet.count(eventKey(e, "L")))
+                    minFireMs = (std::min)(minFireMs, diffMs - localConfig.notifyLeadMs);
+                // Imminent 通知（Lead 発火済みが条件）
+                if (g_imminentNotifyEnabled
+                    && notifiedSet.count(eventKey(e, "L"))
+                    && !notifiedSet.count(eventKey(e, "I")))
+                    minFireMs = (std::min)(minFireMs, diffMs - IMMINENT_NOTIFY_MS);
             }
-            if (targetDatetime.empty()) break; // 通知すべき予定なし → 外側ループへ
+            if (minFireMs == LLONG_MAX) break; // 通知すべき予定なし → 外側ループへ
 
-            // 同時刻のイベントをすべて収集
-            std::vector<const CalendarEvent*> group;
-            for (const auto& e : localEvents) {
-                if (e.datetime == targetDatetime) group.push_back(&e);
-            }
-
-            // 設定された通知リード時間前まで待機
-            long long diffMs = calcDiffMs(targetDatetime, nowUtc);
-            if (diffMs <= 0) {
-                // 開始済み: 通知せずに notifiedSet に追加
-                for (const auto* ev : group) notifiedSet.insert(eventKey(*ev));
-                continue;
-            }
-            if (diffMs > localConfig.notifyLeadMs) {
+            // 発火時刻まで待機（途中でイベント更新があれば再評価）
+            if (minFireMs > 0) {
                 std::unique_lock<std::mutex> lk(g_mtx);
                 auto wakeAt = std::chrono::steady_clock::now()
-                    + std::chrono::milliseconds(diffMs - localConfig.notifyLeadMs);
+                    + std::chrono::milliseconds(minFireMs);
                 g_cv.wait_until(lk, wakeAt,
                     [] { return g_eventsUpdated || g_shutdownRequested.load(); });
                 if (g_eventsUpdated) {
@@ -2175,22 +2188,50 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                     localConfig     = g_currentConfig;
                     g_eventsUpdated = false;
                     pruneNotifiedSet(notifiedSet, localEvents);
-                    continue; // 内側ループ先頭へ戻り再評価
+                    continue;
                 }
                 if (g_shutdownRequested) break;
+                nowUtc = getCurrentUtcISO();
+            }
+
+            // 発火フェーズと対象 datetime を特定（Lead を Imminent より優先）
+            const char* phase = nullptr;
+            std::string targetDatetime;
+            for (const auto& e : localEvents) {
+                if (notifiedSet.count(eventKey(e, "L"))) continue;
+                long long diffMs = calcDiffMs(e.datetime, nowUtc);
+                if (diffMs > 0 && diffMs - localConfig.notifyLeadMs > 0) continue;
+                targetDatetime = e.datetime; phase = "L";
+                break;
+            }
+            if (!phase && g_imminentNotifyEnabled) {
+                for (const auto& e : localEvents) {
+                    if (!notifiedSet.count(eventKey(e, "L"))) continue;
+                    if (notifiedSet.count(eventKey(e, "I"))) continue;
+                    long long diffMs = calcDiffMs(e.datetime, nowUtc);
+                    if (diffMs > 0 && diffMs - IMMINENT_NOTIFY_MS > 0) continue;
+                    targetDatetime = e.datetime; phase = "I";
+                    break;
+                }
+            }
+            if (!phase) continue; // 発火対象なし（稀なケース）
+
+            // 同フェーズ・同 datetime のイベントをグループ化
+            std::vector<const CalendarEvent*> group;
+            for (const auto& e : localEvents) {
+                if (e.datetime != targetDatetime) continue;
+                if (phase[0] == 'I' && !notifiedSet.count(eventKey(e, "L"))) continue;
+                if (!notifiedSet.count(eventKey(e, phase))) group.push_back(&e);
             }
 
             // 通知実行
             auto jstTimeW = utcToJstHHMM(targetDatetime);
             auto jstTime  = wideToUtf8(jstTimeW);
-            writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s))");
-            // 音声スキップ判定: 音声通知OFF > ワンショットミュート > ミーティング中ミュート > 通常再生
+            writeLog(std::string("notify[") + phase + "]: " + jstTime
+                + " (" + std::to_string(group.size()) + " event(s))");
+            // 音声スキップ判定: 音声通知OFF > ミーティング中ミュート > 通常再生
             if (!g_soundEnabled) {
-                g_skipNextSound.exchange(false); // OFF 中もフラグを消費して ON 復帰後の残存を防ぐ
                 writeLog("sound skipped (sound disabled)");
-            }
-            else if (g_skipNextSound.exchange(false)) {
-                writeLog("sound skipped (one-shot mute)");
             }
             else if (g_muteInMeeting && isMeetingActive()) {
                 writeLog("sound skipped (meeting detected)");
@@ -2200,7 +2241,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             }
             for (const auto* ev : group) {
                 showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
-                notifiedSet.insert(eventKey(*ev));
+                notifiedSet.insert(eventKey(*ev, phase));
             }
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
@@ -2285,8 +2326,9 @@ int wmain() {
         addTrayIcon(g_hWnd);
 
         // レジストリから設定を復元（キー未作成時はデフォルト値）
-        g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
-        g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_soundEnabled         = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
+        g_muteInMeeting        = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_imminentNotifyEnabled = readRegDword(REG_IMMINENT_NOTIFY, 1u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
