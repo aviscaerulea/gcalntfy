@@ -103,7 +103,7 @@ static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリ
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
 
 static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
-static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/day";
+static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
 
 // イベントキャッシュファイル名（exe 同フォルダに保存）
 static constexpr wchar_t CACHE_FILENAME[] = L"events.json";
@@ -1967,7 +1967,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"gcalntfy v" APP_VERSION);
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
             // 音声通知（親: レジストリ永続化）
