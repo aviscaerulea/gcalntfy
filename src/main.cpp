@@ -2026,6 +2026,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             bool v = !g_imminentNotifyEnabled.load();
             g_imminentNotifyEnabled.store(v);
             writeRegDword(REG_IMMINENT_NOTIFY, v ? 1u : 0u);
+            // 通知スレッドに再評価を促す
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_eventsUpdated = true;
+            }
+            g_cv.notify_one();
         }
         else if (id == IDM_SOUND_ENABLED) {
             // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
