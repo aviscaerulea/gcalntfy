@@ -103,7 +103,7 @@ static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
-static constexpr UINT IDM_IMMINENT_NOTIFY     = 40010; // 直前通知（1分前）
+static constexpr UINT IDM_IMMINENT_NOTIFY     = 40010; // 予定 1 分前にも通知する
 
 static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
@@ -1976,21 +1976,21 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
             // 直前通知（レジストリ永続化）
             AppendMenuW(hMenu, MF_STRING | (g_imminentNotifyEnabled ? MF_CHECKED : MF_UNCHECKED),
-                IDM_IMMINENT_NOTIFY, L"直前通知（1分前）");
+                IDM_IMMINENT_NOTIFY, L"予定 1 分前にも通知する");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
             // 音声通知（親: レジストリ永続化）
             AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
-                IDM_SOUND_ENABLED, L"音声通知");
+                IDM_SOUND_ENABLED, L"通知音を鳴らす");
 
             // 子項目: 親が OFF なら非活性
             UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
-                IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効");
+                IDM_MUTE_IN_MEETING, L"  マイク/カメラ使用中は無効にする");
 
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイル");
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイル");
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
