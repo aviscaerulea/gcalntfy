@@ -15,7 +15,7 @@ scoop install gcalntfy
 
 - OAuth 2.0 で Google Calendar API をポーリングし、当日の予定を取得
 - 起動すると常駐し、`gcalntfy.toml` の `schedule` に従って当日の Calendar イベントをポーリング
-- 次のイベントの `notify_minutes` 分前（デフォルト 5 分）に Windows Toast 通知を表示し、exe 同フォルダの `audio1.opus`（チャイム音）を再生。`audio2.opus` があれば続けて再生。音声ファイルがない場合は Toast 通知のみ
+- 次のイベントの `notify_minutes` 分前（デフォルト 5 分）に Windows Toast 通知を表示し、exe 同フォルダの `audio.opus`（チャイム音）を再生。`extra.opus` があれば続けて再生。音声ファイルがない場合は Toast 通知のみ。ファイル名は TOML 設定で変更可能
 - 日付が変わると通知済みセットをリセットして当日分を再取得
 
 ## 機能
@@ -23,7 +23,7 @@ scoop install gcalntfy
 - **時間帯別ポーリング回数**: `schedule` に 24 要素の配列（回/時）で各時間帯のポーリング頻度を設定可能
 - **即時ポーリング**: PC スリープ復帰・セッションロック解除・ネットワーク復帰時に即座にポーリングを実行
 - **Toast 通知**: 通知の「Calendar」ボタンからイベントページを直接開ける
-- **通知音**: exe 同フォルダに `audio1.opus`、`audio2.opus` を配置すると通知時にチャイム音を再生（libopus 内蔵のため外部ツール不要）
+- **通知音**: exe 同フォルダに `audio.opus`、`extra.opus` を配置すると通知時にチャイム音を再生（libopus 内蔵のため外部ツール不要）。ファイル名は `audio_file` / `extra_audio_file` で変更可能
 - **BLE ヘッドホン対応**: 接続遅延による冒頭切れを防止する無音を自動挿入
 - **ダッキング**: 通知音再生中に `duck_targets` で指定したプロセスをミュートし終了後に自動復元
 - **多重起動制御**: 新プロセス起動時に旧プロセスを自動終了
@@ -40,6 +40,10 @@ scoop install gcalntfy
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
 # イベント開始何分前に通知するか（0〜30、デフォルト 5）
 # notify_minutes = 5
+# 通知音ファイル名（デフォルト audio.opus）
+# audio_file = "audio.opus"
+# 追加通知音ファイル名（デフォルト extra.opus、存在しない場合は再生しない）
+# extra_audio_file = "extra.opus"
 # 通知音再生中にミュートするプロセス名（空配列で無効）
 # duck_targets = ["chrome.exe", "msedge.exe"]
 ```

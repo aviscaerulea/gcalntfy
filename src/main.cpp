@@ -118,6 +118,10 @@ static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 // 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
+// 通知音のデフォルトファイル名（exe 同フォルダに配置）
+static constexpr wchar_t DEFAULT_AUDIO_FILE[]       = L"audio.opus";
+static constexpr wchar_t DEFAULT_EXTRA_AUDIO_FILE[] = L"extra.opus";
+
 // BLE ヘッドホン対処：冒頭無音の時間（ミリ秒）
 static constexpr int BLE_SILENCE_MS = 2000;
 
@@ -205,6 +209,8 @@ struct Config {
     std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;   // 通知リード時間（ミリ秒、TOML では分で指定）
+    std::wstring              audioFile;      // 通知音ファイル名（デフォルト: audio.opus）
+    std::wstring              extraAudioFile; // 追加通知音ファイル名（デフォルト: extra.opus、空なら再生しない）
 };
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
@@ -216,9 +222,9 @@ static bool                    g_eventsUpdated = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
-    std::wstring                                    audio1Path; // audio1.opus フルパス
-    std::wstring                                    audio2Path; // audio2.opus フルパス（空なら再生しない）
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;      // ミュート済みセッション（復元用）
+    std::wstring                                    audioPath;      // 通知音フルパス
+    std::wstring                                    extraAudioPath; // 追加通知音フルパス（空なら再生しない）
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;          // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -1160,6 +1166,22 @@ static Config loadConfig(const std::wstring& exeDir) {
     notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
+    // audio_file / extra_audio_file（通知音ファイル名。local 優先 → base → デフォルト）
+    auto readStringOr = [](const std::optional<toml::table>& tbl, const char* key,
+                           const std::wstring& def) -> std::wstring {
+        if (!tbl) return def;
+        if (auto s = (*tbl)[key].value<std::string>()) return toWide(*s);
+        return def;
+    };
+    cfg.audioFile = readStringOr(local, "audio_file", L"");
+    if (cfg.audioFile.empty()) {
+        cfg.audioFile = readStringOr(base, "audio_file", std::wstring(DEFAULT_AUDIO_FILE));
+    }
+    cfg.extraAudioFile = readStringOr(local, "extra_audio_file", L"");
+    if (cfg.extraAudioFile.empty()) {
+        cfg.extraAudioFile = readStringOr(base, "extra_audio_file", std::wstring(DEFAULT_EXTRA_AUDIO_FILE));
+    }
+
     return cfg;
 }
 
@@ -1635,10 +1657,10 @@ cleanup:
     return ok;
 }
 
-// audio1 → audio2 を逐次再生し、ダッキング解除するスレッド関数
+// 通知音 → 追加通知音を逐次再生し、ダッキング解除するスレッド関数
 //
 // STA で COM 初期化し、playOpusToWasapi を同期呼び出しで逐次実行する。
-// audio1 完了後、audio2Path が空でなければ audio2 を再生する。
+// 通知音完了後、extraAudioPath が空でなければ追加通知音を再生する。
 // 全再生完了後に DUCK_TRAILING_MS の無音バッファを経てダッキングを解除する。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1646,8 +1668,8 @@ static DWORD WINAPI soundThread(LPVOID param) {
     bool comOk = (hr == S_OK || hr == S_FALSE);
 
     if (comOk) {
-        playOpusToWasapi(ctx->audio1Path, true);
-        if (!ctx->audio2Path.empty()) playOpusToWasapi(ctx->audio2Path, false);
+        playOpusToWasapi(ctx->audioPath, true);
+        if (!ctx->extraAudioPath.empty()) playOpusToWasapi(ctx->extraAudioPath, false);
 
         if (!ctx->muted.empty()) {
             Sleep(DUCK_TRAILING_MS);
@@ -1668,31 +1690,32 @@ static DWORD WINAPI soundThread(LPVOID param) {
 // libopus + WASAPI で通知音を再生する
 //
 // 再生フロー:
-//   BLE 無音（BLE_SILENCE_MS） → audio1.opus（チャイム） → audio2.opus（存在時のみ）
-// audio1.opus が存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
+//   BLE 無音（BLE_SILENCE_MS） → 通知音（チャイム） → 追加通知音（存在時のみ）
+// 通知音ファイルが存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
 //             末尾バッファは soundThread 内の Sleep(DUCK_TRAILING_MS) で実現する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
-    // audio1.opus の存在確認（exe 同ディレクトリ）
-    std::wstring audio1Path = exeDir + L"\\audio1.opus";
-    if (GetFileAttributesW(audio1Path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        writeLog("launchSound: audio1.opus not found, skipping sound");
+    // 通知音ファイルの存在確認（exe 同ディレクトリ）
+    std::wstring audioPath = exeDir + L"\\" + cfg.audioFile;
+    if (GetFileAttributesW(audioPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        writeLog("launchSound: " + wideToUtf8(cfg.audioFile) + " not found, skipping sound");
         return;
     }
 
-    // audio2.opus の存在確認（exe 同ディレクトリ）
-    std::wstring audio2Path = exeDir + L"\\audio2.opus";
-    bool hasAudio2 = (GetFileAttributesW(audio2Path.c_str()) != INVALID_FILE_ATTRIBUTES);
-    writeLog("launchSound: audio2 " + std::string(hasAudio2 ? "found" : "not found"));
+    // 追加通知音ファイルの存在確認（exe 同ディレクトリ）
+    std::wstring extraAudioPath = exeDir + L"\\" + cfg.extraAudioFile;
+    bool hasExtra = (GetFileAttributesW(extraAudioPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    writeLog("launchSound: " + wideToUtf8(cfg.extraAudioFile)
+             + " " + std::string(hasExtra ? "found" : "not found"));
 
-    // ダッキング開始（audio1 再生前にミュート）
+    // ダッキング開始（通知音再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
-    // スレッドで再生（audio1 → audio2 → ダッキング解除）
+    // スレッドで再生（通知音 → 追加通知音 → ダッキング解除）
     auto* ctx = new SoundContext{
-        .audio1Path = audio1Path,
-        .audio2Path = hasAudio2 ? audio2Path : L"",
-        .muted      = std::move(mutedSessions)
+        .audioPath      = audioPath,
+        .extraAudioPath = hasExtra ? extraAudioPath : L"",
+        .muted          = std::move(mutedSessions)
     };
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
