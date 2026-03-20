@@ -207,7 +207,6 @@ struct Config {
     std::vector<int>          schedule;     // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;  // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs; // 通知リード時間（ミリ秒、TOML では分で指定）
-    std::wstring              soundFile;    // 通知音ファイル名（デフォルト: sound.wav）
 };
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
@@ -1162,18 +1161,6 @@ static Config loadConfig(const std::wstring& exeDir) {
     notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
-    // sound_file（通知音ファイル名。local 優先 → base → デフォルト）
-    auto readStringOr = [](const std::optional<toml::table>& tbl, const char* key,
-                           const std::wstring& def) -> std::wstring {
-        if (!tbl) return def;
-        if (auto s = (*tbl)[key].value<std::string>()) return toWide(*s);
-        return def;
-    };
-    cfg.soundFile = readStringOr(local, "sound_file", L"");
-    if (cfg.soundFile.empty()) {
-        cfg.soundFile = readStringOr(base, "sound_file", std::wstring(DEFAULT_SOUND_FILE));
-    }
-
     return cfg;
 }
 
@@ -1707,9 +1694,9 @@ static DWORD WINAPI soundThread(LPVOID param) {
 //             末尾バッファは soundThread 内の Sleep(DUCK_TRAILING_MS) で実現する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // 通知音ファイルの存在確認（exe 同ディレクトリ）
-    std::wstring soundPath = exeDir + L"\\" + cfg.soundFile;
+    std::wstring soundPath = exeDir + L"\\" + DEFAULT_SOUND_FILE;
     if (GetFileAttributesW(soundPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        writeLog("launchSound: " + wideToUtf8(cfg.soundFile) + " not found, skipping sound");
+        writeLog("launchSound: sound.wav not found, skipping sound");
         return;
     }
 
