@@ -12,7 +12,7 @@
  *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
  *   2  - 予期しない初期化エラー
  *
- * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys, libopus/libopusfile (スタティックリンク)
+ * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
  * 外部依存: なし
  * ビルド: rc /nologo resource.rc
  *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
@@ -43,7 +43,6 @@
 #include <audioclient.h>
 #include <bcrypt.h>
 
-#include <opus/opusfile.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
 #include <netioapi.h>
@@ -119,8 +118,7 @@ static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
-static constexpr wchar_t DEFAULT_AUDIO_FILE[]       = L"audio.opus";
-static constexpr wchar_t DEFAULT_EXTRA_AUDIO_FILE[] = L"extra.opus";
+static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 
 // BLE ヘッドホン対処：冒頭無音の時間（ミリ秒）
 static constexpr int BLE_SILENCE_MS = 2000;
@@ -206,11 +204,10 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::vector<int>          schedule;       // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
-    std::vector<std::wstring> duckTargets;    // 通知音再生中にミュートするプロセス名
-    long long                 notifyLeadMs;   // 通知リード時間（ミリ秒、TOML では分で指定）
-    std::wstring              audioFile;      // 通知音ファイル名（デフォルト: audio.opus）
-    std::wstring              extraAudioFile; // 追加通知音ファイル名（デフォルト: extra.opus、空なら再生しない）
+    std::vector<int>          schedule;     // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
+    std::vector<std::wstring> duckTargets;  // 通知音再生中にミュートするプロセス名
+    long long                 notifyLeadMs; // 通知リード時間（ミリ秒、TOML では分で指定）
+    std::wstring              soundFile;    // 通知音ファイル名（デフォルト: sound.wav）
 };
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
@@ -222,9 +219,8 @@ static bool                    g_eventsUpdated = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
-    std::wstring                                    audioPath;      // 通知音フルパス
-    std::wstring                                    extraAudioPath; // 追加通知音フルパス（空なら再生しない）
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;          // ミュート済みセッション（復元用）
+    std::wstring                                    soundPath; // 通知音フルパス
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;     // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -1166,20 +1162,16 @@ static Config loadConfig(const std::wstring& exeDir) {
     notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
-    // audio_file / extra_audio_file（通知音ファイル名。local 優先 → base → デフォルト）
+    // sound_file（通知音ファイル名。local 優先 → base → デフォルト）
     auto readStringOr = [](const std::optional<toml::table>& tbl, const char* key,
                            const std::wstring& def) -> std::wstring {
         if (!tbl) return def;
         if (auto s = (*tbl)[key].value<std::string>()) return toWide(*s);
         return def;
     };
-    cfg.audioFile = readStringOr(local, "audio_file", L"");
-    if (cfg.audioFile.empty()) {
-        cfg.audioFile = readStringOr(base, "audio_file", std::wstring(DEFAULT_AUDIO_FILE));
-    }
-    cfg.extraAudioFile = readStringOr(local, "extra_audio_file", L"");
-    if (cfg.extraAudioFile.empty()) {
-        cfg.extraAudioFile = readStringOr(base, "extra_audio_file", std::wstring(DEFAULT_EXTRA_AUDIO_FILE));
+    cfg.soundFile = readStringOr(local, "sound_file", L"");
+    if (cfg.soundFile.empty()) {
+        cfg.soundFile = readStringOr(base, "sound_file", std::wstring(DEFAULT_SOUND_FILE));
     }
 
     return cfg;
@@ -1488,79 +1480,101 @@ static bool isMeetingActive() {
 
 // ==================== 通知音再生 ====================
 
-// Opus ファイルを WASAPI 共有モードで再生する
+// WAV ファイルを WASAPI 共有モードで再生する
 //
-// path: 再生ファイルのフルパス
+// path: 再生ファイルのフルパス（16bit PCM WAV のみ対応）
 // withLeadingSilence: true で冒頭 BLE_SILENCE_MS 分の無音を挿入する（BLE ヘッドホン対処）
 // 戻り値: 再生成功なら true
 //
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
-// op_read_float_stereo() で常にステレオ出力するため、デバイスのチャンネル設定に依存しない。
 // g_shutdownRequested が true になると再生を中断する。
-static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) {
-    // Opus ファイルを開く（wstring → UTF-8 変換）
-    int len = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) {
-        writeLog("playOpusToWasapi: WideCharToMultiByte failed");
-        return false;
-    }
-    std::string pathUtf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, pathUtf8.data(), len, nullptr, nullptr);
-
-    int err = 0;
-    OggOpusFile* of = op_open_file(pathUtf8.c_str(), &err);
-    if (!of) {
-        writeLog("playOpusToWasapi: op_open_file failed: " + std::to_string(err));
+static bool playWavToWasapi(const std::wstring& path, bool withLeadingSilence) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        writeLog("playWavToWasapi: CreateFileW failed");
         return false;
     }
 
-    // WASAPI デバイス初期化
-    HANDLE hEvent = nullptr;
-    bool ok              = false;
+    bool ok         = false;
+    HANDLE hEvent   = nullptr;
+    WAVEFORMATEX wavFmt   = {};
+    DWORD dataStart       = 0;
+    DWORD totalFrames     = 0;
 
-    winrt::com_ptr<IMMDeviceEnumerator> enumerator;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator), enumerator.put_void()))) {
-        writeLog("playOpusToWasapi: CoCreateInstance IMMDeviceEnumerator failed");
-        goto cleanup;
-    }
-
+    // RIFF/WAVE ヘッダ検証
     {
+        char buf[12] = {};
+        DWORD nRead = 0;
+        ReadFile(hFile, buf, 12, &nRead, nullptr);
+        if (nRead != 12 || memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) {
+            writeLog("playWavToWasapi: invalid RIFF/WAVE header");
+            goto cleanup;
+        }
+    }
+
+    // チャンク走査: "fmt " と "data" を探す
+    {
+        bool hasFmt  = false;
+        bool hasData = false;
+        while (!hasData) {
+            char id[4]      = {};
+            DWORD chunkSize = 0;
+            DWORD nRead     = 0;
+            if (!ReadFile(hFile, id, 4, &nRead, nullptr) || nRead != 4) break;
+            if (!ReadFile(hFile, &chunkSize, 4, &nRead, nullptr) || nRead != 4) break;
+
+            if (memcmp(id, "fmt ", 4) == 0) {
+                DWORD readSize = min(chunkSize, (DWORD)sizeof(WAVEFORMATEX));
+                ReadFile(hFile, &wavFmt, readSize, &nRead, nullptr);
+                if (chunkSize > readSize)
+                    SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
+                if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16) {
+                    writeLog("playWavToWasapi: unsupported format, only 16bit PCM WAV is supported");
+                    goto cleanup;
+                }
+                hasFmt = true;
+            }
+            else if (memcmp(id, "data", 4) == 0) {
+                if (!hasFmt) {
+                    writeLog("playWavToWasapi: data chunk before fmt chunk");
+                    goto cleanup;
+                }
+                totalFrames = chunkSize / wavFmt.nBlockAlign;
+                dataStart   = SetFilePointer(hFile, 0, nullptr, FILE_CURRENT);
+                hasData     = true;
+            }
+            else {
+                // 不明チャンクはスキップ（偶数バイト境界に合わせる）
+                SetFilePointer(hFile, (LONG)((chunkSize + 1) & ~1u), nullptr, FILE_CURRENT);
+            }
+        }
+        if (!hasFmt || !hasData) {
+            writeLog("playWavToWasapi: fmt or data chunk not found");
+            goto cleanup;
+        }
+    }
+
+    // WASAPI デバイス初期化・再生
+    {
+        winrt::com_ptr<IMMDeviceEnumerator> enumerator;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                __uuidof(IMMDeviceEnumerator), enumerator.put_void()))) {
+            writeLog("playWavToWasapi: CoCreateInstance IMMDeviceEnumerator failed");
+            goto cleanup;
+        }
+
         winrt::com_ptr<IMMDevice> device;
         if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.put()))) {
-            writeLog("playOpusToWasapi: GetDefaultAudioEndpoint failed");
+            writeLog("playWavToWasapi: GetDefaultAudioEndpoint failed");
             goto cleanup;
         }
 
         winrt::com_ptr<IAudioClient> client;
         if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client.put_void()))) {
-            writeLog("playOpusToWasapi: Activate IAudioClient failed");
+            writeLog("playWavToWasapi: Activate IAudioClient failed");
             goto cleanup;
         }
-
-        // 共有モードで Opus ネイティブフォーマット（48kHz, ステレオ, 32bit float）を要求する。
-        // OS のオーディオエンジンが必要に応じてリサンプリングする。
-        // op_read_float_stereo() の出力と一致するフォーマット。
-        constexpr UINT32 OPUS_CHANNELS    = 2;
-        constexpr UINT32 OPUS_SAMPLE_RATE = 48000;
-        constexpr UINT32 OPUS_BPS         = 32;
-        constexpr UINT32 OPUS_BLOCK_ALIGN = OPUS_CHANNELS * OPUS_BPS / 8; // 8 bytes/frame
-
-        WAVEFORMATEXTENSIBLE opusFmt = {};
-        opusFmt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-        opusFmt.Format.nChannels       = OPUS_CHANNELS;
-        opusFmt.Format.nSamplesPerSec  = OPUS_SAMPLE_RATE;
-        opusFmt.Format.wBitsPerSample  = OPUS_BPS;
-        opusFmt.Format.nBlockAlign     = OPUS_BLOCK_ALIGN;
-        opusFmt.Format.nAvgBytesPerSec = OPUS_SAMPLE_RATE * OPUS_BLOCK_ALIGN;
-        opusFmt.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-        opusFmt.Samples.wValidBitsPerSample = OPUS_BPS;
-        opusFmt.dwChannelMask          = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-        opusFmt.SubFormat              = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-        // 共有モードの Initialize では OS のオーディオエンジンがフォーマット変換を担うため、
-        // IsFormatSupported の事前チェックは行わず、Initialize の成否で判定する。
-        WAVEFORMATEX* useFmt = reinterpret_cast<WAVEFORMATEX*>(&opusFmt);
 
         hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!hEvent) goto cleanup;
@@ -1571,8 +1585,8 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
                                   | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                                   | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags,
-                bufDuration, 0, useFmt, nullptr))) {
-            writeLog("playOpusToWasapi: IAudioClient::Initialize failed");
+                bufDuration, 0, &wavFmt, nullptr))) {
+            writeLog("playWavToWasapi: IAudioClient::Initialize failed");
             goto cleanup;
         }
 
@@ -1580,7 +1594,7 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
 
         winrt::com_ptr<IAudioRenderClient> render;
         if (FAILED(client->GetService(__uuidof(IAudioRenderClient), render.put_void()))) {
-            writeLog("playOpusToWasapi: GetService IAudioRenderClient failed");
+            writeLog("playWavToWasapi: GetService IAudioRenderClient failed");
             goto cleanup;
         }
 
@@ -1589,7 +1603,7 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
 
         // 冒頭無音挿入（BLE ヘッドホン対処）
         if (withLeadingSilence) {
-            UINT32 silenceFrames = useFmt->nSamplesPerSec * BLE_SILENCE_MS / 1000;
+            UINT32 silenceFrames = wavFmt.nSamplesPerSec * BLE_SILENCE_MS / 1000;
             UINT32 written       = 0;
             client->Start();
             while (written < silenceFrames && !g_shutdownRequested) {
@@ -1601,7 +1615,7 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
                 if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    memset(buf, 0, frames * useFmt->nBlockAlign);
+                    memset(buf, 0, frames * wavFmt.nBlockAlign);
                     render->ReleaseBuffer(frames, 0);
                 }
                 written += frames;
@@ -1610,8 +1624,11 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
             client->Reset();
         }
 
-        // Opus デコード → WASAPI バッファ供給ループ
-        // useFmt は IEEE_FLOAT 48kHz ステレオが保証されているため OPUS_BLOCK_ALIGN で固定。
+        // data チャンク先頭にシーク（BLE 無音のあり/なしに関わらず一定位置から開始）
+        SetFilePointer(hFile, (LONG)dataStart, nullptr, FILE_BEGIN);
+
+        // WAV PCM 供給ループ
+        DWORD sentFrames = 0;
         bool eof = false;
         client->Start();
         while (!eof && !g_shutdownRequested) {
@@ -1621,30 +1638,26 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
             UINT32 avail = bufFrames - padding;
             if (avail == 0) continue;
 
-            // 一時バッファに Opus をデコード（最大 avail フレーム分）
-            std::vector<float> pcm(static_cast<size_t>(avail) * OPUS_CHANNELS);
-            int decoded = op_read_float_stereo(of, pcm.data(), static_cast<int>(pcm.size()));
-            if (decoded < 0) {
-                writeLog("playOpusToWasapi: op_read_float_stereo error: " + std::to_string(decoded));
-                break;
-            }
-            if (decoded == 0) {
-                eof = true;
-                // 残りバッファが再生されるまで待機（最大約 1 秒）
+            UINT32 frames = min(avail, totalFrames - sentFrames);
+            if (frames == 0) {
+                // 全フレーム送信済み。残りバッファが再生されるまで待機（最大約 1 秒）
                 for (int i = 0; i < 100; i++) {
                     UINT32 rem = 0;
                     client->GetCurrentPadding(&rem);
                     if (rem == 0) break;
                     Sleep(10);
                 }
+                eof = true;
                 break;
             }
 
-            // memcpy サイズは Opus デコード出力（ステレオ float）に合わせて OPUS_BLOCK_ALIGN を使う
             BYTE* buf = nullptr;
-            if (SUCCEEDED(render->GetBuffer(static_cast<UINT32>(decoded), &buf))) {
-                memcpy(buf, pcm.data(), static_cast<size_t>(decoded) * OPUS_BLOCK_ALIGN);
-                render->ReleaseBuffer(static_cast<UINT32>(decoded), 0);
+            if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
+                DWORD nActual = 0;
+                ReadFile(hFile, buf, frames * wavFmt.nBlockAlign, &nActual, nullptr);
+                UINT32 framesRead = nActual / wavFmt.nBlockAlign;
+                render->ReleaseBuffer(framesRead, 0);
+                sentFrames += framesRead;
             }
         }
         client->Stop();
@@ -1653,14 +1666,13 @@ static bool playOpusToWasapi(const std::wstring& path, bool withLeadingSilence) 
 
 cleanup:
     if (hEvent) CloseHandle(hEvent);
-    op_free(of);
+    CloseHandle(hFile);
     return ok;
 }
 
-// 通知音 → 追加通知音を逐次再生し、ダッキング解除するスレッド関数
+// 通知音を再生し、ダッキング解除するスレッド関数
 //
-// STA で COM 初期化し、playOpusToWasapi を同期呼び出しで逐次実行する。
-// 通知音完了後、extraAudioPath が空でなければ追加通知音を再生する。
+// STA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
 // 全再生完了後に DUCK_TRAILING_MS の無音バッファを経てダッキングを解除する。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1668,8 +1680,7 @@ static DWORD WINAPI soundThread(LPVOID param) {
     bool comOk = (hr == S_OK || hr == S_FALSE);
 
     if (comOk) {
-        playOpusToWasapi(ctx->audioPath, true);
-        if (!ctx->extraAudioPath.empty()) playOpusToWasapi(ctx->extraAudioPath, false);
+        playWavToWasapi(ctx->soundPath, true);
 
         if (!ctx->muted.empty()) {
             Sleep(DUCK_TRAILING_MS);
@@ -1687,35 +1698,28 @@ static DWORD WINAPI soundThread(LPVOID param) {
     return 0;
 }
 
-// libopus + WASAPI で通知音を再生する
+// WASAPI で通知音（16bit PCM WAV）を再生する
 //
 // 再生フロー:
-//   BLE 無音（BLE_SILENCE_MS） → 通知音（チャイム） → 追加通知音（存在時のみ）
+//   BLE 無音（BLE_SILENCE_MS） → 通知音（チャイム）
 // 通知音ファイルが存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
 //             末尾バッファは soundThread 内の Sleep(DUCK_TRAILING_MS) で実現する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // 通知音ファイルの存在確認（exe 同ディレクトリ）
-    std::wstring audioPath = exeDir + L"\\" + cfg.audioFile;
-    if (GetFileAttributesW(audioPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        writeLog("launchSound: " + wideToUtf8(cfg.audioFile) + " not found, skipping sound");
+    std::wstring soundPath = exeDir + L"\\" + cfg.soundFile;
+    if (GetFileAttributesW(soundPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        writeLog("launchSound: " + wideToUtf8(cfg.soundFile) + " not found, skipping sound");
         return;
     }
-
-    // 追加通知音ファイルの存在確認（exe 同ディレクトリ）
-    std::wstring extraAudioPath = exeDir + L"\\" + cfg.extraAudioFile;
-    bool hasExtra = (GetFileAttributesW(extraAudioPath.c_str()) != INVALID_FILE_ATTRIBUTES);
-    writeLog("launchSound: " + wideToUtf8(cfg.extraAudioFile)
-             + " " + std::string(hasExtra ? "found" : "not found"));
 
     // ダッキング開始（通知音再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
-    // スレッドで再生（通知音 → 追加通知音 → ダッキング解除）
+    // スレッドで再生（通知音 → ダッキング解除）
     auto* ctx = new SoundContext{
-        .audioPath      = audioPath,
-        .extraAudioPath = hasExtra ? extraAudioPath : L"",
-        .muted          = std::move(mutedSessions)
+        .soundPath = soundPath,
+        .muted     = std::move(mutedSessions)
     };
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {

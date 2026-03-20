@@ -24,8 +24,7 @@ tasks:
       - mkdir -p out
       - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
       - cp gcalntfy.toml out/
-      - cp src/audio.opus out/
-      - cp src/extra.opus out/
+      - cp src/sound.wav out/
       - cp src/app.ico out/
       - cp -f *.local.* out/ 2>/dev/null || true
 
@@ -36,6 +35,6 @@ tasks:
       - >-
         pwsh -NonInteractive -Command '
         Compress-Archive
-        -Path out\gcalntfy.exe, gcalntfy.toml, out\audio.opus, out\extra.opus, out\app.ico
+        -Path out\gcalntfy.exe, gcalntfy.toml, out\sound.wav, out\app.ico
         -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
         -Force'
