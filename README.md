@@ -1,4 +1,4 @@
-## gcalntfy
+# gcalntfy
 
 Google Calendar の予定を数分前に Windows 通知で知らせる常駐アプリ。
 
@@ -10,6 +10,14 @@ Google Calendar の予定を数分前に Windows 通知で知らせる常駐ア�
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install gcalntfy
 ```
+
+## 実行
+
+```powershell
+gcalntfy
+```
+
+起動するとシステムトレイに常駐し、Google Calendar をポーリングして予定を通知する。
 
 ## 動作
 
@@ -57,4 +65,3 @@ task build
 Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
 
 ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定すること。
-
