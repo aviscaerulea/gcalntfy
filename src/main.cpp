@@ -3,9 +3,9 @@
  * gcalntfy - Google カレンダーの予定を Windows Toast 通知で知らせる常駐デーモン
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
- * schedule に従って自律的にポーリングし、次の予定を 4 分前に Toast 通知で知らせる。
+ * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
  * schedule は 0 時〜 23 時の 24 要素配列（回/時、最低 1）。
- * 通知済みイベントは datetime+title で記憶して重複防止する。
+ * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
  * 終了コード:
  *   0  - 正常終了（トレイメニューの「終了」または「再起動」による）
@@ -161,6 +161,7 @@ static std::atomic<bool> g_soundEnabled{true};
 // マイク/カメラ使用中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{true};
 
+// トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
 // トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
@@ -191,6 +192,7 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value);
 // ==================== データ構造 ====================
 
 struct CalendarEvent {
+    std::string id;        // Google Calendar イベント id（通知重複防止キー）
     std::string datetime;
     std::string content;
     std::string permalink;
@@ -218,6 +220,9 @@ static bool                    g_eventsUpdated = false;
 // トレイアイコンのバッジ状態
 // NIM_MODIFY の無駄な呼び出しを抑制するために直前のバッジ有無を保持する
 static bool                    g_trayBadgeActive = false;
+
+// 通知音再生スレッドのハンドル（notifyThreadFunc のみがアクセスし、シャットダウン時に join する）
+static HANDLE g_soundThread = nullptr;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
@@ -419,21 +424,15 @@ static void logSchedule(const std::vector<int>& schedule) {
 }
 
 // 次のポーリング予定時刻を "HH:MM" 形式で返す（calcSleepUntilNextPoll と同じロジック）
-static std::string nextPollTimeStr(int count) {
+static std::string nextPollTimeStr(int pollsPerHour) {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    int nextHour = now.wHour, nextMin;
-    if (count <= 0) {
+    int nextHour = now.wHour;
+    int intervalMin = 60 / pollsPerHour;
+    int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
+    if (nextMin >= 60) {
         nextMin  = 0;
         nextHour = (now.wHour + 1) % 24;
-    }
-    else {
-        int intervalMin = 60 / count;
-        nextMin = intervalMin * (now.wMinute / intervalMin + 1);
-        if (nextMin >= 60) {
-            nextMin  = 0;
-            nextHour = (now.wHour + 1) % 24;
-        }
     }
     char buf[6];
     sprintf_s(buf, sizeof(buf), "%02d:%02d", nextHour, nextMin);
@@ -441,19 +440,11 @@ static std::string nextPollTimeStr(int count) {
 }
 
 // 次のポーリング予定時刻までのスリープ時間（ms）を計算
-// 正時 :00 起点で 60/count 分間隔の次の予定分までの残り時間を返す
-static DWORD calcSleepUntilNextPoll(int count) {
+// 正時 :00 起点で 60/pollsPerHour 分間隔の次の予定分までの残り時間を返す
+static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    if (count <= 0) {
-        // count=0 の時間帯に firstPoll で呼ばれた場合: 次の正時までスリープ
-        long long remainMs = (long long)(60 - now.wMinute) * 60000LL
-                             - (long long)now.wSecond * 1000LL
-                             - (long long)now.wMilliseconds;
-        if (remainMs < 1000) remainMs = 1000;
-        return static_cast<DWORD>(remainMs);
-    }
-    int intervalMin = 60 / count;
+    int intervalMin = 60 / pollsPerHour;
     int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
     if (nextMin > 60) nextMin = 60;
     long long sleepMs = (long long)(nextMin - now.wMinute) * 60000LL
@@ -698,7 +689,7 @@ static std::string waitForAuthCode(SOCKET serverSocket) {
     // \r\n\r\n が届くまでループ受信（HTTP リクエストヘッダ全体を確実に取得する）
     std::string req;
     char chunk[1024];
-    while (req.find("\r\n\r\n") == std::string::npos && req.size() < 8192) {
+    while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
         int n = recv(client, chunk, sizeof(chunk), 0);
         if (n <= 0) break;
         req.append(chunk, static_cast<size_t>(n));
@@ -911,6 +902,8 @@ static std::string normalizeToUtcIso(const std::string& dt) {
         sscanf_s(dt.c_str() + minusPos + 1, "%d:%d", &tzH, &tzM);
         negative = true;
     }
+    // タイムゾーンオフセットの妥当性検証（有効範囲: ±14 時間以内）
+    if (tzH > 14 || tzM > 59) return dt;
 
     SYSTEMTIME st = {};
     st.wYear = static_cast<WORD>(y); st.wMonth = static_cast<WORD>(mo); st.wDay = static_cast<WORD>(d);
@@ -969,6 +962,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             }
 
             CalendarEvent e;
+            e.id = winrt::to_string(ev.GetNamedString(L"id", L""));
 
             // 開始日時の UTC 正規化（dateTime または date）
             if (ev.HasKey(L"start")) {
@@ -1007,6 +1001,7 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
         JsonArray arr;
         for (const auto& e : events) {
             JsonObject obj;
+            obj.Insert(L"id",        JsonValue::CreateStringValue(winrt::to_hstring(e.id)));
             obj.Insert(L"datetime",  JsonValue::CreateStringValue(winrt::to_hstring(e.datetime)));
             obj.Insert(L"content",   JsonValue::CreateStringValue(winrt::to_hstring(e.content)));
             obj.Insert(L"permalink", JsonValue::CreateStringValue(winrt::to_hstring(e.permalink)));
@@ -1045,8 +1040,17 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return {};
 
+    SetLastError(0);
     DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize == INVALID_FILE_SIZE || fileSize == 0 || fileSize > 1024 * 1024) {
+    if (fileSize == INVALID_FILE_SIZE) {
+        DWORD err = GetLastError();
+        CloseHandle(hFile);
+        writeLog(err != NO_ERROR
+            ? "cache: GetFileSize failed (error " + std::to_string(err) + ")"
+            : "cache: unexpected file size (4GB+)");
+        return {};
+    }
+    if (fileSize == 0 || fileSize > 1024 * 1024) {
         CloseHandle(hFile);
         if (fileSize != 0) writeLog("cache: unexpected file size (" + std::to_string(fileSize) + ")");
         return {};
@@ -1068,6 +1072,7 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
         for (auto item : arr) {
             auto obj = item.GetObject();
             CalendarEvent e;
+            e.id        = winrt::to_string(obj.GetNamedString(L"id",        L""));
             e.datetime  = winrt::to_string(obj.GetNamedString(L"datetime",  L""));
             e.content   = winrt::to_string(obj.GetNamedString(L"content",   L""));
             e.permalink = winrt::to_string(obj.GetNamedString(L"permalink", L""));
@@ -1111,13 +1116,13 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     if (!tbl) return std::nullopt;
     const auto* arr = (*tbl)["schedule"].as_array();
     if (!arr) return std::nullopt;
-    std::vector<int> s;
+    std::vector<int> sched;
     for (const auto& el : *arr) {
-        if (s.size() >= 24) break;
-        s.push_back((std::min)(60, (std::max)(1, el.value_or(1))));
+        if (sched.size() >= 24) break;
+        sched.push_back((std::min)(60, (std::max)(1, el.value_or(1))));
     }
-    while (s.size() < 24) s.push_back(1);
-    return s;
+    while (sched.size() < 24) sched.push_back(1);
+    return sched;
 }
 
 // gcalntfy.toml と gcalntfy.local.toml を読み込んで Config を構築する
@@ -1443,9 +1448,9 @@ static bool isMicCaptureActive() {
         int sessionCount = 0;
         sessionEnum->GetCount(&sessionCount);
 
-        for (int s = 0; s < sessionCount; s++) {
+        for (int si = 0; si < sessionCount; si++) {
             winrt::com_ptr<IAudioSessionControl> ctrl;
-            if (FAILED(sessionEnum->GetSession(s, ctrl.put()))) continue;
+            if (FAILED(sessionEnum->GetSession(si, ctrl.put()))) continue;
 
             // システムサウンドセッションはスキップ
             auto ctrl2 = ctrl.try_as<IAudioSessionControl2>();
@@ -1519,7 +1524,8 @@ static bool playWavToWasapi(const std::wstring& path, bool withLeadingSilence) {
                 ReadFile(hFile, &wavFmt, readSize, &nRead, nullptr);
                 if (chunkSize > readSize)
                     SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
-                if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16) {
+                if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
+                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0) {
                     writeLog("playWavToWasapi: unsupported format, only 16bit PCM WAV is supported");
                     goto cleanup;
                 }
@@ -1711,13 +1717,21 @@ static void launchSound(const std::wstring& exeDir, const Config& cfg) {
         .soundPath = soundPath,
         .muted     = std::move(mutedSessions)
     };
+    // 前回スレッドが完了していれば解放（通常はとっくに終わっているが念のため）
+    if (g_soundThread) {
+        if (WaitForSingleObject(g_soundThread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_soundThread);
+            g_soundThread = nullptr;
+        }
+    }
+
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
         if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
         delete ctx;
         return;
     }
-    CloseHandle(hThread);
+    g_soundThread = hThread;  // ハンドルを保持（シャットダウン時 join に使用）
 }
 
 // ==================== ショートカット ====================
@@ -2196,7 +2210,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// HWND_MESSAGE 非表示ウィンドウを作成してトレイメッセージ受信に使用する
+// 非表示トップレベルウィンドウを作成してトレイメッセージ受信に使用する
+// HWND_MESSAGE ではなく nullptr 親（トップレベル）にすることで WM_POWERBROADCAST を受信できる
 static HWND createTrayWindow() {
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
@@ -2211,8 +2226,10 @@ static HWND createTrayWindow() {
 // ==================== 通知スレッド ====================
 
 // イベントの通知済み判定キーを生成する
+// Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
+// id ベースにすることで、ユーザがイベントタイトルを編集しても重複通知を防止できる。
 static inline std::string eventKey(const CalendarEvent& e) {
-    return e.datetime + "|" + e.content;
+    return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
 
 // notifiedSet の自然失効: 新リストに含まれないキーを削除する
@@ -2327,6 +2344,14 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
         }
+    }
+
+    // シャットダウン前に通知音スレッドの完了を待機（ダッキング復元を保証）
+    // g_shutdownRequested == true なので playWavToWasapi がすみやかに停止するはず
+    if (g_soundThread) {
+        WaitForSingleObject(g_soundThread, 5000);
+        CloseHandle(g_soundThread);
+        g_soundThread = nullptr;
     }
 
     winrt::uninit_apartment();
@@ -2463,7 +2488,7 @@ int wmain() {
                     firstPoll = true;
                 }
 
-                int count = cfg.schedule[jstNow.wHour];
+                int pollsPerHour = cfg.schedule[jstNow.wHour];
 
                 // アクセストークン確保（有効期限内 → 即 return、それ以外 → リフレッシュまたは完全認証）
                 if (!ensureAccessToken()) {
@@ -2485,7 +2510,7 @@ int wmain() {
                 calUrl += CALENDAR_API_HOST;
                 calUrl += CALENDAR_API_PATH;
                 calUrl += L"?singleEvents=true&orderBy=startTime&maxResults=50";
-                calUrl += L"&fields=items(summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
+                calUrl += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
                 calUrl += L"&timeMin=" + toWide(urlEncode(nowUtc));
                 calUrl += L"&timeMax=" + toWide(urlEncode(endUtc));
 
@@ -2525,7 +2550,7 @@ int wmain() {
                 else {
                     g_lastErrorToastTime.store(0);
                     writeLog("poll: " + std::to_string(events.size()) + " events ("
-                        + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(count));
+                        + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
                 }
 
                 // ポーリング結果を通知スレッドへ渡す
@@ -2542,7 +2567,7 @@ int wmain() {
 
                 firstPoll = false;
                 g_lastPollTick.store(GetTickCount64());
-                waitWithMessages(calcSleepUntilNextPoll(count));
+                waitWithMessages(calcSleepUntilNextPoll(pollsPerHour));
             }
             catch (...) {
                 writeLog("unexpected error in polling loop");
