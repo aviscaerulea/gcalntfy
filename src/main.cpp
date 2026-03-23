@@ -215,6 +215,9 @@ static std::condition_variable g_cv;
 static std::vector<CalendarEvent> g_pendingEvents;
 static Config                  g_currentConfig;
 static bool                    g_eventsUpdated = false;
+// トレイアイコンのバッジ状態
+// NIM_MODIFY の無駄な呼び出しを抑制するために直前のバッジ有無を保持する
+static bool                    g_trayBadgeActive = false;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
@@ -1855,8 +1858,9 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
     return nid;
 }
 
-// トレイアイコンを登録する
+// トレイアイコンの登録
 static void addTrayIcon(HWND hWnd) {
+    g_trayBadgeActive = false;  // バッジ状態をリセットしてアイコン再登録後の差分検出を保証
     auto nid = makeTrayNid(hWnd);
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
@@ -1865,6 +1869,109 @@ static void addTrayIcon(HWND hWnd) {
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
     SetTimer(hWnd, IDT_TOOLTIP_REFRESH, TOOLTIP_REFRESH_MS, nullptr);
+}
+
+// バッジ付きトレイアイコンの生成
+// ベースアイコンの右下に赤い円バッジを合成した HICON を返す。
+// 32bpp DIBSection にピクセルを直接書き込むことで alpha=255 を確実に設定する。
+// GDI Ellipse では alpha バイトが 0 のままになり DWM 合成で透明化されるため使わない。
+// 呼び出し側が DestroyIcon で解放する責務を持つ。失敗時は nullptr を返す。
+static HICON createBadgedIcon() {
+    int cx = GetSystemMetrics(SM_CXSMICON);
+    int cy = GetSystemMetrics(SM_CYSMICON);
+
+    // 32bpp BGRA の DIBSection を作成（pixels ポインタで直接アクセスできる）
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
+    BITMAPINFO bmi              = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = cx;
+    bmi.bmiHeader.biHeight      = -cy;  // top-down（y=0 が左上）
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    UINT32* pixels = nullptr;
+    HBITMAP hbm  = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, (void**)&pixels, nullptr, 0);
+    if (!hbm || !pixels) {
+        DeleteDC(hdcMem);
+        ReleaseDC(nullptr, hdcScreen);
+        return nullptr;
+    }
+    HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hbm);
+
+    // ベースアイコンを DIBSection に描画（DrawIconEx は 32bpp DIB に alpha を正しく書き込む）
+    HICON hBase = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON),
+                                    IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+    if (!hBase) {
+        SelectObject(hdcMem, hOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        ReleaseDC(nullptr, hdcScreen);
+        return nullptr;
+    }
+    DrawIconEx(hdcMem, 0, 0, hBase, cx, cy, 0, nullptr, DI_NORMAL);
+    DestroyIcon(hBase);
+
+    // バッジ円のパラメータ（アイコンを十字 4 等分した右下領域にマージン 1px で収める）
+    int badgeSize = (std::max)(cx / 2 - 2, 3);
+    int ox   = cx / 2;
+    int oy   = cy / 2 + 1;
+    float midX = ox + badgeSize / 2.0f;
+    float midY = oy + badgeSize / 2.0f;
+    float r    = badgeSize / 2.0f;
+
+    // 距離ベースのアルファブレンドで円エッジを滑らかに描画（アンチエイリアス）
+    int scanPad = static_cast<int>(r) + 1;
+    for (int y = oy - scanPad; y < oy + scanPad + badgeSize; ++y) {
+        if (y < 0 || y >= cy) continue;
+        for (int x = ox - scanPad; x < ox + scanPad + badgeSize; ++x) {
+            if (x < 0 || x >= cx) continue;
+            float d     = sqrtf((x - midX) * (x - midX) + (y - midY) * (y - midY));
+            float alpha = (d <= r - 0.5f) ? 1.0f : (d <= r + 0.5f) ? (r + 0.5f - d) : 0.0f;
+            if (alpha <= 0.0f) continue;
+            UINT32 a = static_cast<UINT32>(alpha * 255.0f + 0.5f);
+            pixels[y * cx + x] = (a << 24) | 0x00FF0000u;
+        }
+    }
+
+    SelectObject(hdcMem, hOld);
+
+    // モノクロマスク（黒 = 不透明）を作成
+    HBITMAP hbmMask  = CreateBitmap(cx, cy, 1, 1, nullptr);
+    HDC hdcMono      = CreateCompatibleDC(hdcScreen);
+    HBITMAP hOldMono = (HBITMAP)SelectObject(hdcMono, hbmMask);
+    PatBlt(hdcMono, 0, 0, cx, cy, BLACKNESS);
+    SelectObject(hdcMono, hOldMono);
+    DeleteDC(hdcMono);
+
+    ICONINFO ii   = { TRUE, 0, 0, hbmMask, hbm };
+    HICON hResult = CreateIconIndirect(&ii);
+
+    DeleteObject(hbmMask);
+    DeleteDC(hdcMem);
+    DeleteObject(hbm);
+    ReleaseDC(nullptr, hdcScreen);
+    return hResult;
+}
+
+// トレイアイコンのバッジ切り替え
+// hasUpcoming が g_trayBadgeActive（前回状態）と同じなら NIM_MODIFY をスキップする。
+static void updateTrayIcon(HWND hWnd, bool hasUpcoming) {
+    if (hasUpcoming == g_trayBadgeActive) return;
+    g_trayBadgeActive = hasUpcoming;
+
+    auto nid   = makeTrayNid(hWnd);
+    nid.uFlags = NIF_ICON;
+    if (hasUpcoming) {
+        nid.hIcon = createBadgedIcon();
+        if (!nid.hIcon)
+            nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+    }
+    else {
+        nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+    }
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    if (nid.hIcon) DestroyIcon(nid.hIcon);
 }
 
 // トレイアイコンのツールチップをクリアする（ポップアップ表示前に呼ぶ）
@@ -1902,6 +2009,7 @@ static void updateTrayTooltip(HWND hWnd) {
     else
         wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
+    updateTrayIcon(hWnd, count > 0);
 }
 
 // トレイアイコンを除去する
@@ -2082,6 +2190,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (WM_TASKBAR_CREATED != 0 && msg == WM_TASKBAR_CREATED) {
         addTrayIcon(hWnd);
+        updateTrayTooltip(hWnd);  // バッジ状態とツールチップをエクスプローラ再起動後も復元
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
