@@ -37,5 +37,5 @@ cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `
-    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib
+    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib gdi32.lib
 if ($LASTEXITCODE) { exit 1 }
