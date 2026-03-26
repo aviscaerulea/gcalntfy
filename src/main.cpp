@@ -62,6 +62,7 @@
 #include <mutex>
 #include <thread>
 #include <cstdio>
+#include <cmath>
 
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -120,11 +121,20 @@ static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
 static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 
-// BLE ヘッドホン対処：冒頭無音の時間（ミリ秒）
-static constexpr int BLE_SILENCE_MS = 2000;
+// BLE ヘッドホン対処：冒頭不可聴トーンの時間（ミリ秒）
+static constexpr int BLE_LEADING_TONE_MS = 1500;
 
-// 通知音再生完了後、ダッキング解除前のトレーリング無音（ミリ秒）
-static constexpr int DUCK_TRAILING_MS = 2000;
+// BLE ヘッドホン対処：末尾不可聴トーンの時間（ミリ秒）
+static constexpr int BLE_TRAILING_TONE_MS = 2000;
+
+// 不可聴トーンの周波数（Hz）。BLE デバイスの省電力移行を防止する
+static constexpr int TONE_FREQ_HZ = 19000;
+
+// 不可聴トーンの振幅（int16_t、フルスケール 32767 の約 3%）
+static constexpr int TONE_AMPLITUDE = 1000;
+
+// 円周率（MSVC では M_PI に _USE_MATH_DEFINES が必要なため自前定義）
+static constexpr double PI = 3.14159265358979323846;
 
 // エラー Toast の最小間隔（30 分）
 static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
@@ -1475,15 +1485,43 @@ static bool isMeetingActive() {
 
 // ==================== 通知音再生 ====================
 
+// WASAPI バッファに不可聴正弦波を書き込む
+//
+// サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
+// phase はバッファ分割供給間で位相を維持するための参照引数。
+static void fillToneBuffer(BYTE* buf, UINT32 frames,
+                           const WAVEFORMATEX& wavFmt, double& phase) {
+    // ナイキスト周波数チェック（例：44.1kHz のナイキスト = 22.05kHz）
+    if (TONE_FREQ_HZ >= static_cast<int>(wavFmt.nSamplesPerSec / 2)) {
+        // フォールバック：完全無音（ナイキスト以上の周波数は表現不可）
+        memset(buf, 0, frames * wavFmt.nBlockAlign);
+        return;
+    }
+
+    int16_t* samples = reinterpret_cast<int16_t*>(buf);
+    double phaseStep = 2.0 * PI * TONE_FREQ_HZ / wavFmt.nSamplesPerSec;
+
+    for (UINT32 i = 0; i < frames; i++) {
+        int16_t sampleValue = static_cast<int16_t>(TONE_AMPLITUDE * std::sin(phase));
+        for (int ch = 0; ch < wavFmt.nChannels; ch++) {
+            samples[i * wavFmt.nChannels + ch] = sampleValue;
+        }
+        phase += phaseStep;
+    }
+
+    // 位相を [0, 2π) に正規化（精度維持）
+    phase = std::fmod(phase, 2.0 * PI);
+}
+
 // WAV ファイルを WASAPI 共有モードで再生する
 //
 // path: 再生ファイルのフルパス（16bit PCM WAV のみ対応）
-// withLeadingSilence: true で冒頭 BLE_SILENCE_MS 分の無音を挿入する（BLE ヘッドホン対処）
+// withBleTone: true で冒頭 BLE_LEADING_TONE_MS 分の 19kHz 不可聴トーンを挿入し、末尾 BLE_TRAILING_TONE_MS 分のトーンを追加する（BLE ヘッドホン対処）
 // 戻り値: 再生成功なら true
 //
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
 // g_shutdownRequested が true になると再生を中断する。
-static bool playWavToWasapi(const std::wstring& path, bool withLeadingSilence) {
+static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -1597,21 +1635,22 @@ static bool playWavToWasapi(const std::wstring& path, bool withLeadingSilence) {
         UINT32 bufFrames = 0;
         client->GetBufferSize(&bufFrames);
 
-        // 冒頭無音挿入（BLE ヘッドホン対処）
-        if (withLeadingSilence) {
-            UINT32 silenceFrames = wavFmt.nSamplesPerSec * BLE_SILENCE_MS / 1000;
-            UINT32 written       = 0;
+        // 冒頭不可聴トーン挿入（BLE ヘッドホン対処：省電力移行防止）
+        if (withBleTone) {
+            UINT32 toneFrames = wavFmt.nSamplesPerSec * BLE_LEADING_TONE_MS / 1000;
+            UINT32 written    = 0;
+            double phase      = 0.0;
             client->Start();
-            while (written < silenceFrames && !g_shutdownRequested) {
+            while (written < toneFrames && !g_shutdownRequested) {
                 WaitForSingleObject(hEvent, 200);
                 UINT32 padding = 0;
                 client->GetCurrentPadding(&padding);
                 UINT32 avail  = bufFrames - padding;
-                UINT32 frames = min(avail, silenceFrames - written);
+                UINT32 frames = min(avail, toneFrames - written);
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
                 if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    memset(buf, 0, frames * wavFmt.nBlockAlign);
+                    fillToneBuffer(buf, frames, wavFmt, phase);
                     render->ReleaseBuffer(frames, 0);
                 }
                 written += frames;
@@ -1656,6 +1695,28 @@ static bool playWavToWasapi(const std::wstring& path, bool withLeadingSilence) {
                 sentFrames += framesRead;
             }
         }
+
+        // 末尾不可聴トーン挿入（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
+        if (withBleTone && eof) {
+            UINT32 trailFrames = wavFmt.nSamplesPerSec * BLE_TRAILING_TONE_MS / 1000;
+            UINT32 written     = 0;
+            double phase       = 0.0;
+            while (written < trailFrames && !g_shutdownRequested) {
+                WaitForSingleObject(hEvent, 200);
+                UINT32 padding = 0;
+                client->GetCurrentPadding(&padding);
+                UINT32 avail  = bufFrames - padding;
+                UINT32 frames = min(avail, trailFrames - written);
+                if (frames == 0) continue;
+                BYTE* buf = nullptr;
+                if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
+                    fillToneBuffer(buf, frames, wavFmt, phase);
+                    render->ReleaseBuffer(frames, 0);
+                }
+                written += frames;
+            }
+        }
+
         client->Stop();
         ok = eof;
     }
@@ -1669,7 +1730,7 @@ cleanup:
 // 通知音を再生し、ダッキング解除するスレッド関数
 //
 // STA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
-// 全再生完了後に DUCK_TRAILING_MS の無音バッファを経てダッキングを解除する。
+// 末尾 BLE_TRAILING_TONE_MS 分のトーン再生完了後にダッキングを解除する。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     auto* ctx  = static_cast<SoundContext*>(param);
@@ -1679,7 +1740,6 @@ static DWORD WINAPI soundThread(LPVOID param) {
         playWavToWasapi(ctx->soundPath, true);
 
         if (!ctx->muted.empty()) {
-            Sleep(DUCK_TRAILING_MS);
             unduckAudioSessions(ctx->muted);
             writeLog("unduckAudioSessions: restored");
         }
@@ -1697,10 +1757,10 @@ static DWORD WINAPI soundThread(LPVOID param) {
 // WASAPI で通知音（16bit PCM WAV）を再生する
 //
 // 再生フロー:
-//   BLE 無音（BLE_SILENCE_MS） → 通知音（チャイム）
+//   BLE 19kHz トーン（冒頭 BLE_LEADING_TONE_MS） → 通知音（チャイム）→ BLE 19kHz トーン（末尾 BLE_TRAILING_TONE_MS）
 // 通知音ファイルが存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
-//             末尾バッファは soundThread 内の Sleep(DUCK_TRAILING_MS) で実現する。
+//             末尾トーン（2.0 秒）再生の後にダッキングを解除する。
 static void launchSound(const std::wstring& exeDir, const Config& cfg) {
     // 通知音ファイルの存在確認（exe 同ディレクトリ）
     std::wstring soundPath = exeDir + L"\\" + DEFAULT_SOUND_FILE;
