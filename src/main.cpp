@@ -54,6 +54,8 @@
 #include <string_view>
 #include <vector>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <algorithm>
 #include <atomic>
@@ -195,7 +197,7 @@ static ULARGE_INTEGER g_tokenExpiry = {};
 
 // 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
 static void showToast(const std::wstring& timeJST, const std::wstring& title,
-                      const std::wstring& permalink);
+                      const std::wstring& permalink, bool silent = true);
 static std::wstring readRegString(const wchar_t* valueName);
 static void writeRegString(const wchar_t* valueName, const std::wstring& value);
 
@@ -319,13 +321,30 @@ static bool parseIsoToSystemTime(const std::string& iso, SYSTEMTIME& out) {
     return true;
 }
 
+// UTC ISO 文字列を JST の SYSTEMTIME に変換する
+// パース失敗時は nullopt を返す。
+static std::optional<SYSTEMTIME> utcIsoToJst(const std::string& utcIso) {
+    SYSTEMTIME st;
+    if (!parseIsoToSystemTime(utcIso, st)) return std::nullopt;
+    return utcToJst(st);
+}
+
 // UTC RFC3339 "YYYY-MM-DDTHH:MM:SS...Z" を JST "HH:MM" に変換する
 static std::wstring utcToJstHHMM(const std::string& utcIso) {
-    SYSTEMTIME st;
-    if (!parseIsoToSystemTime(utcIso, st)) return L"??:??";
-    auto jst = utcToJst(st);
+    auto jst = utcIsoToJst(utcIso);
+    if (!jst) return L"??:??";
     wchar_t buf[8];
-    swprintf_s(buf, _countof(buf), L"%02d:%02d", jst.wHour, jst.wMinute);
+    swprintf_s(buf, _countof(buf), L"%02d:%02d", jst->wHour, jst->wMinute);
+    return buf;
+}
+
+// UTC ISO 文字列を JST の "M/D HH:MM" 形式に変換する
+static std::wstring utcToJstMDHHMM(const std::string& utcIso) {
+    auto jst = utcIsoToJst(utcIso);
+    if (!jst) return L"?/? ??:??";
+    wchar_t buf[16];
+    swprintf_s(buf, _countof(buf), L"%d/%d %02d:%02d",
+               jst->wMonth, jst->wDay, jst->wHour, jst->wMinute);
     return buf;
 }
 
@@ -1838,31 +1857,24 @@ static void ensureShortcut() {
 
 // ==================== Toast 通知 ====================
 
-// Toast 通知を表示する
+// アプリアイコンの Toast XML タグを生成する
 //
-// OS に通知を登録して即 return する（コールバック待機なし）。
-// アプリアイコン（exe 同フォルダの app.ico）・OS 通知音の無効化・
-// Calendar を開くボタンを含むリッチな通知を表示する。
-static void showToast(const std::wstring& timeJST, const std::wstring& title,
-                      const std::wstring& permalink)
-{
-    auto iconPath = getExeDir() + L"\\app.ico";
+// exe 同フォルダの app.ico が存在する場合のみタグを返す。存在しない場合は空文字列。
+// 初回呼び出し時に結果をキャッシュする（app.ico は起動後に変化しない）。
+static std::wstring buildIconTag() {
+    static const std::wstring tag = []() -> std::wstring {
+        auto iconPath = getExeDir() + L"\\app.ico";
+        if (!PathFileExistsW(iconPath.c_str())) return {};
+        return L"<image placement=\"appLogoOverride\" src=\"" + escapeXml(iconPath) + L"\"/>";
+    }();
+    return tag;
+}
 
-    std::wstring iconTag;
-    if (PathFileExistsW(iconPath.c_str())) {
-        iconTag = L"<image placement=\"appLogoOverride\" src=\"" + escapeXml(iconPath) + L"\"/>";
-    }
-
-    std::wstring xml =
-        L"<toast>"
-        L"<visual><binding template=\"ToastGeneric\">"
-        + iconTag +
-        L"<text>" + escapeXml(timeJST) + L"</text>"
-        L"<text>" + escapeXml(title)   + L"</text>"
-        L"</binding></visual>"
-        L"<audio silent=\"true\"/>";
-
-    // https:// / http:// 以外のスキームは拒否して任意プロトコルハンドラの悪用を防ぐ
+// Toast XML を WinRT に渡して通知を表示する
+//
+// https:// / http:// 以外のスキームは拒否して任意プロトコルハンドラの悪用を防ぐ。
+// xml は </visual> まで構築済みの文字列を渡す（</toast> は内部で付加する）。
+static void dispatchToastXml(std::wstring xml, const std::wstring& permalink) {
     if (!permalink.empty() && isHttpUrl(permalink)) {
         xml += L"<actions>"
                L"<action activationType=\"protocol\" content=\"Calendar\""
@@ -1879,6 +1891,45 @@ static void showToast(const std::wstring& timeJST, const std::wstring& title,
     auto notification = winrt::Windows::UI::Notifications::ToastNotification(doc);
 
     notifier.Show(notification);
+}
+
+// Toast 通知を表示する
+//
+// OS に通知を登録して即 return する（コールバック待機なし）。
+// アプリアイコン（exe 同フォルダの app.ico）・Calendar を開くボタンを含むリッチな通知を表示する。
+// silent=true（デフォルト）: OS 通知音を無効化する。
+// silent=false: <audio> タグを省略し OS 標準通知音を鳴らす。
+static void showToast(const std::wstring& timeJST, const std::wstring& title,
+                      const std::wstring& permalink, bool silent)
+{
+    std::wstring xml =
+        L"<toast>"
+        L"<visual><binding template=\"ToastGeneric\">"
+        + buildIconTag() +
+        L"<text>" + escapeXml(timeJST) + L"</text>"
+        L"<text>" + escapeXml(title)   + L"</text>"
+        L"</binding></visual>"
+        + (silent ? L"<audio silent=\"true\"/>" : L"");
+
+    dispatchToastXml(std::move(xml), permalink);
+}
+
+// 3 行 Toast 通知を表示する（変更・キャンセル通知用）
+//
+// line1 を title スタイル（太字大）で表示し、OS 標準通知音を鳴らす。
+static void showToast3(const std::wstring& line1, const std::wstring& line2,
+                       const std::wstring& line3, const std::wstring& permalink)
+{
+    std::wstring xml =
+        L"<toast>"
+        L"<visual><binding template=\"ToastGeneric\">"
+        + buildIconTag() +
+        L"<text hint-style=\"title\">" + escapeXml(line1) + L"</text>"
+        L"<text>" + escapeXml(line2) + L"</text>"
+        L"<text>" + escapeXml(line3) + L"</text>"
+        L"</binding></visual>";
+
+    dispatchToastXml(std::move(xml), permalink);
 }
 
 // エラー Toast 表示（クールダウン制御付き）
@@ -2283,6 +2334,100 @@ static HWND createTrayWindow() {
         0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
 }
 
+// ==================== 予定変更検知 ====================
+
+// 予定変更の種別
+enum class EventChangeType { TimeChanged, Cancelled, Added };
+
+// 検出した変更 1 件分
+struct EventChange {
+    EventChangeType type;
+    std::string     oldDatetime;  // TimeChanged: 旧日時、Cancelled: 通知表示用日時
+    std::string     newDatetime;  // TimeChanged / Added 時に使用（Cancelled 時は空）
+    std::string     content;      // イベント名
+    std::string     permalink;    // Calendar URL（空でもよい）
+};
+
+// イベントリストの変更を検出する
+//
+// oldEvents と newEvents を id で突合し、日時変更・追加・キャンセルを検出する。
+// Added 検知はポーリングウィンドウへの新規進入を検知するものであり、ユーザが Calendar
+// に実際に追加した予定との区別は行わない（firstPoll スキップで起動直後の誤検知を抑制）。
+// id が空のイベントは比較対象から除外する。
+// oldEvents が空の場合は空のベクタを返す（変更検知の開始前状態）。
+static std::vector<EventChange> collectEventChanges(
+    const std::vector<CalendarEvent>& oldEvents,
+    const std::vector<CalendarEvent>& newEvents)
+{
+    if (oldEvents.empty()) return {};
+
+    std::unordered_map<std::string, const CalendarEvent*> oldMap;
+    for (const auto& e : oldEvents) {
+        if (!e.id.empty()) oldMap[e.id] = &e;
+    }
+
+    std::unordered_set<std::string> newIds;
+    std::vector<EventChange> changes;
+
+    for (const auto& e : newEvents) {
+        if (e.id.empty()) continue;
+        newIds.insert(e.id);
+        auto it = oldMap.find(e.id);
+        if (it == oldMap.end()) {
+            changes.push_back({EventChangeType::Added,
+                               {}, e.datetime,
+                               e.content, e.permalink});
+        }
+        else if (it->second->datetime != e.datetime) {
+            changes.push_back({EventChangeType::TimeChanged,
+                               it->second->datetime, e.datetime,
+                               e.content, e.permalink});
+        }
+    }
+
+    auto nowUtc = getCurrentUtcISO();
+    for (const auto& [id, old] : oldMap) {
+        if (newIds.find(id) == newIds.end()) {
+            // 開始済みのイベントはポーリングウィンドウから自然消失しただけなのでスキップ
+            if (old->datetime <= nowUtc) continue;
+            changes.push_back({EventChangeType::Cancelled,
+                               old->datetime, {},
+                               old->content, old->permalink});
+        }
+    }
+
+    return changes;
+}
+
+// 検出した変更に対して Toast 通知を送信する
+//
+// g_mtx のロック外から呼ぶこと（Toast 送信中に通知スレッドがロックを取得できるようにするため）。
+static void notifyEventChanges(const std::vector<EventChange>& changes)
+{
+    for (const auto& c : changes) {
+        auto wContent   = toWide(c.content);
+        auto wPermalink = toWide(c.permalink);
+        try {
+            switch (c.type) {
+            case EventChangeType::TimeChanged: {
+                auto line2 = utcToJstMDHHMM(c.oldDatetime) + L" → " + utcToJstMDHHMM(c.newDatetime);
+                showToast3(L"予定変更", line2, wContent, wPermalink);
+                break;
+            }
+            case EventChangeType::Cancelled:
+                showToast3(L"予定キャンセル", utcToJstMDHHMM(c.oldDatetime), wContent, wPermalink);
+                break;
+            case EventChangeType::Added:
+                showToast3(L"予定追加", utcToJstMDHHMM(c.newDatetime), wContent, wPermalink);
+                break;
+            }
+        }
+        catch (...) {
+            writeLog("notifyEventChanges: toast failed for " + c.content);
+        }
+    }
+}
+
 // ==================== 通知スレッド ====================
 
 // イベントの通知済み判定キーを生成する
@@ -2615,12 +2760,20 @@ int wmain() {
 
                 // ポーリング結果を通知スレッドへ渡す
                 if (errorMsg.empty()) {
+                    std::vector<CalendarEvent> prevEvents;
                     {
                         std::lock_guard<std::mutex> lk(g_mtx);
+                        prevEvents      = g_pendingEvents;
                         g_pendingEvents = events;
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
+                    // 初回ポーリングはベースライン確立のため変更検知をスキップする
+                    std::vector<EventChange> changes;
+                    if (!firstPoll) {
+                        changes = collectEventChanges(prevEvents, events);
+                    }
+                    notifyEventChanges(changes);
                     saveCacheFile(exeDir, events);
                     if (g_hWnd) updateTrayTooltip(g_hWnd);
                 }
