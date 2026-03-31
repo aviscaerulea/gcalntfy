@@ -155,7 +155,6 @@ static constexpr const wchar_t* OAUTH_SCOPE      = L"https://www.googleapis.com/
 
 // Google Calendar API v3
 static constexpr const wchar_t* CALENDAR_API_HOST = L"www.googleapis.com";
-static constexpr const wchar_t* CALENDAR_API_PATH = L"/calendar/v3/calendars/primary/events";
 
 // PKCE code_verifier のバイト数（Base64url で 86 文字）
 static constexpr size_t PKCE_VERIFIER_BYTES = 64;
@@ -218,9 +217,10 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::vector<int>          schedule;     // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
-    std::vector<std::wstring> duckTargets;  // 通知音再生中にミュートするプロセス名
-    long long                 notifyLeadMs; // 通知リード時間（ミリ秒、TOML では分で指定）
+    std::vector<int>          schedule;          // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
+    std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
+    long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
+    std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 };
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
@@ -323,7 +323,7 @@ static bool parseIsoToSystemTime(const std::string& iso, SYSTEMTIME& out) {
 
 // UTC ISO 文字列を JST の SYSTEMTIME に変換する
 // パース失敗時は nullopt を返す。
-static std::optional<SYSTEMTIME> utcIsoToJst(const std::string& utcIso) {
+static std::optional<SYSTEMTIME> utcIsoToJstSt(const std::string& utcIso) {
     SYSTEMTIME st;
     if (!parseIsoToSystemTime(utcIso, st)) return std::nullopt;
     return utcToJst(st);
@@ -331,7 +331,7 @@ static std::optional<SYSTEMTIME> utcIsoToJst(const std::string& utcIso) {
 
 // UTC RFC3339 "YYYY-MM-DDTHH:MM:SS...Z" を JST "HH:MM" に変換する
 static std::wstring utcToJstHHMM(const std::string& utcIso) {
-    auto jst = utcIsoToJst(utcIso);
+    auto jst = utcIsoToJstSt(utcIso);
     if (!jst) return L"??:??";
     wchar_t buf[8];
     swprintf_s(buf, _countof(buf), L"%02d:%02d", jst->wHour, jst->wMinute);
@@ -340,7 +340,7 @@ static std::wstring utcToJstHHMM(const std::string& utcIso) {
 
 // UTC ISO 文字列を JST の "M/D HH:MM" 形式に変換する
 static std::wstring utcToJstMDHHMM(const std::string& utcIso) {
-    auto jst = utcIsoToJst(utcIso);
+    auto jst = utcIsoToJstSt(utcIso);
     if (!jst) return L"?/? ??:??";
     wchar_t buf[16];
     swprintf_s(buf, _countof(buf), L"%d/%d %02d:%02d",
@@ -1175,6 +1175,18 @@ static Config loadConfig(const std::wstring& exeDir) {
         return targets;
     };
 
+    // ext_calendar_ids 配列の読み込み（local 優先、なければ base）
+    auto readExtCalendarIds = [&](const std::optional<toml::table>& tbl) -> std::vector<std::string> {
+        if (!tbl) return {};
+        const auto* arr = (*tbl)["ext_calendar_ids"].as_array();
+        if (!arr) return {};
+        std::vector<std::string> ids;
+        for (const auto& el : *arr) {
+            if (auto s = el.value<std::string>()) ids.push_back(*s);
+        }
+        return ids;
+    };
+
     Config cfg;
     if (auto s = readSchedule(local)) {
         cfg.schedule = std::move(*s);
@@ -1188,6 +1200,9 @@ static Config loadConfig(const std::wstring& exeDir) {
 
     cfg.duckTargets = readDuckTargets(local);
     if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
+
+    cfg.extCalendarIds = readExtCalendarIds(local);
+    if (cfg.extCalendarIds.empty()) cfg.extCalendarIds = readExtCalendarIds(base);
 
     // notify_minutes（通知リード時間、分単位。デフォルト 5 分、0〜30 にクランプ）
     long long notifyMin = DEFAULT_NOTIFY_MINUTES;
@@ -2662,7 +2677,8 @@ int wmain() {
         }
 
         int lastJstDay = -1;
-        bool firstPoll = true; // 起動時は schedule に関わらず必ず1回ポーリング
+        bool firstPoll           = true;  // 起動時は schedule に関わらず必ず1回ポーリング
+        bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
 
         while (!g_shutdownRequested) {
             try {
@@ -2703,7 +2719,7 @@ int wmain() {
                     continue;
                 }
 
-                // Calendar API v3 URL 構築（現在時刻以降、翌日 JST 23:59:59 までの予定を取得）
+                // Calendar API v3 クエリパラメータ（全カレンダー共通）
                 auto nowUtc = getCurrentUtcISO();
                 // JST の今日 00:00:00 に +48h - 1s = 翌日 JST 23:59:59。UTC に変換（-9h）して timeMax とする
                 SYSTEMTIME jstMidnight = utcToJst(utcNow);
@@ -2711,55 +2727,86 @@ int wmain() {
                 auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
                 auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
                 auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
-                std::wstring calUrl = L"https://";
-                calUrl += CALENDAR_API_HOST;
-                calUrl += CALENDAR_API_PATH;
-                calUrl += L"?singleEvents=true&orderBy=startTime&maxResults=50";
-                calUrl += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
-                calUrl += L"&timeMin=" + toWide(urlEncode(nowUtc));
-                calUrl += L"&timeMax=" + toWide(urlEncode(endUtc));
+                std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
+                queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
+                queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
+                queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
 
-                DWORD httpStatus = 0;
-                ULONGLONG t0 = GetTickCount64();
-                auto body = httpGet(calUrl, g_accessToken, &httpStatus);
+                // ポーリング対象カレンダー（primary + ext_calendar_ids）
+                std::vector<std::string> calendarIds = {"primary"};
+                for (const auto& id : cfg.extCalendarIds) calendarIds.push_back(id);
 
-                // 401: アクセストークン失効 → リフレッシュしてリトライ
-                if (httpStatus == 401) {
-                    writeLog("access token expired (401), refreshing...");
-                    g_accessToken.clear();
-                    g_tokenExpiry = {};
-                    if (!ensureAccessToken()) {
-                        showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
-                        waitWithMessages(RETRY_WAIT_MS);
+                std::vector<CalendarEvent> events;
+                bool anySuccess  = false;
+                bool authFailed  = false;
+                ULONGLONG t0     = GetTickCount64();
+
+                for (const auto& calId : calendarIds) {
+                    std::wstring calUrl = L"https://";
+                    calUrl += CALENDAR_API_HOST;
+                    calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
+                    calUrl += queryParams;
+
+                    DWORD httpStatus = 0;
+                    auto body = httpGet(calUrl, g_accessToken, &httpStatus);
+
+                    // 401: アクセストークン失効 → リフレッシュしてリトライ
+                    if (httpStatus == 401) {
+                        writeLog("access token expired (401), refreshing...");
+                        g_accessToken.clear();
+                        g_tokenExpiry = {};
+                        if (!ensureAccessToken()) {
+                            authFailed = true;
+                            break;
+                        }
+                        body = httpGet(calUrl, g_accessToken, &httpStatus);
+                    }
+
+                    if (body.empty()) {
+                        writeLog("poll: calendar " + calId + " failed"
+                            + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
                         continue;
                     }
-                    t0 = GetTickCount64();
-                    body = httpGet(calUrl, g_accessToken, &httpStatus);
+
+                    auto [calEvents, errorMsg] = parseCalendarEvents(body);
+                    if (!errorMsg.empty()) {
+                        writeLog("poll: calendar " + calId + ": " + errorMsg);
+                        continue;
+                    }
+
+                    // カレンダー ID をプレフィックスとして付与（カレンダー間の ID 衝突を防ぐ）
+                    for (auto& ev : calEvents) {
+                        if (!ev.id.empty()) ev.id = calId + "/" + ev.id;
+                    }
+                    events.insert(events.end(), calEvents.begin(), calEvents.end());
+                    anySuccess = true;
                 }
                 ULONGLONG elapsed = GetTickCount64() - t0;
 
-                if (body.empty()) {
-                    std::string err = "HTTP request failed";
-                    if (httpStatus != 0) err += " (status " + std::to_string(httpStatus) + ")";
-                    writeLog(err);
+                if (authFailed) {
+                    showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
+                    waitWithMessages(RETRY_WAIT_MS);
+                    continue;
+                }
+
+                if (!anySuccess) {
+                    writeLog("HTTP request failed");
                     showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
                     waitWithMessages(RETRY_WAIT_MS);
                     continue;
                 }
 
-                auto [events, errorMsg] = parseCalendarEvents(body);
-                if (!errorMsg.empty()) {
-                    writeLog(errorMsg);
-                    showErrorToast(L"API エラー", L"Calendar データの取得に失敗しました");
-                }
-                else {
-                    g_lastErrorToastTime.store(0);
-                    writeLog("poll: " + std::to_string(events.size()) + " events ("
-                        + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
-                }
+                // 複数カレンダーのマージ結果を開始時刻でソート
+                std::sort(events.begin(), events.end(), [](const CalendarEvent& a, const CalendarEvent& b) {
+                    return a.datetime < b.datetime;
+                });
+
+                g_lastErrorToastTime.store(0);
+                writeLog("poll: " + std::to_string(events.size()) + " events ("
+                    + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
 
                 // ポーリング結果を通知スレッドへ渡す
-                if (errorMsg.empty()) {
+                {
                     std::vector<CalendarEvent> prevEvents;
                     {
                         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2770,7 +2817,7 @@ int wmain() {
                     g_cv.notify_one();
                     // 初回ポーリングはベースライン確立のため変更検知をスキップする
                     std::vector<EventChange> changes;
-                    if (!firstPoll) {
+                    if (baselineEstablished) {
                         changes = collectEventChanges(prevEvents, events);
                     }
                     notifyEventChanges(changes);
@@ -2778,7 +2825,8 @@ int wmain() {
                     if (g_hWnd) updateTrayTooltip(g_hWnd);
                 }
 
-                firstPoll = false;
+                firstPoll           = false;
+                baselineEstablished = true;
                 g_lastPollTick.store(GetTickCount64());
                 waitWithMessages(calcSleepUntilNextPoll(pollsPerHour));
             }
