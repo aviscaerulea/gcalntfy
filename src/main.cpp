@@ -203,10 +203,11 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value);
 // ==================== データ構造 ====================
 
 struct CalendarEvent {
-    std::string id;        // Google Calendar イベント id（通知重複防止キー）
-    std::string datetime;
-    std::string content;
-    std::string permalink;
+    std::string      id;              // Google Calendar イベント id（通知重複防止キー）
+    std::string      datetime;
+    std::string      content;
+    std::string      permalink;
+    std::vector<int> reminderMinutes; // イベント個別の追加通知分数（popup のみ。空=追加通知なし）
 };
 
 // parseCalendarEvents の戻り値
@@ -1007,6 +1008,20 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             e.content   = winrt::to_string(ev.GetNamedString(L"summary",  L""));
             e.permalink = winrt::to_string(ev.GetNamedString(L"htmlLink", L""));
 
+            // reminders.overrides の popup エントリを通知分数として収集（useDefault は無視）
+            if (ev.HasKey(L"reminders")) {
+                auto rem = ev.GetNamedObject(L"reminders");
+                if (!rem.GetNamedBoolean(L"useDefault", true) && rem.HasKey(L"overrides")) {
+                    for (auto ov : rem.GetNamedArray(L"overrides")) {
+                        auto o = ov.GetObject();
+                        if (winrt::to_string(o.GetNamedString(L"method", L"")) == "popup") {
+                            auto mins = static_cast<int>(o.GetNamedNumber(L"minutes", 0));
+                            if (mins > 0) e.reminderMinutes.push_back(mins);
+                        }
+                    }
+                }
+            }
+
             if (!e.datetime.empty() && !e.content.empty()) result.events.push_back(std::move(e));
         }
     }
@@ -1034,6 +1049,9 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
             obj.Insert(L"datetime",  JsonValue::CreateStringValue(winrt::to_hstring(e.datetime)));
             obj.Insert(L"content",   JsonValue::CreateStringValue(winrt::to_hstring(e.content)));
             obj.Insert(L"permalink", JsonValue::CreateStringValue(winrt::to_hstring(e.permalink)));
+            JsonArray remArr;
+            for (int m : e.reminderMinutes) remArr.Append(JsonValue::CreateNumberValue(m));
+            obj.Insert(L"reminderMinutes", remArr);
             arr.Append(obj);
         }
         auto json = winrt::to_string(arr.Stringify());
@@ -1105,6 +1123,11 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
             e.datetime  = winrt::to_string(obj.GetNamedString(L"datetime",  L""));
             e.content   = winrt::to_string(obj.GetNamedString(L"content",   L""));
             e.permalink = winrt::to_string(obj.GetNamedString(L"permalink", L""));
+            // reminderMinutes の復元（旧キャッシュ互換: キーなし → 空ベクタ）
+            if (obj.HasKey(L"reminderMinutes")) {
+                for (auto mv : obj.GetNamedArray(L"reminderMinutes"))
+                    e.reminderMinutes.push_back(static_cast<int>(mv.GetNumber()));
+            }
             if (!e.datetime.empty() && !e.content.empty()) events.push_back(std::move(e));
         }
 
@@ -2453,24 +2476,30 @@ static inline std::string eventKey(const CalendarEvent& e) {
 }
 
 // notifiedSet の自然失効: 新リストに含まれないキーを削除する
+//
+// notifiedSet のキーは "eventKey@minutes" 形式。
+// イベントが削除・変更されたとき、対応するすべての "@minutes" エントリを失効させる。
 static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
                              const std::vector<CalendarEvent>& events)
 {
-    std::set<std::string> validKeys;
-    for (const auto& e : events) {
-        validKeys.insert(eventKey(e));
-    }
+    std::set<std::string> validBaseKeys;
+    for (const auto& e : events) validBaseKeys.insert(eventKey(e));
+
     for (auto it = notifiedSet.begin(); it != notifiedSet.end(); ) {
-        it = validKeys.count(*it) ? std::next(it) : notifiedSet.erase(it);
+        // "@minutes" サフィックスを除いたベースキーで照合する
+        auto sep = it->rfind('@');
+        auto base = (sep != std::string::npos) ? it->substr(0, sep) : *it;
+        it = validBaseKeys.count(base) ? std::next(it) : notifiedSet.erase(it);
     }
 }
 
 // 通知スレッド: メインスレッドから予定リストを受け取り、通知を実行する
 //
 // STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
-// イベントごとに notify_minutes 前に通知を発火する。
-// notifiedSet でイベントの通知済み状態を管理し、
-// 全イベントを走査して最小発火時間を求めてから wait_until で待機する。
+// notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
+// 設定されていれば、そのタイミングでも追加通知する（重複分数は 1 回のみ通知）。
+// notifiedSet のキーは "eventKey@minutes" 形式で、同一イベントの異なるタイミングを区別する。
+// 全イベント × 全通知分数を走査して最小発火時間を求めてから wait_until で待機する。
 static void notifyThreadFunc(const std::wstring& exeDir) {
     winrt::init_apartment();
 
@@ -2493,17 +2522,28 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
         // 直近未通知イベントを順次通知する内側ループ
         while (!g_shutdownRequested) {
             auto nowUtc = getCurrentUtcISO();
+            long long leadMs = localConfig.notifyLeadMs;
 
-            // 全イベントを走査して最小発火待機時間を計算
+            // 全イベント × 全通知分数を走査して最小発火待機時間を計算
+            // notifiedSet キーは "eventKey@minutes" 形式
             long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
                 if (diffMs <= 0) {
-                    notifiedSet.insert(eventKey(e));
+                    // 開始済みイベント: 全通知タイミングを通知済みとしてマーク
+                    notifiedSet.insert(eventKey(e) + "@" + std::to_string(leadMs / 60000));
+                    for (int m : e.reminderMinutes)
+                        notifiedSet.insert(eventKey(e) + "@" + std::to_string(m));
                     continue;
                 }
-                if (!notifiedSet.count(eventKey(e)))
-                    minFireMs = (std::min)(minFireMs, diffMs - localConfig.notifyLeadMs);
+                // notify_minutes（ベースライン）+ reminders のすべてのタイミングをチェック
+                auto checkLead = [&](long long leadMsVal) {
+                    auto key = eventKey(e) + "@" + std::to_string(leadMsVal / 60000);
+                    if (!notifiedSet.count(key))
+                        minFireMs = (std::min)(minFireMs, diffMs - leadMsVal);
+                };
+                checkLead(leadMs);
+                for (int m : e.reminderMinutes) checkLead(static_cast<long long>(m) * 60000);
             }
             if (minFireMs == LLONG_MAX) break; // 通知すべき予定なし → 外側ループへ
 
@@ -2517,6 +2557,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 if (g_eventsUpdated) {
                     localEvents     = g_pendingEvents;
                     localConfig     = g_currentConfig;
+                    leadMs          = localConfig.notifyLeadMs;
                     g_eventsUpdated = false;
                     pruneNotifiedSet(notifiedSet, localEvents);
                     continue;
@@ -2525,28 +2566,49 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 nowUtc = getCurrentUtcISO();
             }
 
-            // 発火対象の datetime を特定
+            // 発火対象の (datetime, leadMsVal) を特定
             std::string targetDatetime;
+            long long   targetLeadMs = 0;
             for (const auto& e : localEvents) {
-                if (notifiedSet.count(eventKey(e))) continue;
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
-                if (diffMs > 0 && diffMs - localConfig.notifyLeadMs > 0) continue;
-                targetDatetime = e.datetime;
-                break;
+                if (diffMs <= 0) continue;
+
+                auto tryLead = [&](long long lv) -> bool {
+                    auto key = eventKey(e) + "@" + std::to_string(lv / 60000);
+                    if (!notifiedSet.count(key) && diffMs - lv <= 0) {
+                        targetDatetime = e.datetime;
+                        targetLeadMs   = lv;
+                        return true;
+                    }
+                    return false;
+                };
+                if (tryLead(leadMs)) break;
+                for (int m : e.reminderMinutes)
+                    if (tryLead(static_cast<long long>(m) * 60000)) goto found;
             }
+            found:
             if (targetDatetime.empty()) continue; // 発火対象なし（稀なケース）
 
-            // 同 datetime のイベントをグループ化
+            // 同 datetime かつ同 targetLeadMs のイベントをグループ化
             std::vector<const CalendarEvent*> group;
             for (const auto& e : localEvents) {
                 if (e.datetime != targetDatetime) continue;
-                if (!notifiedSet.count(eventKey(e))) group.push_back(&e);
+                // notify_minutes タイミングか、reminders に含まれるタイミングかをチェック
+                bool isTarget = (targetLeadMs == leadMs);
+                if (!isTarget) {
+                    for (int m : e.reminderMinutes)
+                        if (static_cast<long long>(m) * 60000 == targetLeadMs) { isTarget = true; break; }
+                }
+                if (!isTarget) continue;
+                auto key = eventKey(e) + "@" + std::to_string(targetLeadMs / 60000);
+                if (!notifiedSet.count(key)) group.push_back(&e);
             }
 
             // 通知実行
             auto jstTimeW = utcToJstHHMM(targetDatetime);
             auto jstTime  = wideToUtf8(jstTimeW);
-            writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s))");
+            writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s), "
+                + std::to_string(targetLeadMs / 60000) + "min before)");
             // 音声スキップ判定: 音声通知OFF > マイク/カメラ使用中ミュート > 通常再生
             if (!g_soundEnabled) {
                 writeLog("sound skipped (sound disabled)");
@@ -2559,7 +2621,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             }
             for (const auto* ev : group) {
                 showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
-                notifiedSet.insert(eventKey(*ev));
+                notifiedSet.insert(eventKey(*ev) + "@" + std::to_string(targetLeadMs / 60000));
             }
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
@@ -2728,7 +2790,7 @@ int wmain() {
                 auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
                 auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
                 std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
-                queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus))";
+                queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
                 queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
                 queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
 
