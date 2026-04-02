@@ -2543,7 +2543,16 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                         minFireMs = (std::min)(minFireMs, diffMs - leadMsVal);
                 };
                 checkLead(leadMs);
-                for (int m : e.reminderMinutes) checkLead(static_cast<long long>(m) * 60000);
+                // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす
+                for (int m : e.reminderMinutes) {
+                    long long rmMs = static_cast<long long>(m) * 60000;
+                    if (diffMs - rmMs < 0) {
+                        notifiedSet.insert(eventKey(e) + "@" + std::to_string(m));
+                    }
+                    else {
+                        checkLead(rmMs);
+                    }
+                }
             }
             if (minFireMs == LLONG_MAX) break; // 通知すべき予定なし → 外側ループへ
 
