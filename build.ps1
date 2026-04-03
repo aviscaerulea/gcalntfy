@@ -2,6 +2,7 @@
 # gcalntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
 param([string]$Version = "0.0.0")
+$Version = $Version -replace '^v', ''
 
 # VS 開発環境の初期化（DevShell モジュール経由、Build Tools 対応）
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
