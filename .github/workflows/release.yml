@@ -2,8 +2,8 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -13,11 +13,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Extract version
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${GITHUB_EVENT_RELEASE_TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_EVENT_RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
 
       - name: Create .env
         shell: bash
@@ -39,12 +43,13 @@ jobs:
             -DestinationPath "out\gcalntfy-${{ steps.version.outputs.version }}-x64.zip" `
             -Force
 
-      - name: Create draft release
+      - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "out/gcalntfy-${{ steps.version.outputs.version }}-x64.zip" \
-            --title "$GITHUB_REF_NAME" \
-            --draft
+          gh release upload "$TAG" \
+            "out/gcalntfy-${VERSION}-x64.zip" \
+            --clobber
