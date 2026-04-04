@@ -21,7 +21,7 @@ gcalntfy
 
 ## 動作
 
-- OAuth 2.0 で Google Calendar API をポーリングし、当日の予定を取得
+- OAuth 2.0 で Google Calendar API をポーリングし、当日の予定を取得（「タスク」は API 経由で時刻情報を得られないため非対応）
 - 起動すると常駐し、`gcalntfy.toml` の `schedule` に従って当日の Calendar イベントをポーリング
 - 次のイベントの `notify_minutes` 分前（デフォルト 5 分）に Windows Toast 通知を表示し、exe 同フォルダの `sound.wav`（チャイム音）を再生。音声ファイルがない場合は Toast 通知のみ
 - 日付が変わると通知済みセットをリセットして当日分を再取得
@@ -91,4 +91,3 @@ task build
 Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。成果物は `out/gcalntfy.exe`。
 
 ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定すること。
-
