@@ -39,3 +39,12 @@ tasks:
         -Path out\gcalntfy.exe, gcalntfy.toml, out\sound.wav, out\app.ico
         -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
         -Force'
+
+  rebuild:
+    desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
+    cmds:
+      - cmd: taskkill //F //IM gcalntfy.exe
+        ignore_error: true
+      - task: clean
+      - task: build
+      - pwsh.exe -NoProfile -Command "Start-Process 'out/gcalntfy.exe'"
