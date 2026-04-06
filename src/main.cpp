@@ -2774,10 +2774,12 @@ int wmain() {
                 GetSystemTime(&utcNow);
                 auto jstNow = utcToJst(utcNow);
 
-                // 日付変更: 強制ポーリングを促す（notifiedSet は通知スレッドが自然失効で管理）
+                // 日付変更: 強制ポーリングと変更検知ベースラインをリセットする
+                // notifiedSet は通知スレッドが自然失効で管理する
                 if (static_cast<int>(jstNow.wDay) != lastJstDay) {
-                    lastJstDay = static_cast<int>(jstNow.wDay);
-                    firstPoll = true;
+                    lastJstDay          = static_cast<int>(jstNow.wDay);
+                    firstPoll           = true;
+                    baselineEstablished = false;
                 }
 
                 int pollsPerHour = cfg.schedule[jstNow.wHour];
@@ -2886,10 +2888,26 @@ int wmain() {
                         g_eventsUpdated = true;
                     }
                     g_cv.notify_one();
-                    // 初回ポーリングはベースライン確立のため変更検知をスキップする
+                    // 変更検知は当日の予定のみを対象とする
+                    // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
+                    // jstNow の年月日と一致するイベントのみ true を返す
+                    auto isToday = [&](const CalendarEvent& e) {
+                        auto jst = utcIsoToJstSt(e.datetime);
+                        return jst && jst->wYear == jstNow.wYear
+                                   && jst->wMonth == jstNow.wMonth
+                                   && jst->wDay == jstNow.wDay;
+                    };
+                    std::vector<CalendarEvent> todayPrev, todayNew;
+                    for (const auto& e : prevEvents) {
+                        if (isToday(e)) todayPrev.push_back(e);
+                    }
+                    for (const auto& e : events) {
+                        if (isToday(e)) todayNew.push_back(e);
+                    }
+
                     std::vector<EventChange> changes;
                     if (baselineEstablished) {
-                        changes = collectEventChanges(prevEvents, events);
+                        changes = collectEventChanges(todayPrev, todayNew);
                     }
                     notifyEventChanges(changes);
                     saveCacheFile(exeDir, events);
