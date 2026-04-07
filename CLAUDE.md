@@ -19,5 +19,3 @@ GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxx
 ```
 
 ## 参考
-
-@.claude/rules/README_gcalntfy.md
