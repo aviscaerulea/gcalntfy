@@ -124,10 +124,10 @@ static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 
 // BLE ヘッドホン対処：冒頭不可聴トーンの時間（ミリ秒）
-static constexpr int BLE_LEADING_TONE_MS = 1500;
+static constexpr int BLE_LEADING_TONE_MS = 1200;
 
 // BLE ヘッドホン対処：末尾不可聴トーンの時間（ミリ秒）
-static constexpr int BLE_TRAILING_TONE_MS = 2000;
+static constexpr int BLE_TRAILING_TONE_MS = 1200;
 
 // 不可聴トーンの周波数（Hz）。BLE デバイスの省電力移行を防止する
 static constexpr int TONE_FREQ_HZ = 19000;
