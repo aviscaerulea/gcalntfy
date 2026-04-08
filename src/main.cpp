@@ -216,8 +216,6 @@ struct Config {
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
     bool  guardEnabled;     // ガードトーン有効/無効（デフォルト true）
-    float guardFrequency;   // トーン周波数 Hz（デフォルト 19000.0）
-    float guardAmplitude;   // トーン振幅（デフォルト 0.001）
     float guardLeadIn;      // リードイン秒数（デフォルト 1.2）
     float guardLeadOut;     // リードアウト秒数（デフォルト 1.2）
 
@@ -1261,11 +1259,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     };
 
     // [guard] ガードトーン設定
-    cfg.guardEnabled   = readConfigBool("guard", "enabled", true);
-    cfg.guardFrequency = readConfigFloat("guard", "frequency", 19000.0f, 100.0f, 22000.0f);
-    cfg.guardAmplitude = readConfigFloat("guard", "amplitude", 0.001f, 0.0f, 1.0f);
-    cfg.guardLeadIn    = readConfigFloat("guard", "lead_in_duration", 1.2f, 0.0f, 5.0f);
-    cfg.guardLeadOut   = readConfigFloat("guard", "lead_out_duration", 1.2f, 0.0f, 5.0f);
+    cfg.guardEnabled = readConfigBool("guard", "enabled", true);
+    cfg.guardLeadIn  = readConfigFloat("guard", "lead_in_duration", 1.2f, 0.0f, 5.0f);
+    cfg.guardLeadOut = readConfigFloat("guard", "lead_out_duration", 1.2f, 0.0f, 5.0f);
 
     // [loudness] ラウドネスノーマライズ設定
     cfg.loudnessEnabled     = readConfigBool("loudness", "enabled", true);
@@ -1727,18 +1723,21 @@ cleanup:
 // サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
 // phase はバッファ分割供給間で位相を維持するための参照引数。
 static void fillToneBuffer(BYTE* buf, UINT32 frames,
-                           const WAVEFORMATEX& wavFmt, double& phase,
-                           float freq, float amplitude) {
+                           const WAVEFORMATEX& wavFmt, double& phase) {
+    // BLE 省電力モード抑止用の不可聴高周波トーン固定パラメータ
+    constexpr float FREQ      = 19000.0f; // 周波数 Hz（成人不可聴域）
+    constexpr float AMPLITUDE = 0.001f;   // 振幅（約 -60 dB）
+
     // ナイキスト周波数チェック（例：44.1kHz のナイキスト = 22.05kHz）
-    if (static_cast<double>(freq) >= static_cast<double>(wavFmt.nSamplesPerSec) / 2.0) {
+    if (static_cast<double>(FREQ) >= static_cast<double>(wavFmt.nSamplesPerSec) / 2.0) {
         // フォールバック：完全無音（ナイキスト以上の周波数は表現不可）
         memset(buf, 0, frames * wavFmt.nBlockAlign);
         return;
     }
 
     int16_t* samples   = reinterpret_cast<int16_t*>(buf);
-    double   phaseStep = 2.0 * PI * freq / wavFmt.nSamplesPerSec;
-    float    ampFloat  = amplitude * 32767.0f;
+    double   phaseStep = 2.0 * PI * FREQ / wavFmt.nSamplesPerSec;
+    float    ampFloat  = AMPLITUDE * 32767.0f;
 
     for (UINT32 i = 0; i < frames; i++) {
         int16_t sampleValue = static_cast<int16_t>(ampFloat * std::sin(phase));
@@ -1829,8 +1828,7 @@ static bool playWavToWasapi(const Config& cfg) {
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
                 if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    fillToneBuffer(buf, frames, wavFmt, phase,
-                                   cfg.guardFrequency, cfg.guardAmplitude);
+                    fillToneBuffer(buf, frames, wavFmt, phase);
                     render->ReleaseBuffer(frames, 0);
                 }
                 written += frames;
