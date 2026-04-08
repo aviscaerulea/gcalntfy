@@ -29,6 +29,9 @@ jobs:
           echo "GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }}" > .env
           echo "GOOGLE_CLIENT_SECRET=${{ secrets.GOOGLE_CLIENT_SECRET }}" >> .env
 
+      - name: Install vcpkg packages
+        run: vcpkg install ebur128:x64-windows-static
+
       - name: Build
         shell: pwsh
         run: |
