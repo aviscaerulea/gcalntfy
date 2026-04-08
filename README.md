@@ -76,6 +76,20 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 # 追加でポーリングするカレンダー ID（primary は常に有効）
 # カレンダー ID は Google Calendar の「設定」→「カレンダーの統合」で確認できる
 # ext_calendar_ids = ["abc123@group.calendar.google.com"]
+
+# ガードトーン設定（BLE ヘッドホン対処）
+[guard]
+# enabled = true           # ガードトーンの有効/無効（デフォルト: true）
+# frequency = 19000.0      # トーン周波数 Hz（デフォルト: 19000.0）
+# amplitude = 0.001        # トーン振幅（デフォルト: 0.001 ≈ -60dB）
+# lead_in_duration = 1.2   # リードイン秒数（デフォルト: 1.2）
+# lead_out_duration = 1.2  # リードアウト秒数（デフォルト: 1.2）
+
+# ラウドネスノーマライズ設定
+[loudness]
+# enabled = true           # 有効/無効（デフォルト: true）
+# target = -16.0           # 目標ラウドネス LUFS（デフォルト: -16.0）
+# peak_ceiling = 0.891     # トゥルーピーク上限（デフォルト: 0.891 = -1 dBFS）
 ```
 
 ## 初回起動時の認証

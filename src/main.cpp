@@ -13,11 +13,14 @@
  *   2  - 予期しない初期化エラー
  *
  * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
- * 外部依存: なし
+ * 外部依存: libebur128（vcpkg: libebur128:x64-windows-static）
  * ビルド: rc /nologo resource.rc
  *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
  *             /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
  */
+
+// ebur128 は windows.h より先にインクルードする（ヘッダ内マクロ衝突回避）
+#include <ebur128.h>
 
 // C++/WinRT ヘッダは windows.h より先にインクルードする
 #include <winrt/base.h>
@@ -123,18 +126,6 @@ static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
 static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 
-// BLE ヘッドホン対処：冒頭不可聴トーンの時間（ミリ秒）
-static constexpr int BLE_LEADING_TONE_MS = 1200;
-
-// BLE ヘッドホン対処：末尾不可聴トーンの時間（ミリ秒）
-static constexpr int BLE_TRAILING_TONE_MS = 1200;
-
-// 不可聴トーンの周波数（Hz）。BLE デバイスの省電力移行を防止する
-static constexpr int TONE_FREQ_HZ = 19000;
-
-// 不可聴トーンの振幅（int16_t、フルスケール 32767 の約 3%）
-static constexpr int TONE_AMPLITUDE = 1000;
-
 // 円周率（MSVC では M_PI に _USE_MATH_DEFINES が必要なため自前定義）
 static constexpr double PI = 3.14159265358979323846;
 
@@ -222,7 +213,27 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
+
+    // [guard] ガードトーン設定（BLE ヘッドホン対処）
+    bool  guardEnabled;     // ガードトーン有効/無効（デフォルト true）
+    float guardFrequency;   // トーン周波数 Hz（デフォルト 19000.0）
+    float guardAmplitude;   // トーン振幅（デフォルト 0.001）
+    float guardLeadIn;      // リードイン秒数（デフォルト 1.2）
+    float guardLeadOut;     // リードアウト秒数（デフォルト 1.2）
+
+    // [loudness] ラウドネスノーマライズ設定
+    bool  loudnessEnabled;      // ノーマライズ有効/無効（デフォルト true）
+    float loudnessTarget;       // 目標ラウドネス LUFS（デフォルト -16.0）
+    float loudnessPeakCeiling;  // ピーク上限（デフォルト 0.891 = -1 dBFS）
 };
+
+// ノーマライズ済み WAV データキャッシュ（起動時に 1 回だけ構築する）
+struct WavCache {
+    std::vector<int16_t> samples;
+    WAVEFORMATEX         fmt;
+    bool                 valid = false;
+};
+static WavCache g_wavCache;
 
 // メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
 static std::mutex              g_mtx;
@@ -239,8 +250,8 @@ static HANDLE g_soundThread = nullptr;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
-    std::wstring                                    soundPath; // 通知音フルパス
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted;     // ミュート済みセッション（復元用）
+    Config                                          cfg;   // 再生時の設定
+    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted; // ミュート済みセッション（復元用）
 };
 
 // ==================== ユーティリティ ====================
@@ -1236,6 +1247,31 @@ static Config loadConfig(const std::wstring& exeDir) {
     notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
+    // [guard] / [loudness] セクション読み込みヘルパー
+    auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
+        if (local && (*local)[section][key].is_boolean()) return **(*local)[section][key].as_boolean();
+        if (base && (*base)[section][key].is_boolean())   return **(*base)[section][key].as_boolean();
+        return def;
+    };
+    auto readConfigFloat = [&](const char* section, const char* key, float def, float lo, float hi) -> float {
+        double v = def;
+        if (local && (*local)[section][key].is_number()) v = (*local)[section][key].value_or(def);
+        else if (base && (*base)[section][key].is_number()) v = (*base)[section][key].value_or(def);
+        return static_cast<float>((std::max)((double)lo, (std::min)((double)hi, v)));
+    };
+
+    // [guard] ガードトーン設定
+    cfg.guardEnabled   = readConfigBool("guard", "enabled", true);
+    cfg.guardFrequency = readConfigFloat("guard", "frequency", 19000.0f, 100.0f, 22000.0f);
+    cfg.guardAmplitude = readConfigFloat("guard", "amplitude", 0.001f, 0.0f, 1.0f);
+    cfg.guardLeadIn    = readConfigFloat("guard", "lead_in_duration", 1.2f, 0.0f, 5.0f);
+    cfg.guardLeadOut   = readConfigFloat("guard", "lead_out_duration", 1.2f, 0.0f, 5.0f);
+
+    // [loudness] ラウドネスノーマライズ設定
+    cfg.loudnessEnabled     = readConfigBool("loudness", "enabled", true);
+    cfg.loudnessTarget      = readConfigFloat("loudness", "target", -16.0f, -60.0f, 0.0f);
+    cfg.loudnessPeakCeiling = readConfigFloat("loudness", "peak_ceiling", 0.891f, 0.1f, 1.0f);
+
     return cfg;
 }
 
@@ -1540,57 +1576,76 @@ static bool isMeetingActive() {
     return isMicCaptureActive(); // レジストリ未検出分の補完
 }
 
-// ==================== 通知音再生 ====================
+// ==================== 通知音前処理 ====================
 
-// WASAPI バッファに不可聴正弦波を書き込む
+// WAV の 16bit PCM サンプルにラウドネスノーマライズを適用する
 //
-// サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
-// phase はバッファ分割供給間で位相を維持するための参照引数。
-static void fillToneBuffer(BYTE* buf, UINT32 frames,
-                           const WAVEFORMATEX& wavFmt, double& phase) {
-    // ナイキスト周波数チェック（例：44.1kHz のナイキスト = 22.05kHz）
-    if (TONE_FREQ_HZ >= static_cast<int>(wavFmt.nSamplesPerSec / 2)) {
-        // フォールバック：完全無音（ナイキスト以上の周波数は表現不可）
-        memset(buf, 0, frames * wavFmt.nBlockAlign);
+// EBU R128 に基づく統合ラウドネス測定（libebur128）でゲインを算出し、
+// 全サンプルに乗算する。peak_ceiling を超える場合はゲインを制限する。
+// ほぼ無音（ピーク < 1e-6f）の場合はスキップする。
+static void normalizeLoudness(std::vector<int16_t>& samples, int channels,
+                              int sampleRate, float target, float peakCeiling) {
+    if (samples.empty()) return;
+
+    UINT32 frames = static_cast<UINT32>(samples.size()) / channels;
+    std::vector<float> flt(samples.size());
+    for (size_t i = 0; i < samples.size(); i++)
+        flt[i] = static_cast<float>(samples[i]) / 32768.0f;
+
+    // ピーク確認（ほぼ無音はスキップ）
+    float peak = 0.0f;
+    for (float s : flt) {
+        float v = std::fabs(s);
+        if (v > peak) peak = v;
+    }
+    if (peak < 1e-6f) return;
+
+    // 統合ラウドネス測定
+    ebur128_state* state = ebur128_init(
+        static_cast<unsigned>(channels),
+        static_cast<unsigned long>(sampleRate),
+        EBUR128_MODE_I);
+    if (!state) return;
+
+    if (ebur128_add_frames_float(state, flt.data(), frames) != EBUR128_SUCCESS) {
+        ebur128_destroy(&state);
         return;
     }
 
-    int16_t* samples = reinterpret_cast<int16_t*>(buf);
-    double phaseStep = 2.0 * PI * TONE_FREQ_HZ / wavFmt.nSamplesPerSec;
+    double loudness = 0.0;
+    int result = ebur128_loudness_global(state, &loudness);
+    ebur128_destroy(&state);
 
-    for (UINT32 i = 0; i < frames; i++) {
-        int16_t sampleValue = static_cast<int16_t>(TONE_AMPLITUDE * std::sin(phase));
-        for (int ch = 0; ch < wavFmt.nChannels; ch++) {
-            samples[i * wavFmt.nChannels + ch] = sampleValue;
-        }
-        phase += phaseStep;
+    if (result != EBUR128_SUCCESS || std::isinf(loudness)) return;
+
+    float gain = static_cast<float>(std::pow(10.0, (target - loudness) / 20.0));
+    if (peak * gain > peakCeiling) gain = peakCeiling / peak;
+
+    for (int16_t& s : samples) {
+        float v = static_cast<float>(s) * gain;
+        if (v > 32767.0f)  v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        s = static_cast<int16_t>(v);
     }
-
-    // 位相を [0, 2π) に正規化（精度維持）
-    phase = std::fmod(phase, 2.0 * PI);
 }
 
-// WAV ファイルを WASAPI 共有モードで再生する
+// WAV ファイルを読み込み、ラウドネスノーマライズを適用して g_wavCache に格納する
 //
-// path: 再生ファイルのフルパス（16bit PCM WAV のみ対応）
-// withBleTone: true で冒頭 BLE_LEADING_TONE_MS 分の 19kHz 不可聴トーンを挿入し、末尾 BLE_TRAILING_TONE_MS 分のトーンを追加する（BLE ヘッドホン対処）
-// 戻り値: 再生成功なら true
-//
-// WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
-// g_shutdownRequested が true になると再生を中断する。
-static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+// 起動時（設定読み込み後）に 1 回だけ呼び出す。以降の再生は g_wavCache を使い回す。
+// 16bit PCM WAV のみ対応。ファイルが存在しない場合は g_wavCache.valid = false のまま。
+static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
+    g_wavCache = WavCache{};  // リセット
+
+    std::wstring soundPath = exeDir + L"\\" + DEFAULT_SOUND_FILE;
+    HANDLE hFile = CreateFileW(soundPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        writeLog("playWavToWasapi: CreateFileW failed");
-        return false;
+        writeLog("loadWavAndNormalize: sound.wav not found");
+        return;
     }
 
-    bool ok         = false;
-    HANDLE hEvent   = nullptr;
-    WAVEFORMATEX wavFmt   = {};
-    DWORD dataStart       = 0;
-    DWORD totalFrames     = 0;
+    WAVEFORMATEX wavFmt = {};
+    std::vector<int16_t> samples;
 
     // RIFF/WAVE ヘッダ検証
     {
@@ -1598,17 +1653,17 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
         DWORD nRead = 0;
         ReadFile(hFile, buf, 12, &nRead, nullptr);
         if (nRead != 12 || memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) {
-            writeLog("playWavToWasapi: invalid RIFF/WAVE header");
+            writeLog("loadWavAndNormalize: invalid RIFF/WAVE header");
             goto cleanup;
         }
     }
 
-    // チャンク走査: "fmt " と "data" を探す
+    // チャンク走査
     {
         bool hasFmt  = false;
         bool hasData = false;
         while (!hasData) {
-            char id[4]      = {};
+            char  id[4]     = {};
             DWORD chunkSize = 0;
             DWORD nRead     = 0;
             if (!ReadFile(hFile, id, 4, &nRead, nullptr) || nRead != 4) break;
@@ -1621,30 +1676,99 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
                     SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
                 if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
                         || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0) {
-                    writeLog("playWavToWasapi: unsupported format, only 16bit PCM WAV is supported");
+                    writeLog("loadWavAndNormalize: unsupported format, only 16bit PCM WAV is supported");
                     goto cleanup;
                 }
                 hasFmt = true;
             }
             else if (memcmp(id, "data", 4) == 0) {
                 if (!hasFmt) {
-                    writeLog("playWavToWasapi: data chunk before fmt chunk");
+                    writeLog("loadWavAndNormalize: data chunk before fmt chunk");
                     goto cleanup;
                 }
-                totalFrames = chunkSize / wavFmt.nBlockAlign;
-                dataStart   = SetFilePointer(hFile, 0, nullptr, FILE_CURRENT);
-                hasData     = true;
+                // data チャンク全体を一括読み込み
+                DWORD totalBytes = chunkSize;
+                samples.resize(totalBytes / sizeof(int16_t));
+                ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr);
+                samples.resize(nRead / sizeof(int16_t));
+                hasData = true;
             }
             else {
-                // 不明チャンクはスキップ（偶数バイト境界に合わせる）
                 SetFilePointer(hFile, (LONG)((chunkSize + 1) & ~1u), nullptr, FILE_CURRENT);
             }
         }
         if (!hasFmt || !hasData) {
-            writeLog("playWavToWasapi: fmt or data chunk not found");
+            writeLog("loadWavAndNormalize: fmt or data chunk not found");
             goto cleanup;
         }
     }
+
+    // ラウドネスノーマライズ
+    if (cfg.loudnessEnabled) {
+        normalizeLoudness(samples, wavFmt.nChannels, (int)wavFmt.nSamplesPerSec,
+                          cfg.loudnessTarget, cfg.loudnessPeakCeiling);
+        writeLog("loadWavAndNormalize: normalization applied (target="
+            + std::to_string((int)cfg.loudnessTarget) + " LUFS)");
+    }
+
+    g_wavCache.samples = std::move(samples);
+    g_wavCache.fmt     = wavFmt;
+    g_wavCache.valid   = true;
+    writeLog("loadWavAndNormalize: loaded sound.wav");
+
+cleanup:
+    CloseHandle(hFile);
+}
+
+// ==================== 通知音再生 ====================
+
+// WASAPI バッファに不可聴正弦波を書き込む
+//
+// サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
+// phase はバッファ分割供給間で位相を維持するための参照引数。
+static void fillToneBuffer(BYTE* buf, UINT32 frames,
+                           const WAVEFORMATEX& wavFmt, double& phase,
+                           float freq, float amplitude) {
+    // ナイキスト周波数チェック（例：44.1kHz のナイキスト = 22.05kHz）
+    if (static_cast<double>(freq) >= static_cast<double>(wavFmt.nSamplesPerSec) / 2.0) {
+        // フォールバック：完全無音（ナイキスト以上の周波数は表現不可）
+        memset(buf, 0, frames * wavFmt.nBlockAlign);
+        return;
+    }
+
+    int16_t* samples   = reinterpret_cast<int16_t*>(buf);
+    double   phaseStep = 2.0 * PI * freq / wavFmt.nSamplesPerSec;
+    float    ampFloat  = amplitude * 32767.0f;
+
+    for (UINT32 i = 0; i < frames; i++) {
+        int16_t sampleValue = static_cast<int16_t>(ampFloat * std::sin(phase));
+        for (int ch = 0; ch < wavFmt.nChannels; ch++) {
+            samples[i * wavFmt.nChannels + ch] = sampleValue;
+        }
+        phase += phaseStep;
+    }
+
+    // 位相を [0, 2π) に正規化（精度維持）
+    phase = std::fmod(phase, 2.0 * PI);
+}
+
+// g_wavCache のノーマライズ済み PCM データを WASAPI 共有モードで再生する
+//
+// 再生フロー（guardEnabled が true の場合）:
+//   ガードトーン（リードイン） → 通知音（チャイム）→ ガードトーン（リードアウト）
+// g_wavCache.valid == false（sound.wav なし）の場合は何もしない。
+// WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
+// g_shutdownRequested が true になると再生を中断する。
+static bool playWavToWasapi(const Config& cfg) {
+    if (!g_wavCache.valid) return false;
+
+    const WAVEFORMATEX& wavFmt     = g_wavCache.fmt;
+    const int16_t*      pcmData    = g_wavCache.samples.data();
+    UINT32              totalFrames = static_cast<UINT32>(g_wavCache.samples.size())
+                                      / wavFmt.nChannels;
+
+    bool   ok     = false;
+    HANDLE hEvent = nullptr;
 
     // WASAPI デバイス初期化・再生
     {
@@ -1692,12 +1816,10 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
         UINT32 bufFrames = 0;
         client->GetBufferSize(&bufFrames);
 
-        // 冒頭不可聴トーン挿入（BLE ヘッドホン対処：省電力移行防止）
-        if (withBleTone) {
-            UINT32 toneFrames = wavFmt.nSamplesPerSec * BLE_LEADING_TONE_MS / 1000;
-            UINT32 written    = 0;
-            double phase      = 0.0;
-            client->Start();
+        // ガードトーン供給ループ（冒頭・末尾共用）
+        auto runToneLoop = [&](UINT32 toneFrames) {
+            UINT32 written = 0;
+            double phase   = 0.0;
             while (written < toneFrames && !g_shutdownRequested) {
                 WaitForSingleObject(hEvent, 200);
                 UINT32 padding = 0;
@@ -1707,21 +1829,26 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
                 if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    fillToneBuffer(buf, frames, wavFmt, phase);
+                    fillToneBuffer(buf, frames, wavFmt, phase,
+                                   cfg.guardFrequency, cfg.guardAmplitude);
                     render->ReleaseBuffer(frames, 0);
                 }
                 written += frames;
             }
+        };
+
+        // 冒頭ガードトーン（BLE ヘッドホン対処：省電力移行防止）
+        if (cfg.guardEnabled && cfg.guardLeadIn > 0.0f) {
+            UINT32 toneFrames = static_cast<UINT32>(wavFmt.nSamplesPerSec * cfg.guardLeadIn);
+            client->Start();
+            runToneLoop(toneFrames);
             client->Stop();
             client->Reset();
         }
 
-        // data チャンク先頭にシーク（BLE 無音のあり/なしに関わらず一定位置から開始）
-        SetFilePointer(hFile, (LONG)dataStart, nullptr, FILE_BEGIN);
-
-        // WAV PCM 供給ループ
-        DWORD sentFrames = 0;
-        bool eof = false;
+        // WAV PCM 供給ループ（メモリバッファから読み込み）
+        UINT32 sentFrames = 0;
+        bool   eof        = false;
         client->Start();
         while (!eof && !g_shutdownRequested) {
             WaitForSingleObject(hEvent, 200);
@@ -1745,33 +1872,17 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
 
             BYTE* buf = nullptr;
             if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                DWORD nActual = 0;
-                ReadFile(hFile, buf, frames * wavFmt.nBlockAlign, &nActual, nullptr);
-                UINT32 framesRead = nActual / wavFmt.nBlockAlign;
-                render->ReleaseBuffer(framesRead, 0);
-                sentFrames += framesRead;
+                memcpy(buf, pcmData + sentFrames * wavFmt.nChannels,
+                       frames * wavFmt.nBlockAlign);
+                render->ReleaseBuffer(frames, 0);
+                sentFrames += frames;
             }
         }
 
-        // 末尾不可聴トーン挿入（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
-        if (withBleTone && eof) {
-            UINT32 trailFrames = wavFmt.nSamplesPerSec * BLE_TRAILING_TONE_MS / 1000;
-            UINT32 written     = 0;
-            double phase       = 0.0;
-            while (written < trailFrames && !g_shutdownRequested) {
-                WaitForSingleObject(hEvent, 200);
-                UINT32 padding = 0;
-                client->GetCurrentPadding(&padding);
-                UINT32 avail  = bufFrames - padding;
-                UINT32 frames = min(avail, trailFrames - written);
-                if (frames == 0) continue;
-                BYTE* buf = nullptr;
-                if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    fillToneBuffer(buf, frames, wavFmt, phase);
-                    render->ReleaseBuffer(frames, 0);
-                }
-                written += frames;
-            }
+        // 末尾ガードトーン（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
+        if (cfg.guardEnabled && cfg.guardLeadOut > 0.0f && eof) {
+            UINT32 trailFrames = static_cast<UINT32>(wavFmt.nSamplesPerSec * cfg.guardLeadOut);
+            runToneLoop(trailFrames);
         }
 
         client->Stop();
@@ -1780,21 +1891,20 @@ static bool playWavToWasapi(const std::wstring& path, bool withBleTone) {
 
 cleanup:
     if (hEvent) CloseHandle(hEvent);
-    CloseHandle(hFile);
     return ok;
 }
 
 // 通知音を再生し、ダッキング解除するスレッド関数
 //
 // STA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
-// 末尾 BLE_TRAILING_TONE_MS 分のトーン再生完了後にダッキングを解除する。
+// 末尾ガードトーン再生完了後にダッキングを解除する。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     auto* ctx  = static_cast<SoundContext*>(param);
     bool comOk = (hr == S_OK || hr == S_FALSE);
 
     if (comOk) {
-        playWavToWasapi(ctx->soundPath, true);
+        playWavToWasapi(ctx->cfg);
 
         if (!ctx->muted.empty()) {
             unduckAudioSessions(ctx->muted);
@@ -1813,16 +1923,13 @@ static DWORD WINAPI soundThread(LPVOID param) {
 
 // WASAPI で通知音（16bit PCM WAV）を再生する
 //
-// 再生フロー:
-//   BLE 19kHz トーン（冒頭 BLE_LEADING_TONE_MS） → 通知音（チャイム）→ BLE 19kHz トーン（末尾 BLE_TRAILING_TONE_MS）
-// 通知音ファイルが存在しない場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
+// 再生フロー（guard.enabled が true の場合）:
+//   ガードトーン（リードイン）→ 通知音（チャイム）→ ガードトーン（リードアウト）
+// g_wavCache.valid == false の場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
-//             末尾トーン（2.0 秒）再生の後にダッキングを解除する。
-static void launchSound(const std::wstring& exeDir, const Config& cfg) {
-    // 通知音ファイルの存在確認（exe 同ディレクトリ）
-    std::wstring soundPath = exeDir + L"\\" + DEFAULT_SOUND_FILE;
-    if (GetFileAttributesW(soundPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        writeLog("launchSound: sound.wav not found, skipping sound");
+static void launchSound(const Config& cfg) {
+    if (!g_wavCache.valid) {
+        writeLog("launchSound: sound.wav not loaded, skipping sound");
         return;
     }
 
@@ -1831,8 +1938,8 @@ static void launchSound(const std::wstring& exeDir, const Config& cfg) {
 
     // スレッドで再生（通知音 → ダッキング解除）
     auto* ctx = new SoundContext{
-        .soundPath = soundPath,
-        .muted     = std::move(mutedSessions)
+        .cfg   = cfg,
+        .muted = std::move(mutedSessions)
     };
     // 前回スレッドが完了していれば解放（通常はとっくに終わっているが念のため）
     if (g_soundThread) {
@@ -2626,7 +2733,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 writeLog("sound skipped (mic/camera in use)");
             }
             else {
-                launchSound(exeDir, localConfig);
+                launchSound(localConfig);
             }
             for (const auto* ev : group) {
                 showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
@@ -2719,6 +2826,9 @@ int wmain() {
 
         auto cfg = loadConfig(exeDir);
         g_currentConfig = cfg;  // 通知スレッドへの初期設定（起動時のみ）
+
+        // 通知音を読み込みノーマライズしてキャッシュに格納（以降の再生はキャッシュを使用）
+        loadWavAndNormalize(exeDir, cfg);
 
         addTrayIcon(g_hWnd);
 

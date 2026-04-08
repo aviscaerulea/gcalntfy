@@ -6,6 +6,27 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $Version = $Version -replace '^v', ''
 
+# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シム の優先順）
+if ($env:VCPKG_INSTALLATION_ROOT) {
+    $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+}
+else {
+    $vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
+    $vcpkgRoot = Split-Path $vcpkgCmd
+    $shimFile = [System.IO.Path]::ChangeExtension($vcpkgCmd, ".shim")
+    if (Test-Path $shimFile) {
+        $vcpkgReal = (Get-Content $shimFile |
+            Where-Object { $_ -match "^path" } |
+            ForEach-Object { ($_ -split '"')[1] } |
+            Select-Object -First 1)
+        if ($vcpkgReal) {
+            $vcpkgRoot = Split-Path $vcpkgReal
+        }
+    }
+}
+$vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
+$vcpkgLib     = "$vcpkgRoot\installed\x64-windows-static\lib"
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe が見つからない: $vswhere"; exit 1 }
 $vsPath = & $vswhere -products '*' -latest -property installationPath
@@ -35,9 +56,10 @@ if (-not $envVars['GOOGLE_CLIENT_ID'] -or -not $envVars['GOOGLE_CLIENT_SECRET'])
 #define OAUTH_CLIENT_SECRET L"$($envVars['GOOGLE_CLIENT_SECRET'])"
 "@ | Set-Content -Encoding UTF8NoBOM out\oauth.h
 
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ `
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /I out\ /I "$vcpkgInclude" `
     /Foout\ /Feout\gcalntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup `
-    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib gdi32.lib
+    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib bcrypt.lib ws2_32.lib gdi32.lib `
+    "$vcpkgLib\ebur128.lib"
 if ($LASTEXITCODE) { exit 1 }
