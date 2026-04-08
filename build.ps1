@@ -27,6 +27,10 @@ else {
 $vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
 $vcpkgLib     = "$vcpkgRoot\installed\x64-windows-static\lib"
 
+# 依存ライブラリのインストール（未インストール時のみ実行）
+& "$vcpkgRoot\vcpkg.exe" install ebur128:x64-windows-static
+if ($LASTEXITCODE) { exit 1 }
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe が見つからない: $vswhere"; exit 1 }
 $vsPath = & $vswhere -products '*' -latest -property installationPath
