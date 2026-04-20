@@ -94,7 +94,8 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
 // トレイアイコン用メッセージ ID
-static constexpr UINT WM_TRAYICON = WM_USER + 1;
+static constexpr UINT WM_TRAYICON        = WM_USER + 1;
+static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
 
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_RESTART          = 40001;
@@ -241,7 +242,10 @@ static Config                  g_currentConfig;
 static bool                    g_eventsUpdated = false;
 // トレイアイコンのバッジ状態
 // NIM_MODIFY の無駄な呼び出しを抑制するために直前のバッジ有無を保持する
-static bool                    g_trayBadgeActive = false;
+static bool                    g_trayBadgeActive  = false;
+// updateTrayTooltip のリエントランシーガード
+// Shell_NotifyIconW が内部でメッセージポンプして WM_TIMER 等を呼ぶことへの対処
+static bool                    g_tooltipUpdating  = false;
 
 // 通知音再生スレッドのハンドル（notifyThreadFunc のみがアクセスし、シャットダウン時に join する）
 static HANDLE g_soundThread = nullptr;
@@ -2255,6 +2259,8 @@ static void clearTrayTooltip(HWND hWnd) {
 // ポップアップメニュー表示中は更新しない
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
+    if (g_tooltipUpdating) return;
+    g_tooltipUpdating = true;
     std::vector<CalendarEvent> events;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2278,6 +2284,7 @@ static void updateTrayTooltip(HWND hWnd) {
         wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     updateTrayIcon(hWnd, count > 0);
+    g_tooltipUpdating = false;
 }
 
 // トレイアイコンを除去する
@@ -2384,6 +2391,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             g_popupShowing.store(false);
             updateTrayTooltip(hWnd);
         }
+        return 0;
+    }
+    if (msg == WM_UPDATE_TOOLTIP) {
+        updateTrayTooltip(hWnd);
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_TOOLTIP_REFRESH) {
@@ -2851,7 +2862,7 @@ int wmain() {
             // g_eventsUpdated = true が条件変数の述語になっているため、
             // notify_one が通知スレッドの wait 到達前に呼ばれても次の wait 時に述語が true で即解放される
             g_cv.notify_one();
-            if (g_hWnd) updateTrayTooltip(g_hWnd);
+            if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
             writeLog("cache: loaded " + std::to_string(cachedEvents.size()) + " events from cache");
         }
 
@@ -3019,7 +3030,7 @@ int wmain() {
                     }
                     notifyEventChanges(changes);
                     saveCacheFile(exeDir, events);
-                    if (g_hWnd) updateTrayTooltip(g_hWnd);
+                    if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
                 }
 
                 firstPoll           = false;
