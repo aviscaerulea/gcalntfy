@@ -105,6 +105,7 @@ static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
+static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 
 static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
@@ -1507,6 +1508,10 @@ static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED    = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING  = L"MuteInMeeting";
 
+// Windows スタートアップ登録用レジストリ（HKCU Run キー）
+static constexpr const wchar_t* REG_RUN_KEY_PATH    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static constexpr const wchar_t* REG_RUN_VALUE_NAME  = L"gcalntfy";
+
 // レジストリ DWORD 値の読み取り
 // キーまたは値が存在しない場合は defaultVal を返す
 static DWORD readRegDword(const wchar_t* valueName, DWORD defaultVal) {
@@ -1560,6 +1565,48 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value) 
     if (RegSetValueExW(hKey, valueName, 0, REG_SZ,
             reinterpret_cast<const BYTE*>(value.c_str()), byteSize) != ERROR_SUCCESS)
         writeLog("registry write failed: " + wideToUtf8(valueName));
+    RegCloseKey(hKey);
+}
+
+// スタートアップ登録の有無判定
+// HKCU Run キーに gcalntfy 値が存在すれば登録済みとみなす
+static bool isStartupRegistered() {
+    return RegGetValueW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, REG_RUN_VALUE_NAME,
+        RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
+// スタートアップへ登録
+// 現在の実行ファイルパスを二重引用符で括って HKCU Run キーに書き込む
+static void registerStartup() {
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) {
+        writeLog("startup register: GetModuleFileNameW failed");
+        return;
+    }
+    std::wstring quoted = std::wstring(L"\"") + exePath + L"\"";
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        writeLog("startup register: RegOpenKeyExW failed");
+        return;
+    }
+    DWORD byteSize = static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t));
+    if (RegSetValueExW(hKey, REG_RUN_VALUE_NAME, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(quoted.c_str()), byteSize) != ERROR_SUCCESS)
+        writeLog("startup register: RegSetValueExW failed");
+    RegCloseKey(hKey);
+}
+
+// スタートアップ登録を解除
+// HKCU Run キーから gcalntfy 値を削除する。値が存在しない場合はエラーを無視
+static void unregisterStartup() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        writeLog("startup unregister: RegOpenKeyExW failed");
+        return;
+    }
+    LONG r = RegDeleteValueW(hKey, REG_RUN_VALUE_NAME);
+    if (r != ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND)
+        writeLog("startup unregister: RegDeleteValueW failed");
     RegCloseKey(hKey);
 }
 
@@ -2520,6 +2567,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
                 IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
 
+            // スタートアップ登録トグル（HKCU Run キー）
+            AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
+                IDM_STARTUP, L"スタートアップ登録");
+
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
@@ -2563,6 +2614,14 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             if (g_soundEnabled.load()) {
                 g_muteInMeeting.store(!g_muteInMeeting.load());
                 writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
+            }
+        }
+        else if (id == IDM_STARTUP) {
+            if (isStartupRegistered()) {
+                unregisterStartup();
+            }
+            else {
+                registerStartup();
             }
         }
         else if (id == IDM_OPEN_GITHUB) {
