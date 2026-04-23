@@ -130,6 +130,9 @@ static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 // 円周率（MSVC では M_PI に _USE_MATH_DEFINES が必要なため自前定義）
 static constexpr double PI = 3.14159265358979323846;
 
+// OAuth 認証コード待機タイムアウト（秒）
+static constexpr int AUTH_CODE_TIMEOUT_SEC = 120;
+
 // エラー Toast の最小間隔（30 分）
 static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 
@@ -718,7 +721,7 @@ static std::string waitForAuthCode(SOCKET serverSocket) {
     fd_set readSet;
     FD_ZERO(&readSet);
     FD_SET(serverSocket, &readSet);
-    timeval tv = { 120, 0 };
+    timeval tv = { AUTH_CODE_TIMEOUT_SEC, 0 };
     if (select(0, &readSet, nullptr, nullptr, &tv) <= 0) return {};
 
     SOCKET client = accept(serverSocket, nullptr, nullptr);
@@ -1297,6 +1300,7 @@ static long long calcDiffMs(const std::string& isoTarget, const std::string& iso
 // ==================== ダッキング ====================
 
 // プロセス ID からプロセス名（小文字）を取得する
+// アクセス不可・取得失敗時は空文字列を返す
 static std::wstring getProcessName(DWORD pid) {
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return {};
@@ -1570,6 +1574,7 @@ static bool isMicCaptureActive() {
 // マイクまたはカメラの使用状態を判定する
 //
 // レジストリ → WASAPI の順で検出し、いずれかが true なら使用中。
+// WASAPI 補完（isMicCaptureActive）はマイクのみ対象（カメラはレジストリ検出のみ）。
 static bool isMeetingActive() {
     if (isRegistryDeviceInUse(L"microphone")) return true;
     if (isRegistryDeviceInUse(L"webcam"))     return true;
@@ -2591,6 +2596,12 @@ static inline std::string eventKey(const CalendarEvent& e) {
     return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
 
+// 通知済みセット用キーを生成する
+// leadMsVal はミリ秒単位。eventKey に "@分数" サフィックスを付けた形式で返す
+static inline std::string notifyKey(const CalendarEvent& e, long long leadMsVal) {
+    return eventKey(e) + "@" + std::to_string(leadMsVal / 60000);
+}
+
 // notifiedSet の自然失効: 新リストに含まれないキーを削除する
 //
 // notifiedSet のキーは "eventKey@minutes" 形式。
@@ -2647,14 +2658,14 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
                 if (diffMs <= 0) {
                     // 開始済みイベント: 全通知タイミングを通知済みとしてマーク
-                    notifiedSet.insert(eventKey(e) + "@" + std::to_string(leadMs / 60000));
+                    notifiedSet.insert(notifyKey(e, leadMs));
                     for (int m : e.reminderMinutes)
-                        notifiedSet.insert(eventKey(e) + "@" + std::to_string(m));
+                        notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
                     continue;
                 }
                 // notify_minutes（ベースライン）+ reminders のすべてのタイミングをチェック
                 auto checkLead = [&](long long leadMsVal) {
-                    auto key = eventKey(e) + "@" + std::to_string(leadMsVal / 60000);
+                    auto key = notifyKey(e, leadMsVal);
                     if (!notifiedSet.count(key))
                         minFireMs = (std::min)(minFireMs, diffMs - leadMsVal);
                 };
@@ -2663,7 +2674,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 for (int m : e.reminderMinutes) {
                     long long rmMs = static_cast<long long>(m) * 60000;
                     if (diffMs - rmMs < 0) {
-                        notifiedSet.insert(eventKey(e) + "@" + std::to_string(m));
+                        notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
                     }
                     else {
                         checkLead(rmMs);
@@ -2699,7 +2710,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 if (diffMs <= 0) continue;
 
                 auto tryLead = [&](long long lv) -> bool {
-                    auto key = eventKey(e) + "@" + std::to_string(lv / 60000);
+                    auto key = notifyKey(e, lv);
                     if (!notifiedSet.count(key) && diffMs - lv <= 0) {
                         targetDatetime = e.datetime;
                         targetLeadMs   = lv;
@@ -2725,7 +2736,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                         if (static_cast<long long>(m) * 60000 == targetLeadMs) { isTarget = true; break; }
                 }
                 if (!isTarget) continue;
-                auto key = eventKey(e) + "@" + std::to_string(targetLeadMs / 60000);
+                auto key = notifyKey(e, targetLeadMs);
                 if (!notifiedSet.count(key)) group.push_back(&e);
             }
 
@@ -2746,7 +2757,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             }
             for (const auto* ev : group) {
                 showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
-                notifiedSet.insert(eventKey(*ev) + "@" + std::to_string(targetLeadMs / 60000));
+                notifiedSet.insert(notifyKey(*ev, targetLeadMs));
             }
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
@@ -3002,7 +3013,7 @@ int wmain() {
                     std::vector<CalendarEvent> prevEvents;
                     {
                         std::lock_guard<std::mutex> lk(g_mtx);
-                        prevEvents      = g_pendingEvents;
+                        prevEvents      = std::move(g_pendingEvents);
                         g_pendingEvents = events;
                         g_eventsUpdated = true;
                     }
