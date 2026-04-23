@@ -111,7 +111,9 @@ static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerule
 static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
 
 // イベントキャッシュファイル名（exe 同フォルダに保存）
-static constexpr wchar_t CACHE_FILENAME[] = L"events.json";
+static constexpr wchar_t CACHE_FILENAME[]        = L"events.json";
+// 通知抑制リストキャッシュファイル名（exe 同フォルダに保存）
+static constexpr wchar_t MUTED_CACHE_FILENAME[]  = L"muted_events.json";
 
 // 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
@@ -252,6 +254,15 @@ static bool                    g_tooltipUpdating  = false;
 
 // 通知音再生スレッドのハンドル（notifyThreadFunc のみがアクセスし、シャットダウン時に join する）
 static HANDLE g_soundThread = nullptr;
+
+// exe ディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
+static std::wstring g_exeDir;
+
+// 通知抑制リスト：eventKey → JST 日付（YYYY-MM-DD）（g_mtx で保護）
+static std::unordered_map<std::string, std::string> g_mutedEvents;
+
+// 左クリックポップアップの予定項目描画用フォント（initMenuFonts で初期化）
+static HFONT g_hMenuFont = nullptr;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 struct SoundContext {
@@ -1161,6 +1172,88 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
     catch (...) {
         writeLog("cache: parse failed");
         return {};
+    }
+}
+
+// 通知抑制リストの保存
+// トグル操作のたびに呼び出し、g_mutedEvents を JSON ファイルに上書き保存する。
+// g_mtx ロック外で呼ぶこと。
+static void saveMutedEvents(const std::wstring& dir) {
+    using namespace winrt::Windows::Data::Json;
+    try {
+        JsonArray arr;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            for (const auto& [key, date] : g_mutedEvents) {
+                JsonObject obj;
+                obj.Insert(L"key",  JsonValue::CreateStringValue(winrt::to_hstring(key)));
+                obj.Insert(L"date", JsonValue::CreateStringValue(winrt::to_hstring(date)));
+                arr.Append(obj);
+            }
+        }
+        auto json = winrt::to_string(arr.Stringify());
+
+        auto path = dir + L"\\" + MUTED_CACHE_FILENAME;
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            writeLog("muted: save failed (CreateFileW error " + std::to_string(GetLastError()) + ")");
+            return;
+        }
+        DWORD written = 0;
+        BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+        CloseHandle(hFile);
+        if (!writeOk || written != static_cast<DWORD>(json.size()))
+            writeLog("muted: write failed (" + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+    }
+    catch (...) {
+        writeLog("muted: save failed (exception)");
+    }
+}
+
+// 通知抑制リストの読み込み
+// 起動時に呼び出し、当日以降のエントリのみ g_mutedEvents に格納する（過去分を自動プルーニング）。
+// ファイル未存在・パースエラー時は何もしない。
+static void loadMutedEvents(const std::wstring& dir) {
+    using namespace winrt::Windows::Data::Json;
+    auto path = dir + L"\\" + MUTED_CACHE_FILENAME;
+
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    SetLastError(0);
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0 || fileSize > 1024 * 1024) {
+        CloseHandle(hFile);
+        return;
+    }
+    std::string buf(fileSize, '\0');
+    DWORD readBytes = 0;
+    BOOL ok = ReadFile(hFile, buf.data(), fileSize, &readBytes, nullptr);
+    CloseHandle(hFile);
+    if (!ok || readBytes != fileSize) return;
+
+    try {
+        auto arr = JsonArray::Parse(winrt::to_hstring(buf));
+
+        SYSTEMTIME utcNow;
+        GetSystemTime(&utcNow);
+        auto jstNow = utcToJst(utcNow);
+        std::string today = systemTimeToIso(jstNow).substr(0, 10);
+
+        std::lock_guard<std::mutex> lk(g_mtx);
+        for (auto item : arr) {
+            auto obj  = item.GetObject();
+            auto key  = winrt::to_string(obj.GetNamedString(L"key",  L""));
+            auto date = winrt::to_string(obj.GetNamedString(L"date", L""));
+            if (!key.empty() && date >= today)
+                g_mutedEvents[key] = date;
+        }
+        writeLog("muted: loaded " + std::to_string(g_mutedEvents.size()) + " entries");
+    }
+    catch (...) {
+        writeLog("muted: load failed (exception)");
     }
 }
 
@@ -2300,37 +2393,63 @@ static void removeTrayIcon(HWND hWnd) {
 }
 
 
-// 左クリック予定一覧の permalink 配列（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
-static std::vector<std::wstring> g_eventPermalinks;
+// イベントの通知済み判定キーを生成する
+// Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
+// id ベースにすることで、ユーザがイベントタイトルを編集しても重複通知を防止できる。
+static inline std::string eventKey(const CalendarEvent& e) {
+    return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
+}
+
+// メニュー描画用フォントの初期化
+// OS のメニューフォント設定を取得して左クリックポップアップの予定項目描画用フォントを作成する。
+static void initMenuFonts() {
+    NONCLIENTMETRICSW ncm = { sizeof(ncm) };
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    g_hMenuFont = CreateFontIndirectW(&ncm.lfMenuFont);
+}
+
+// 左クリックポップアップの予定項目（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
+struct ScheduleItem {
+    std::wstring permalink;
+    std::string  key;    // eventKey(e)：右クリック抑制トグル用
+    std::string  date;   // JST YYYY-MM-DD：抑制リスト保存用
+    std::wstring label;  // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
+    bool         muted;  // 抑制中フラグ（右クリックトグル時にもその場で更新する）
+};
+static std::vector<ScheduleItem> g_scheduleItems;
 
 // 左クリック時の予定一覧ポップアップ表示
-// g_pendingEvents から現在時刻以降の当日（JST）イベントを抽出してメニューに表示する
-// 選択時に参照する permalink を g_eventPermalinks に格納する
+// g_pendingEvents から現在時刻以降の当日（JST）イベントを抽出してメニューに表示する。
+// 左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
 static void showSchedulePopup(HWND hWnd) {
     std::vector<CalendarEvent> events;
+    std::unordered_map<std::string, std::string> mutedSnapshot;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        events = g_pendingEvents;
+        events       = g_pendingEvents;
+        mutedSnapshot = g_mutedEvents;
     }
 
     SYSTEMTIME utcNow;
     GetSystemTime(&utcNow);
     auto jstNow = utcToJst(utcNow);
     std::string nowJst = systemTimeToIso(jstNow);
-    std::string today = nowJst.substr(0, 10);
+    std::string today  = nowJst.substr(0, 10);
 
-    struct TodayEvent { std::wstring label; std::wstring permalink; };
-    std::vector<TodayEvent> todayEvents;
+    std::vector<ScheduleItem> todayEvents;
     for (const auto& ev : events) {
         auto jst = utcIsoToJst(ev.datetime);
         if (jst.substr(0, 10) != today) continue;
         if (jst < nowJst) continue;
-        // "HH:MM タイトル" 形式
+        auto key   = eventKey(ev);
+        auto date  = jst.substr(0, 10);
+        bool muted = mutedSnapshot.count(key) != 0;
+        // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィクス不要）
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
-        todayEvents.push_back({label, toWide(ev.permalink)});
+        todayEvents.push_back({toWide(ev.permalink), key, date, label, muted});
     }
 
-    g_eventPermalinks.clear();
+    g_scheduleItems.clear();
     HMENU hMenu = CreatePopupMenu();
     if (todayEvents.empty()) {
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, NO_UPCOMING_EVENTS);
@@ -2339,19 +2458,29 @@ static void showSchedulePopup(HWND hWnd) {
         UINT idx = 0;
         for (const auto& te : todayEvents) {
             if (idx >= (IDM_EVENT_MAX - IDM_EVENT_BASE)) break;
-            AppendMenuW(hMenu, MF_STRING, IDM_EVENT_BASE + idx, te.label.c_str());
-            g_eventPermalinks.push_back(te.permalink);
+            // MFT_OWNERDRAW で WM_MEASUREITEM / WM_DRAWITEM に描画を委譲する。
+            // dwItemData にインデックスを渡し、描画時に g_scheduleItems から参照する。
+            MENUITEMINFOW mii = { sizeof(mii) };
+            mii.fMask     = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
+            mii.fType     = MFT_OWNERDRAW;
+            mii.wID       = IDM_EVENT_BASE + idx;
+            mii.dwItemData = static_cast<ULONG_PTR>(idx);
+            InsertMenuItemW(hMenu, idx, TRUE, &mii);
+            g_scheduleItems.push_back(te);
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"本日の以降予定：" + std::to_wstring(g_eventPermalinks.size())
-                + (todayEvents.size() > g_eventPermalinks.size() ? L" 件（超過分省略）" : L" 件");
+        std::wstring footer = L"本日の以降予定：" + std::to_wstring(g_scheduleItems.size())
+                + (todayEvents.size() > g_scheduleItems.size() ? L" 件（超過分省略）" : L" 件")
+                + L"（右クリックで通知抑制）";
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, footer.c_str());
     }
 
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(hWnd);
+    // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
+    // を発火してしまい、抑制トグル用の WM_MENURBUTTONUP が届かなくなる）
     TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
     DestroyMenu(hMenu);
 }
@@ -2454,9 +2583,122 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         else if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
             UINT idx = id - IDM_EVENT_BASE;
-            if (idx < g_eventPermalinks.size() && isHttpUrl(g_eventPermalinks[idx])) {
-                ShellExecuteW(nullptr, L"open", g_eventPermalinks[idx].c_str(),
+            if (idx < g_scheduleItems.size() && isHttpUrl(g_scheduleItems[idx].permalink)) {
+                ShellExecuteW(nullptr, L"open", g_scheduleItems[idx].permalink.c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);
+            }
+        }
+        return 0;
+    }
+    // 左クリックポップアップの owner-draw 項目サイズ計算
+    if (msg == WM_MEASUREITEM) {
+        auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (mis->CtlType == ODT_MENU) {
+            UINT eidx = static_cast<UINT>(mis->itemData);
+            if (eidx < g_scheduleItems.size()) {
+                const auto& item = g_scheduleItems[eidx];
+                HDC   hdc = GetDC(hWnd);
+                HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+                SIZE  sz  = {};
+                GetTextExtentPoint32W(hdc, item.label.c_str(),
+                    static_cast<int>(item.label.size()), &sz);
+                SelectObject(hdc, old);
+                ReleaseDC(hWnd, hdc);
+                // 左右パディングとして 16 px ずつ確保する
+                mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
+                mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
+                return TRUE;
+            }
+        }
+    }
+    // 左クリックポップアップの owner-draw 項目描画
+    // ODS_SELECTED に応じた背景色・テキスト色を切り替え、muted フラグが立つ項目には
+    // DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+    if (msg == WM_DRAWITEM) {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlType == ODT_MENU) {
+            UINT eidx = static_cast<UINT>(dis->itemData);
+            if (eidx < g_scheduleItems.size()) {
+                const auto& item     = g_scheduleItems[eidx];
+                bool        selected = (dis->itemState & ODS_SELECTED) != 0;
+
+                FillRect(dis->hDC, &dis->rcItem,
+                    reinterpret_cast<HBRUSH>(
+                        static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+
+                RECT textRect  = dis->rcItem;
+                textRect.left += 16;
+                SetBkMode(dis->hDC, TRANSPARENT);
+                COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+                SetTextColor(dis->hDC, textColor);
+                HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
+                DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
+                    DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                if (item.muted) {
+                    SIZE sz = {};
+                    GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
+                        static_cast<int>(item.label.size()), &sz);
+                    constexpr int STRIKE_THICKNESS = 2;
+                    // 中央から 1 px だけ下寄せにして視認性を上げる
+                    constexpr int STRIKE_Y_OFFSET  = 1;
+                    // テキスト左端より 3 px、右端より 4 px 外側まで線を伸ばす
+                    constexpr int STRIKE_MARGIN_LEFT  = 3;
+                    constexpr int STRIKE_MARGIN_RIGHT = 4;
+                    int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
+                    RECT strikeRect = {
+                        textRect.left - STRIKE_MARGIN_LEFT,
+                        lineY - STRIKE_THICKNESS / 2,
+                        textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
+                        lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
+                    };
+                    HBRUSH hLineBrush = CreateSolidBrush(textColor);
+                    FillRect(dis->hDC, &strikeRect, hLineBrush);
+                    DeleteObject(hLineBrush);
+                }
+                SelectObject(dis->hDC, oldFont);
+                return TRUE;
+            }
+        }
+    }
+    // 左クリックポップアップ上の右クリック: 通知抑制をトグルする
+    // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
+    // g_mutedEvents と item.muted をトグルし、EnumThreadWindows で menu window を特定して再描画する。
+    if (msg == WM_MENURBUTTONUP) {
+        UINT  itemIdx = static_cast<UINT>(wParam);
+        HMENU hm      = reinterpret_cast<HMENU>(lParam);
+        UINT  id      = GetMenuItemID(hm, static_cast<int>(itemIdx));
+        if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
+            UINT eidx = id - IDM_EVENT_BASE;
+            if (eidx < g_scheduleItems.size()) {
+                auto& item = g_scheduleItems[eidx];
+                bool nowMuted;
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    auto it = g_mutedEvents.find(item.key);
+                    if (it != g_mutedEvents.end()) {
+                        g_mutedEvents.erase(it);
+                        nowMuted = false;
+                    }
+                    else {
+                        g_mutedEvents[item.key] = item.date;
+                        nowMuted = true;
+                    }
+                }
+                item.muted = nowMuted;
+                // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
+                // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
+                EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
+                    wchar_t className[16] = {};
+                    if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
+                        && wcscmp(className, L"#32768") == 0) {
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                        UpdateWindow(hwnd);
+                    }
+                    return TRUE;
+                }, 0);
+                saveMutedEvents(g_exeDir);
+                g_forcePoll.store(true);
+                writeLog(std::string("muted: ") + (nowMuted ? "added " : "removed ") + item.key);
             }
         }
         return 0;
@@ -2589,13 +2831,6 @@ static void notifyEventChanges(const std::vector<EventChange>& changes)
 
 // ==================== 通知スレッド ====================
 
-// イベントの通知済み判定キーを生成する
-// Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
-// id ベースにすることで、ユーザがイベントタイトルを編集しても重複通知を防止できる。
-static inline std::string eventKey(const CalendarEvent& e) {
-    return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
-}
-
 // 通知済みセット用キーを生成する
 // leadMsVal はミリ秒単位。eventKey に "@分数" サフィックスを付けた形式で返す
 static inline std::string notifyKey(const CalendarEvent& e, long long leadMsVal) {
@@ -2636,6 +2871,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
 
     while (!g_shutdownRequested) {
         // 予定リスト更新を待機
+        // g_mutedEvents のキーセットをスナップショットして内側ループのロック取得を O(1) 回に削減する
+        std::unordered_set<std::string> mutedKeys;
         {
             std::unique_lock<std::mutex> lk(g_mtx);
             g_cv.wait(lk, [] { return g_eventsUpdated || g_shutdownRequested.load(); });
@@ -2643,6 +2880,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             localEvents     = g_pendingEvents;
             localConfig     = g_currentConfig;
             g_eventsUpdated = false;
+            for (const auto& kv : g_mutedEvents)
+                mutedKeys.insert(kv.first);
         }
         pruneNotifiedSet(notifiedSet, localEvents);
 
@@ -2663,6 +2902,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                         notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
                     continue;
                 }
+                // 通知抑制中のイベントは minFireMs 計算から除外する
+                if (mutedKeys.count(eventKey(e))) continue;
                 // notify_minutes（ベースライン）+ reminders のすべてのタイミングをチェック
                 auto checkLead = [&](long long leadMsVal) {
                     auto key = notifyKey(e, leadMsVal);
@@ -2695,6 +2936,9 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                     localConfig     = g_currentConfig;
                     leadMs          = localConfig.notifyLeadMs;
                     g_eventsUpdated = false;
+                    mutedKeys.clear();
+                    for (const auto& kv : g_mutedEvents)
+                        mutedKeys.insert(kv.first);
                     pruneNotifiedSet(notifiedSet, localEvents);
                     continue;
                 }
@@ -2708,6 +2952,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
                 if (diffMs <= 0) continue;
+                if (mutedKeys.count(eventKey(e))) continue;
 
                 auto tryLead = [&](long long lv) -> bool {
                     auto key = notifyKey(e, lv);
@@ -2736,6 +2981,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                         if (static_cast<long long>(m) * 60000 == targetLeadMs) { isTarget = true; break; }
                 }
                 if (!isTarget) continue;
+                if (mutedKeys.count(eventKey(e))) continue;
                 auto key = notifyKey(e, targetLeadMs);
                 if (!notifiedSet.count(key)) group.push_back(&e);
             }
@@ -2792,6 +3038,7 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 int wmain() {
     // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
     auto exeDir = getExeDir();
+    g_exeDir = exeDir;
     g_logDir = exeDir + L"\\logs";
     CreateDirectoryW(g_logDir.c_str(), nullptr);
 
@@ -2861,6 +3108,12 @@ int wmain() {
 
         // 通知スレッド起動
         std::thread notifyThread(notifyThreadFunc, exeDir);
+
+        // 通知抑制リストを復元（過去分のエントリは自動プルーニング）
+        loadMutedEvents(exeDir);
+
+        // メニュー描画用フォントを初期化（以降、WM_MEASUREITEM / WM_DRAWITEM で使用する）
+        initMenuFonts();
 
         // キャッシュからイベントデータを復元（起動直後のポーリング失敗に備える）
         auto cachedEvents = loadCacheFile(exeDir);

@@ -21,7 +21,8 @@ tasks:
   build:
     desc: gcalntfy をビルド
     cmds:
-      - taskkill //F //IM gcalntfy.exe 2>/dev/null || true
+      # 実行中の gcalntfy を停止する。殺した場合のみ exe のロック解放を待つ
+      - taskkill //F //IM gcalntfy.exe 2>/dev/null && sleep 1 || true
       - mkdir -p out
       - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
       - cp gcalntfy.toml out/
