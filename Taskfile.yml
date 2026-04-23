@@ -3,49 +3,65 @@ $schema: https://taskfile.dev/schema.json
 version: '3'
 
 vars:
+  APP_NAME: gcalntfy
   VERSION:
-    sh: git describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev
+    sh: git describe --tags --always --dirty | sed 's/^v//'
+  ARCH: x64
 
 tasks:
   default:
-    desc: クリーンビルドを実行する。
+    desc: クリーンビルドを実行
     cmds:
       - task clean
       - task build
 
+  kill:
+    desc: 実行中のアプリケーションを強制終了（起動していない場合は無視）
+    cmds:
+      - cmd: taskkill /IM {{.APP_NAME}}.exe /F
+        ignore_error: true
+
   clean:
-    desc: ビルド成果物を削除
+    desc: out/ 以下のファイルを削除
+    deps: [kill]
     cmds:
       - rm -rf out
 
-  build:
-    desc: gcalntfy をビルド
+  copy-assets:
+    desc: ビルド成果物ディレクトリへのアセットコピー
+    internal: true
     cmds:
-      # 実行中の gcalntfy を停止する。殺した場合のみ exe のロック解放を待つ
-      - taskkill //F //IM gcalntfy.exe 2>/dev/null && sleep 1 || true
-      - mkdir -p out
-      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
-      - cp gcalntfy.toml out/
+      - cp {{.APP_NAME}}.toml out/
       - cp src/sound.wav out/
       - cp src/app.ico out/
-      - cp -f *.local.* out/ 2>/dev/null || true
+      - cmd: cp -f *.local.* out/
+        ignore_error: true
 
-  release:
-    desc: リリースビルドと zip 作成
-    deps: [build]
+  build:
+    desc: 通常ビルド（out/gcalntfy.exe）
+    deps: [kill]
     cmds:
-      - >-
-        pwsh -NonInteractive -Command '
-        Compress-Archive
-        -Path out\gcalntfy.exe, gcalntfy.toml, out\sound.wav, out\app.ico
-        -DestinationPath "out\gcalntfy-{{.VERSION}}-x64.zip"
-        -Force'
+      - mkdir -p out
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
+      - task: copy-assets
 
   rebuild:
     desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
     cmds:
-      - cmd: taskkill //F //IM gcalntfy.exe
-        ignore_error: true
       - task: clean
       - task: build
-      - pwsh.exe -NoProfile -Command "Start-Process 'out/gcalntfy.exe'"
+      - pwsh.exe -NoProfile -Command "Start-Process 'out/{{.APP_NAME}}.exe'"
+
+  release:
+    desc: リリースビルド（デバッグ情報なし＋最適化）と zip 作成
+    deps: [clean]
+    cmds:
+      - mkdir -p out
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -Release
+      - task: copy-assets
+      - >-
+        pwsh -NonInteractive -Command '
+        Compress-Archive
+        -Path out\{{.APP_NAME}}.exe, {{.APP_NAME}}.toml, out\sound.wav, out\app.ico
+        -DestinationPath "out\{{.APP_NAME}}-{{.VERSION}}-{{.ARCH}}.zip"
+        -Force'
