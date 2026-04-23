@@ -8,7 +8,7 @@
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
  * 終了コード:
- *   0  - 正常終了（トレイメニューの「終了」または「再起動」による）
+ *   0  - 正常終了（トレイメニューの「終了」による）
  *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
  *   2  - 予期しない初期化エラー
  *
@@ -98,7 +98,6 @@ static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
 
 // コンテキストメニューコマンド ID
-static constexpr UINT IDM_RESTART          = 40001;
 static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED       = 40005;
@@ -159,9 +158,8 @@ static constexpr size_t PKCE_VERIFIER_BYTES = 64;
 // レジストリ値名（refresh token）
 static constexpr const wchar_t* REG_REFRESH_TOKEN = L"RefreshToken";
 
-// シャットダウン・再起動フラグ（メインスレッド・WndProc・通知スレッドから参照）
+// シャットダウンフラグ（メインスレッド・WndProc・通知スレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
-static std::atomic<bool> g_restartRequested{false};
 
 // 音声通知の有効/無効フラグ（レジストリで永続化、トレイメニューの親項目）
 static std::atomic<bool> g_soundEnabled{true};
@@ -2526,7 +2524,6 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
             AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
             forceForeground(hWnd);
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
@@ -2553,11 +2550,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_COMMAND) {
         UINT id = LOWORD(wParam);
-        if (id == IDM_RESTART) {
-            g_restartRequested  = true;
-            g_shutdownRequested = true;
-        }
-        else if (id == IDM_EXIT) {
+        if (id == IDM_EXIT) {
             g_shutdownRequested = true;
         }
         else if (id == IDM_SOUND_ENABLED) {
@@ -3337,26 +3330,7 @@ int wmain() {
         removeTrayIcon(g_hWnd);
         DestroyWindow(g_hWnd);
 
-        if (g_restartRequested) {
-            writeLog("restarting");
-            wchar_t exePath[MAX_PATH];
-            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-            std::wstring cmd = std::wstring(L"\"") + exePath + L"\"";
-            STARTUPINFOW si = {};
-            si.cb = sizeof(si);
-            PROCESS_INFORMATION pi = {};
-            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-                    FALSE, CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi)) {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-            else {
-                writeLog("failed to restart process");
-            }
-        }
-        else {
-            writeLog("shutdown");
-        }
+        writeLog("shutdown");
     }
     catch (...) {
         writeLog("unexpected initialization error");
