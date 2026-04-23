@@ -2418,6 +2418,22 @@ struct ScheduleItem {
 };
 static std::vector<ScheduleItem> g_scheduleItems;
 
+// フォアグラウンド権限を確実に取得するユーティリティ
+// 起動直後は自プロセスがフォアグラウンド権限を持たないため SetForegroundWindow が失敗する。
+// 現フォアグラウンドスレッドの入力キューに一時アタッチして権限制限を回避する。
+static void forceForeground(HWND hWnd) {
+    HWND  hFg   = GetForegroundWindow();
+    DWORD fgTid = hFg ? GetWindowThreadProcessId(hFg, nullptr) : 0;
+    DWORD myTid = GetCurrentThreadId();
+    if (fgTid != 0 && fgTid != myTid) {
+        AttachThreadInput(myTid, fgTid, TRUE);
+        SetForegroundWindow(hWnd);
+        AttachThreadInput(myTid, fgTid, FALSE);
+        return;
+    }
+    SetForegroundWindow(hWnd);
+}
+
 // 左クリック時の予定一覧ポップアップ表示
 // g_pendingEvents から現在時刻以降の当日（JST）イベントを抽出してメニューに表示する。
 // 左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
@@ -2478,7 +2494,7 @@ static void showSchedulePopup(HWND hWnd) {
 
     POINT pt;
     GetCursorPos(&pt);
-    SetForegroundWindow(hWnd);
+    forceForeground(hWnd);
     // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
     // を発火してしまい、抑制トグル用の WM_MENURBUTTONUP が届かなくなる）
     TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
@@ -2512,7 +2528,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_RESTART, L"再起動");
             AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
-            SetForegroundWindow(hWnd);
+            forceForeground(hWnd);
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
             DestroyMenu(hMenu);
             g_popupShowing.store(false);
