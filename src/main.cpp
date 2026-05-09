@@ -795,19 +795,18 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
     // 1 秒ごとに g_shutdownRequested を確認し、必要なら早期に脱出する。
     int waited = 0;
-    int ready  = 0;
-    while (waited < AUTH_CODE_TIMEOUT_SEC) {
+    while (true) {
+        if (waited >= AUTH_CODE_TIMEOUT_SEC) return {};
         if (g_shutdownRequested.load()) return {};
         fd_set readSet;
         FD_ZERO(&readSet);
         FD_SET(serverSocket, &readSet);
         timeval tv = { 1, 0 };
-        ready = select(0, &readSet, nullptr, nullptr, &tv);
+        int ready = select(0, &readSet, nullptr, nullptr, &tv);
         if (ready < 0) return {};
         if (ready > 0) break;
         ++waited;
     }
-    if (ready <= 0) return {};
 
     SOCKET client = accept(serverSocket, nullptr, nullptr);
     if (client == INVALID_SOCKET) return {};
@@ -817,7 +816,6 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
-    // \r\n\r\n が届くまでループ受信（HTTP リクエストヘッダ全体を確実に取得する）
     std::string req;
     char chunk[1024];
     while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
@@ -2267,16 +2265,15 @@ static void launchSound(const Config& cfg) {
     // 前回スレッドの完了を待ってから新スレッドを起動する
     // 旧スレッドが再生中に新スレッドを起動すると、旧スレッドの unduck と新スレッドの duck が競合し、
     // 新スレッド再生中に他プロセスが意図せずミュート解除される問題が起きる。
-    // 通知間隔は分単位、WAV は数秒なので待機しても実害はない。
-    // 想定外の長時間化に備えて 10 秒タイムアウトを設けている。
+    // タイムアウト時はハンドルを破棄して次回起動を試行する（同じハンドルを保持し続けると永久に再生不能になるため）。
     if (g_soundThread) {
         DWORD waitResult = WaitForSingleObject(g_soundThread, 10000);
         if (waitResult == WAIT_TIMEOUT) {
-            writeLog("launchSound: previous sound thread did not finish, skipping new sound");
-            return;
+            writeLog("launchSound: previous sound thread did not finish within 10s, dropping handle and retrying");
         }
         CloseHandle(g_soundThread);
         g_soundThread = nullptr;
+        if (waitResult == WAIT_TIMEOUT) return;
     }
 
     // ダッキング開始（通知音再生前にミュート）
@@ -2863,7 +2860,7 @@ static void showTrayContextMenu(HWND hWnd) {
 // トレイアイコン左クリック時の処理
 // 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
 static void handleTrayLeftClick(HWND hWnd) {
-    // 未認証時はメニューを挟まず即フロー起動（KISS）。tooltip で事前にユーザに告知済み
+    // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         if (!g_authInProgress.load()) {
             std::thread(startInteractiveAuth).detach();
@@ -2895,15 +2892,11 @@ static std::wstring getCurrentLogTarget() {
 // メニュー選択（IDM_*）と予定一覧クリック（IDM_EVENT_BASE 以降）を処理する。
 static void handleTrayCommand(UINT id) {
     if (id == IDM_EXIT) {
-        // 終了要求
-        // g_shutdownRequested フラグでバックグラウンドスレッドへ伝達し、
-        // PostQuitMessage で wmain のメッセージループを抜ける
         g_shutdownRequested = true;
         PostQuitMessage(0);
         return;
     }
     if (id == IDM_SOUND_ENABLED) {
-        // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
         g_soundEnabled.store(!g_soundEnabled.load());
         writeRegDword(REG_SOUND_ENABLED, g_soundEnabled.load() ? 1u : 0u);
         return;
