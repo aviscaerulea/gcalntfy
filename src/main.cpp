@@ -274,7 +274,12 @@ static bool                    g_trayBadgeActive  = false;
 // Shell_NotifyIconW が内部でメッセージポンプして WM_TIMER 等を呼ぶことへの対処
 static bool                    g_tooltipUpdating  = false;
 
-// 通知音再生スレッドのハンドル（notifyThreadFunc のみがアクセスし、シャットダウン時に join する）
+// 通知音再生スレッドのハンドル
+//
+// アクセスは notifyThreadFunc 1 スレッドに限定する。launchSound（呼び出し元は notifyThreadFunc）と、
+// notifyThreadFunc 末尾のシャットダウン処理がすべての書き換え箇所であり、
+// 並行アクセスがないためミューテックス保護は不要。新たな呼び出し箇所を追加する場合は
+// 必ず notifyThreadFunc コンテキスト内であることを確認すること。
 static HANDLE g_soundThread = nullptr;
 
 // exe ディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
@@ -287,9 +292,12 @@ static std::unordered_map<std::string, std::string> g_mutedEvents;
 static HFONT g_hMenuFont = nullptr;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
+// ダッキング操作（duck/unduck）はすべて soundThread 内で実行する。
+// ISimpleAudioVolume を取得したスレッドと別スレッドで Release すると、
+// COM スレッド境界をまたいだプロキシ解放となり潜在リスクがあるため、
+// 取得・復元・解放をすべて同一スレッドに集約する。
 struct SoundContext {
-    Config                                          cfg;   // 再生時の設定
-    std::vector<winrt::com_ptr<ISimpleAudioVolume>> muted; // ミュート済みセッション（復元用）
+    Config cfg;
 };
 
 // ==================== ユーティリティ ====================
@@ -775,10 +783,17 @@ static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier
 
 // クエリ文字列から指定キーの値を抽出する
 // req は HTTP リクエスト全体、key は "code" や "state"（"=" は不要）。
+// "?" または "&" の直後に出現する key=value のみを対象とし、
+// "scope=" が "code=" にマッチするような部分一致を回避する。
 // 見つからない場合は空文字列。値の URL デコードまでは行わない（ASCII 範囲のみ想定）。
 static std::string extractQueryValue(const std::string& req, const std::string& key) {
     std::string pattern = key + "=";
-    size_t pos = req.find(pattern);
+    size_t pos = 0;
+    while ((pos = req.find(pattern, pos)) != std::string::npos) {
+        // 直前の文字が "?" または "&" の場合のみ正当なキーと判定する
+        if (pos > 0 && (req[pos - 1] == '?' || req[pos - 1] == '&')) break;
+        pos += pattern.size();
+    }
     if (pos == std::string::npos) return {};
     pos += pattern.size();
     size_t end = req.find_first_of("& \r\n", pos);
@@ -794,6 +809,8 @@ static std::string extractQueryValue(const std::string& req, const std::string& 
 static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState) {
     // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
     // 1 秒ごとに g_shutdownRequested を確認し、必要なら早期に脱出する。
+    // タイムアウトは「ちょうど AUTH_CODE_TIMEOUT_SEC 経過後」の判定で打ち切る
+    // （厳密には 1 ループ分早く打ち切られる可能性があるが許容差）。
     int waited = 0;
     while (true) {
         if (waited >= AUTH_CODE_TIMEOUT_SEC) return {};
@@ -817,10 +834,22 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
     std::string req;
+    // HTTP リクエスト読み出しループ
+    // recv の戻り値: 正値=受信バイト数、0=ピア close、SOCKET_ERROR(-1)=エラー
+    // エラー・close 時は req が不完全なまま抜け、後続の extractQueryValue が空文字を返して
+    // 認証フローが安全に失敗する（不完全リクエストのまま強引に処理を進めない）。
     char chunk[1024];
     while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
         int n = recv(client, chunk, sizeof(chunk), 0);
-        if (n <= 0) break;
+        if (n == 0) {
+            writeLog("waitForAuthCode: peer closed before request complete");
+            break;
+        }
+        if (n == SOCKET_ERROR) {
+            writeLog("waitForAuthCode: recv failed, WSA error " + std::to_string(WSAGetLastError()));
+            closesocket(client);
+            return {};
+        }
         req.append(chunk, static_cast<size_t>(n));
     }
 
@@ -868,7 +897,7 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
 // g_tokenMtx を取得してから書き込む（並行スレッドからの読み出しと競合しないため）
 static bool applyTokenResponse(const winrt::Windows::Data::Json::JsonObject& obj) {
     if (!obj.HasKey(L"access_token")) return false;
-    auto token = obj.GetNamedString(L"access_token", L"").c_str();
+    std::wstring token = obj.GetNamedString(L"access_token", L"").c_str();
 
     double expiresIn = obj.GetNamedNumber(L"expires_in", 3600);
     FILETIME ft = {};
@@ -1018,14 +1047,17 @@ static void startInteractiveAuth() {
     }
 
     // 切り離しスレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
-    // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存する。
+    // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存するため、
+    // 失敗時は対話認証を断念して g_authInProgress を解放する（不整合状態で続行しない）。
     bool comInitialized = false;
     try {
         winrt::init_apartment();
         comInitialized = true;
     }
     catch (...) {
-        writeLog("interactive auth: winrt::init_apartment failed");
+        writeLog("interactive auth: winrt::init_apartment failed, abort");
+        g_authInProgress.store(false);
+        return;
     }
 
     bool succeeded = false;
@@ -1234,13 +1266,20 @@ static bool atomicWriteJson(const std::wstring& path, const std::string& json,
     }
     DWORD written = 0;
     BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+    BOOL flushOk = TRUE;
     if (writeOk && written == static_cast<DWORD>(json.size())) {
-        FlushFileBuffers(hFile);
+        flushOk = FlushFileBuffers(hFile);
     }
     CloseHandle(hFile);
     if (!writeOk || written != static_cast<DWORD>(json.size())) {
         writeLog(std::string(logTag) + ": write failed ("
             + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    if (!flushOk) {
+        writeLog(std::string(logTag) + ": flush failed (error "
+            + std::to_string(GetLastError()) + ")");
         DeleteFileW(tmpPath.c_str());
         return false;
     }
@@ -1831,7 +1870,7 @@ static bool isRegistryDeviceInUse(const wchar_t* deviceType) {
 
 // WASAPI でマイクキャプチャセッションがアクティブかを判定する
 //
-// 通知スレッドの STA COM を利用（CoInitialize 呼び出し不要）。
+// 通知スレッドの MTA COM を利用（呼び出し元スレッドで CoInitializeEx 済み前提）。
 // レジストリで検出できない仮想オーディオデバイス経由の使用を補完検出する。
 static bool isMicCaptureActive() {
     winrt::com_ptr<IMMDeviceEnumerator> enumerator;
@@ -2221,28 +2260,26 @@ cleanup:
     return ok;
 }
 
-// 通知音を再生し、ダッキング解除するスレッド関数
+// 通知音を再生し、ダッキングの開始・解除を行うスレッド関数
 //
-// MTA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
-// 末尾ガードトーン再生完了後にダッキングを解除する。
-// 呼び出し元の通知スレッド（notifyThreadFunc）も MTA のため、
-// duckAudioSessions が確保した ISimpleAudioVolume をマーシャリング無しで安全に解放できる。
+// MTA で COM 初期化し、ダッキング開始 → playWavToWasapi 同期呼び出し → ダッキング解除の順で実行する。
+// ISimpleAudioVolume の取得・復元・解放をすべて本スレッド内に閉じ込めることで、
+// COM スレッド境界をまたいだプロキシ操作を回避する。
 static DWORD WINAPI soundThread(LPVOID param) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto* ctx  = static_cast<SoundContext*>(param);
     bool comOk = (hr == S_OK || hr == S_FALSE);
 
     if (comOk) {
+        auto muted = duckAudioSessions(ctx->cfg.duckTargets);
         playWavToWasapi(ctx->cfg);
-
-        if (!ctx->muted.empty()) {
-            unduckAudioSessions(ctx->muted);
+        if (!muted.empty()) {
+            unduckAudioSessions(muted);
             writeLog("unduckAudioSessions: restored");
         }
     }
     else {
         writeLog("soundThread: CoInitializeEx failed");
-        if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
     }
 
     delete ctx;
@@ -2265,29 +2302,23 @@ static void launchSound(const Config& cfg) {
     // 前回スレッドの完了を待ってから新スレッドを起動する
     // 旧スレッドが再生中に新スレッドを起動すると、旧スレッドの unduck と新スレッドの duck が競合し、
     // 新スレッド再生中に他プロセスが意図せずミュート解除される問題が起きる。
-    // タイムアウト時はハンドルを破棄して次回起動を試行する（同じハンドルを保持し続けると永久に再生不能になるため）。
+    // タイムアウト時はハンドルを保持したまま今回の再生を諦める（強制終了するとスレッド固有 COM/WASAPI
+    // リソースが宙に浮くため）。次回 launchSound 呼び出し時に再度 join を試みる。
     if (g_soundThread) {
         DWORD waitResult = WaitForSingleObject(g_soundThread, 10000);
         if (waitResult == WAIT_TIMEOUT) {
-            writeLog("launchSound: previous sound thread did not finish within 10s, dropping handle and retrying");
+            writeLog("launchSound: previous sound thread did not finish within 10s, skipping this play");
+            return;
         }
         CloseHandle(g_soundThread);
         g_soundThread = nullptr;
-        if (waitResult == WAIT_TIMEOUT) return;
     }
 
-    // ダッキング開始（通知音再生前にミュート）
-    auto mutedSessions = duckAudioSessions(cfg.duckTargets);
-
-    // スレッドで再生（通知音 → ダッキング解除）
-    auto* ctx = new SoundContext{
-        .cfg   = cfg,
-        .muted = std::move(mutedSessions)
-    };
+    // スレッドで再生（ダッキング開始 → 通知音 → ダッキング解除を soundThread 内で完結）
+    auto* ctx = new SoundContext{ .cfg = cfg };
 
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
-        if (!ctx->muted.empty()) unduckAudioSessions(ctx->muted);
         delete ctx;
         return;
     }
@@ -2785,6 +2816,10 @@ static void showSchedulePopup(HWND hWnd) {
 
     g_scheduleItems.clear();
     HMENU hMenu = CreatePopupMenu();
+    if (!hMenu) {
+        writeLog("showSchedulePopup: CreatePopupMenu failed");
+        return;
+    }
     if (todayEvents.empty()) {
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, NO_UPCOMING_EVENTS);
     }
@@ -2829,6 +2864,12 @@ static void showTrayContextMenu(HWND hWnd) {
     POINT pt;
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
+    if (!hMenu) {
+        writeLog("showTrayContextMenu: CreatePopupMenu failed");
+        g_popupShowing.store(false);
+        updateTrayTooltip(hWnd);
+        return;
+    }
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -2875,6 +2916,8 @@ static void handleTrayLeftClick(HWND hWnd) {
 }
 
 // 当日ログファイルのパスを取得し、存在しなければ logs フォルダのパスを返す
+//
+// 「当日」は JST 基準で判定する（writeLog の日付ロールオーバ判定と同じ基準）。
 static std::wstring getCurrentLogTarget() {
     if (g_logDir.empty()) return {};
     SYSTEMTIME st;
@@ -3298,7 +3341,7 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 
 // 通知スレッド: メインスレッドから予定リストを受け取り、通知を実行する
 //
-// STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
+// MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
 // 設定されていれば、そのタイミングでも追加通知する（重複分数は 1 回のみ通知）。
 // notifiedSet のキーは "eventKey@minutes" 形式で、同一イベントの異なるタイミングを区別する。
@@ -3446,7 +3489,7 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 // timeMin に現在時刻、timeMax に「JST 翌日 23:59:59」を設定して
 // 当日と翌日の予定をまとめて取得するためのクエリ文字列を返す。
 static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
-    auto nowUtc = getCurrentUtcISO();
+    auto nowUtc = systemTimeToIso(utcNow) + ".000Z";
     SYSTEMTIME jstMidnight = utcToJst(utcNow);
     jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
     auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
@@ -3467,6 +3510,10 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // アクセストークンをクリアしてリフレッシュ後に 1 回だけリトライする。
 // outAnySuccess: 1 件以上取得できれば true。
 // outAuthFailed: リフレッシュ後も認証エラーで全停止する場合に true。
+//
+// ※ ID プレフィックス付与（"<calId>/<eventId>"）はこの関数内で行う。
+// カレンダー ID をまたいだ ID 衝突防止のため、events 取得直後にカレンダー ID を
+// 付与する責務をここに集約する。後段の deliverPollResults 等は付与済み ID を前提とする。
 static void fetchAllCalendarEvents(
     const std::vector<std::string>& calendarIds,
     const std::wstring& queryParams,
