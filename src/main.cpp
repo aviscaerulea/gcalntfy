@@ -2374,23 +2374,19 @@ static void notifyAuthRequired() {
 
 // ==================== トレイアイコン ====================
 
-// メッセージポンプしつつ指定時間（ミリ秒）待機する Sleep() 代替
+// バックグラウンドスレッド用の中断可能 Sleep
 //
+// メッセージは処理しない（呼び出し元がメインスレッドではないため）。
 // g_shutdownRequested または g_forcePoll が true になった時点で即座にリターンする。
-static void waitWithMessages(DWORD ms) {
+// 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
+static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
     while (!g_shutdownRequested && !g_forcePoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
-        DWORD remain = static_cast<DWORD>(
-            (std::min)(end - now, static_cast<ULONGLONG>(INFINITE - 1)));
-        DWORD result = MsgWaitForMultipleObjects(0, nullptr, FALSE, remain, QS_ALLINPUT);
-        if (result == WAIT_TIMEOUT) break;
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        ULONGLONG remain = end - now;
+        DWORD chunk = static_cast<DWORD>((std::min)(remain, static_cast<ULONGLONG>(100)));
+        Sleep(chunk);
     }
 }
 
@@ -2757,7 +2753,11 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_COMMAND) {
         UINT id = LOWORD(wParam);
         if (id == IDM_EXIT) {
+            // 終了要求
+            // g_shutdownRequested フラグでバックグラウンドスレッドへ伝達し、
+            // PostQuitMessage で wmain のメッセージループを抜ける
             g_shutdownRequested = true;
+            PostQuitMessage(0);
         }
         else if (id == IDM_SOUND_ENABLED) {
             // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
@@ -3258,6 +3258,218 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
     g_forcePoll.store(true);
 }
 
+// ポーリングスレッド本体
+//
+// メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
+// 応答性をネットワーク状態に依存させないことが目的。
+// 実行内容：トークンリフレッシュ → Calendar API ポーリング → 結果を通知スレッドへ受け渡し。
+// 中断は g_shutdownRequested の atomic フラグ経由（waitInterruptible が 100 ms 単位で監視）。
+static void pollThreadFunc(std::wstring exeDir, Config cfg) {
+    // WinRT アパートメント初期化
+    // 本スレッドは認証失効・接続エラーの Toast 表示経路（showErrorToast / notifyAuthRequired）を
+    // 持つため、WinRT 呼び出しに先立ってアパートメントを初期化する。
+    winrt::init_apartment();
+
+    int  lastJstDay          = -1;
+    bool firstPoll           = true;  // 起動時は schedule に関わらず必ず1回ポーリング
+    bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
+
+    while (!g_shutdownRequested) {
+        try {
+            // 対話的認証フロー実行中はトークン操作を一切行わない。
+            // これにより g_accessToken / g_tokenExpiry の data race と
+            // notifyAuthRequired の TOCTOU を回避する。
+            if (g_authInProgress.load()) {
+                waitInterruptible(RETRY_WAIT_MS);
+                continue;
+            }
+
+            // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
+            bool forceTriggered = g_forcePoll.exchange(false);
+            ULONGLONG tickNow   = GetTickCount64();
+            ULONGLONG lastTick  = g_lastPollTick.load();
+            bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
+
+            if ((forceTriggered || stale) && !firstPoll) {
+                if (lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
+                    if (forceTriggered) writeLog("force poll skipped (cooldown)");
+                }
+                else {
+                    if (forceTriggered) writeLog("force poll triggered");
+                    if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
+                    firstPoll = true;
+                }
+            }
+
+            SYSTEMTIME utcNow;
+            GetSystemTime(&utcNow);
+            auto jstNow = utcToJst(utcNow);
+
+            // 日付変更: 強制ポーリングと変更検知ベースラインをリセットする
+            // notifiedSet は通知スレッドが自然失効で管理する
+            if (static_cast<int>(jstNow.wDay) != lastJstDay) {
+                lastJstDay          = static_cast<int>(jstNow.wDay);
+                firstPoll           = true;
+                baselineEstablished = false;
+            }
+
+            int pollsPerHour = cfg.schedule[jstNow.wHour];
+
+            // アクセストークン確保（非対話）。認証失敗時もブラウザは自動起動しない。
+            {
+                auto rr = tryRefreshAccessToken();
+                if (rr == RefreshResult::NetworkError) {
+                    // ネットワーク不通は接続エラー扱い。認証 Toast は出さない。
+                    // 後段の Calendar API 呼び出しでも失敗するため、そちらの「接続エラー」Toast に任せる。
+                    waitInterruptible(RETRY_WAIT_MS);
+                    continue;
+                }
+                if (rr == RefreshResult::AuthRequired) {
+                    notifyAuthRequired();  // Toast 表示（クールダウンつき）。ブラウザは開かない。
+                    waitInterruptible(RETRY_WAIT_MS);
+                    continue;
+                }
+                g_authRequired.store(false);  // 認証復旧時にフラグをクリア（tooltip も次更新で通常表示へ）
+            }
+
+            // Calendar API v3 クエリパラメータ（全カレンダー共通）
+            auto nowUtc = getCurrentUtcISO();
+            // JST の今日 00:00:00 に +48h - 1s = 翌日 JST 23:59:59。UTC に変換（-9h）して timeMax とする
+            SYSTEMTIME jstMidnight = utcToJst(utcNow);
+            jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
+            auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
+            auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
+            auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
+            std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
+            queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
+            queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
+            queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
+
+            // ポーリング対象カレンダー（primary + ext_calendar_ids）
+            std::vector<std::string> calendarIds = {"primary"};
+            for (const auto& id : cfg.extCalendarIds) calendarIds.push_back(id);
+
+            std::vector<CalendarEvent> events;
+            bool anySuccess  = false;
+            bool authFailed  = false;
+            ULONGLONG t0     = GetTickCount64();
+
+            for (const auto& calId : calendarIds) {
+                std::wstring calUrl = L"https://";
+                calUrl += CALENDAR_API_HOST;
+                calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
+                calUrl += queryParams;
+
+                DWORD httpStatus = 0;
+                auto body = httpGet(calUrl, g_accessToken, &httpStatus);
+
+                // 401: アクセストークン失効 → リフレッシュしてリトライ（非対話）
+                if (httpStatus == 401) {
+                    writeLog("access token expired (401), refreshing...");
+                    g_accessToken.clear();
+                    g_tokenExpiry = {};
+                    auto rr = tryRefreshAccessToken();
+                    if (rr != RefreshResult::Ok) {
+                        if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
+                        authFailed = true;
+                        break;
+                    }
+                    body = httpGet(calUrl, g_accessToken, &httpStatus);
+                }
+
+                if (body.empty()) {
+                    writeLog("poll: calendar " + calId + " failed"
+                        + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
+                    continue;
+                }
+
+                auto [calEvents, errorMsg] = parseCalendarEvents(body);
+                if (!errorMsg.empty()) {
+                    writeLog("poll: calendar " + calId + ": " + errorMsg);
+                    continue;
+                }
+
+                // カレンダー ID をプレフィックスとして付与（カレンダー間の ID 衝突を防ぐ）
+                for (auto& ev : calEvents) {
+                    if (!ev.id.empty()) ev.id = calId + "/" + ev.id;
+                }
+                events.insert(events.end(), calEvents.begin(), calEvents.end());
+                anySuccess = true;
+            }
+            ULONGLONG elapsed = GetTickCount64() - t0;
+
+            if (authFailed) {
+                // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
+                waitInterruptible(RETRY_WAIT_MS);
+                continue;
+            }
+
+            if (!anySuccess) {
+                writeLog("HTTP request failed");
+                showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
+                waitInterruptible(RETRY_WAIT_MS);
+                continue;
+            }
+
+            // 複数カレンダーのマージ結果を開始時刻でソート
+            std::sort(events.begin(), events.end(), [](const CalendarEvent& a, const CalendarEvent& b) {
+                return a.datetime < b.datetime;
+            });
+
+            g_lastErrorToastTime.store(0);
+            writeLog("poll: " + std::to_string(events.size()) + " events ("
+                + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
+
+            // ポーリング結果を通知スレッドへ渡す
+            {
+                std::vector<CalendarEvent> prevEvents;
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    prevEvents      = std::move(g_pendingEvents);
+                    g_pendingEvents = events;
+                    g_eventsUpdated = true;
+                }
+                g_cv.notify_one();
+                // 変更検知は当日の予定のみを対象とする
+                // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
+                // jstNow の年月日と一致するイベントのみ true を返す
+                auto isToday = [&](const CalendarEvent& e) {
+                    auto jst = utcIsoToJstSt(e.datetime);
+                    return jst && jst->wYear == jstNow.wYear
+                               && jst->wMonth == jstNow.wMonth
+                               && jst->wDay == jstNow.wDay;
+                };
+                std::vector<CalendarEvent> todayPrev, todayNew;
+                for (const auto& e : prevEvents) {
+                    if (isToday(e)) todayPrev.push_back(e);
+                }
+                for (const auto& e : events) {
+                    if (isToday(e)) todayNew.push_back(e);
+                }
+
+                std::vector<EventChange> changes;
+                if (baselineEstablished) {
+                    changes = collectEventChanges(todayPrev, todayNew);
+                }
+                notifyEventChanges(changes);
+                saveCacheFile(exeDir, events);
+                if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+            }
+
+            firstPoll           = false;
+            baselineEstablished = true;
+            g_lastPollTick.store(GetTickCount64());
+            waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
+        }
+        catch (...) {
+            writeLog("unexpected error in polling loop");
+            waitInterruptible(RETRY_WAIT_MS);
+        }
+    }
+
+    winrt::uninit_apartment();
+}
+
 int wmain() {
     // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
     auto exeDir = getExeDir();
@@ -3353,209 +3565,31 @@ int wmain() {
             writeLog("cache: loaded " + std::to_string(cachedEvents.size()) + " events from cache");
         }
 
-        int lastJstDay = -1;
-        bool firstPoll           = true;  // 起動時は schedule に関わらず必ず1回ポーリング
-        bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
+        // ポーリングスレッド起動
+        // メインスレッドはメッセージループに専念させるため、Calendar API ポーリング（HTTP I/O）を別スレッドへ分離する。
+        // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
+        std::thread pollThread(pollThreadFunc, exeDir, cfg);
 
-        while (!g_shutdownRequested) {
-            try {
-                // 対話的認証フロー実行中はトークン操作を一切行わない。
-                // これにより g_accessToken / g_tokenExpiry の data race と
-                // notifyAuthRequired の TOCTOU を回避する。
-                if (g_authInProgress.load()) {
-                    waitWithMessages(RETRY_WAIT_MS);
-                    continue;
-                }
-
-                // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
-                bool forceTriggered = g_forcePoll.exchange(false);
-                ULONGLONG tickNow   = GetTickCount64();
-                ULONGLONG lastTick  = g_lastPollTick.load();
-                bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
-
-                if ((forceTriggered || stale) && !firstPoll) {
-                    if (lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
-                        if (forceTriggered) writeLog("force poll skipped (cooldown)");
-                    }
-                    else {
-                        if (forceTriggered) writeLog("force poll triggered");
-                        if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
-                        firstPoll = true;
-                    }
-                }
-
-                SYSTEMTIME utcNow;
-                GetSystemTime(&utcNow);
-                auto jstNow = utcToJst(utcNow);
-
-                // 日付変更: 強制ポーリングと変更検知ベースラインをリセットする
-                // notifiedSet は通知スレッドが自然失効で管理する
-                if (static_cast<int>(jstNow.wDay) != lastJstDay) {
-                    lastJstDay          = static_cast<int>(jstNow.wDay);
-                    firstPoll           = true;
-                    baselineEstablished = false;
-                }
-
-                int pollsPerHour = cfg.schedule[jstNow.wHour];
-
-                // アクセストークン確保（非対話）。認証失敗時もブラウザは自動起動しない。
-                {
-                    auto rr = tryRefreshAccessToken();
-                    if (rr == RefreshResult::NetworkError) {
-                        // ネットワーク不通は接続エラー扱い。認証 Toast は出さない。
-                        // 後段の Calendar API 呼び出しでも失敗するため、そちらの「接続エラー」Toast に任せる。
-                        waitWithMessages(RETRY_WAIT_MS);
-                        continue;
-                    }
-                    if (rr == RefreshResult::AuthRequired) {
-                        notifyAuthRequired();  // Toast 表示（クールダウンつき）。ブラウザは開かない。
-                        waitWithMessages(RETRY_WAIT_MS);
-                        continue;
-                    }
-                    g_authRequired.store(false);  // 認証復旧時にフラグをクリア（tooltip も次更新で通常表示へ）
-                }
-
-                // Calendar API v3 クエリパラメータ（全カレンダー共通）
-                auto nowUtc = getCurrentUtcISO();
-                // JST の今日 00:00:00 に +48h - 1s = 翌日 JST 23:59:59。UTC に変換（-9h）して timeMax とする
-                SYSTEMTIME jstMidnight = utcToJst(utcNow);
-                jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
-                auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
-                auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
-                auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
-                std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
-                queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
-                queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
-                queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
-
-                // ポーリング対象カレンダー（primary + ext_calendar_ids）
-                std::vector<std::string> calendarIds = {"primary"};
-                for (const auto& id : cfg.extCalendarIds) calendarIds.push_back(id);
-
-                std::vector<CalendarEvent> events;
-                bool anySuccess  = false;
-                bool authFailed  = false;
-                ULONGLONG t0     = GetTickCount64();
-
-                for (const auto& calId : calendarIds) {
-                    std::wstring calUrl = L"https://";
-                    calUrl += CALENDAR_API_HOST;
-                    calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
-                    calUrl += queryParams;
-
-                    DWORD httpStatus = 0;
-                    auto body = httpGet(calUrl, g_accessToken, &httpStatus);
-
-                    // 401: アクセストークン失効 → リフレッシュしてリトライ（非対話）
-                    if (httpStatus == 401) {
-                        writeLog("access token expired (401), refreshing...");
-                        g_accessToken.clear();
-                        g_tokenExpiry = {};
-                        auto rr = tryRefreshAccessToken();
-                        if (rr != RefreshResult::Ok) {
-                            if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
-                            authFailed = true;
-                            break;
-                        }
-                        body = httpGet(calUrl, g_accessToken, &httpStatus);
-                    }
-
-                    if (body.empty()) {
-                        writeLog("poll: calendar " + calId + " failed"
-                            + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
-                        continue;
-                    }
-
-                    auto [calEvents, errorMsg] = parseCalendarEvents(body);
-                    if (!errorMsg.empty()) {
-                        writeLog("poll: calendar " + calId + ": " + errorMsg);
-                        continue;
-                    }
-
-                    // カレンダー ID をプレフィックスとして付与（カレンダー間の ID 衝突を防ぐ）
-                    for (auto& ev : calEvents) {
-                        if (!ev.id.empty()) ev.id = calId + "/" + ev.id;
-                    }
-                    events.insert(events.end(), calEvents.begin(), calEvents.end());
-                    anySuccess = true;
-                }
-                ULONGLONG elapsed = GetTickCount64() - t0;
-
-                if (authFailed) {
-                    // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
-                    waitWithMessages(RETRY_WAIT_MS);
-                    continue;
-                }
-
-                if (!anySuccess) {
-                    writeLog("HTTP request failed");
-                    showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
-                    waitWithMessages(RETRY_WAIT_MS);
-                    continue;
-                }
-
-                // 複数カレンダーのマージ結果を開始時刻でソート
-                std::sort(events.begin(), events.end(), [](const CalendarEvent& a, const CalendarEvent& b) {
-                    return a.datetime < b.datetime;
-                });
-
-                g_lastErrorToastTime.store(0);
-                writeLog("poll: " + std::to_string(events.size()) + " events ("
-                    + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
-
-                // ポーリング結果を通知スレッドへ渡す
-                {
-                    std::vector<CalendarEvent> prevEvents;
-                    {
-                        std::lock_guard<std::mutex> lk(g_mtx);
-                        prevEvents      = std::move(g_pendingEvents);
-                        g_pendingEvents = events;
-                        g_eventsUpdated = true;
-                    }
-                    g_cv.notify_one();
-                    // 変更検知は当日の予定のみを対象とする
-                    // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
-                    // jstNow の年月日と一致するイベントのみ true を返す
-                    auto isToday = [&](const CalendarEvent& e) {
-                        auto jst = utcIsoToJstSt(e.datetime);
-                        return jst && jst->wYear == jstNow.wYear
-                                   && jst->wMonth == jstNow.wMonth
-                                   && jst->wDay == jstNow.wDay;
-                    };
-                    std::vector<CalendarEvent> todayPrev, todayNew;
-                    for (const auto& e : prevEvents) {
-                        if (isToday(e)) todayPrev.push_back(e);
-                    }
-                    for (const auto& e : events) {
-                        if (isToday(e)) todayNew.push_back(e);
-                    }
-
-                    std::vector<EventChange> changes;
-                    if (baselineEstablished) {
-                        changes = collectEventChanges(todayPrev, todayNew);
-                    }
-                    notifyEventChanges(changes);
-                    saveCacheFile(exeDir, events);
-                    if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
-                }
-
-                firstPoll           = false;
-                baselineEstablished = true;
-                g_lastPollTick.store(GetTickCount64());
-                waitWithMessages(calcSleepUntilNextPoll(pollsPerHour));
-            }
-            catch (...) {
-                writeLog("unexpected error in polling loop");
-                waitWithMessages(RETRY_WAIT_MS);
-            }
+        // メッセージループ（純粋）
+        // GetMessage は WM_QUIT で 0 を返してループを抜ける。
+        // WM_QUIT は IDM_EXIT 等の終了経路で PostQuitMessage(0) により投函される。
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
+
+        // メッセージループ終了 → シャットダウン処理開始
+        g_shutdownRequested = true;
 
         // NIC 変化監視を解除してからスレッドを停止（コールバック発火を先に止める）
         // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
         if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
 
-        // 通知スレッドを停止
+        // バックグラウンドスレッドを停止
+        // 通知スレッドは条件変数で待機中の可能性があるため notify_one で起こす
         g_cv.notify_one();
+        pollThread.join();
         notifyThread.join();
 
         // ループ終了後のクリーンアップ
