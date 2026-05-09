@@ -96,6 +96,7 @@ static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
+static constexpr UINT WM_AUTH_REQUESTED  = WM_USER + 3;  // ユーザ操作による認証フロー起動要求
 
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
@@ -137,6 +138,9 @@ static constexpr int AUTH_CODE_TIMEOUT_SEC = 120;
 
 // エラー Toast の最小間隔（30 分）
 static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
+
+// 認証必要 Toast の最小間隔（30 分）
+static constexpr ULONGLONG AUTH_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 
 // 前回ポーリングからこの時間が経過したら即時ポーリング（1 時間）
 static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
@@ -190,11 +194,21 @@ static UINT WM_TASKBAR_CREATED = 0;
 static std::wstring   g_accessToken;
 static ULARGE_INTEGER g_tokenExpiry = {};
 
+// 認証フロー状態フラグ
+//
+// g_authRequired:    refresh_token が無効・未設定で、ユーザ操作によるフル OAuth が必要な状態
+// g_authInProgress:  startInteractiveAuth 実行中（二重起動防止用）
+// g_lastAuthToastTime: 認証 Toast の最終表示時刻（クールダウン制御用、GetTickCount64）
+static std::atomic<bool>      g_authRequired{false};
+static std::atomic<bool>      g_authInProgress{false};
+static std::atomic<ULONGLONG> g_lastAuthToastTime{0};
+
 // 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
 static void showToast(const std::wstring& timeJST, const std::wstring& title,
                       const std::wstring& permalink, bool silent = true);
 static std::wstring readRegString(const wchar_t* valueName);
 static void writeRegString(const wchar_t* valueName, const std::wstring& value);
+static void notifyAuthRequired();
 
 // ==================== データ構造 ====================
 
@@ -832,8 +846,17 @@ static bool exchangeCodeForTokens(const std::string& authCode,
     }
 }
 
+// リフレッシュ結果
+//
+// Ok:           アクセストークン取得成功（有効期限内 or refresh 成功）
+// NetworkError: ネットワーク不通・タイムアウト・5xx 等の一時エラー（認証 Toast を出さない）
+// AuthRequired: refresh_token なし or 4xx（invalid_grant 等）。フル OAuth が必要
+enum class RefreshResult { Ok, NetworkError, AuthRequired };
+
 // リフレッシュトークンでアクセストークンを更新する
-static bool refreshAccessToken(const std::wstring& refreshToken) {
+//
+// 戻り値: Ok / NetworkError / AuthRequired（呼び出し側で使い分ける）
+static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
     std::string body =
         "grant_type=refresh_token"
         "&refresh_token=" + urlEncode(wideToUtf8(refreshToken)) +
@@ -843,31 +866,40 @@ static bool refreshAccessToken(const std::wstring& refreshToken) {
     DWORD httpStatus = 0;
     std::wstring url = std::wstring(L"https://") + OAUTH_TOKEN_HOST + OAUTH_TOKEN_PATH;
     auto resp = httpPostForm(url, body, &httpStatus);
-    if (resp.empty() || httpStatus != 200) {
-        writeLog("refresh token failed: status " + std::to_string(httpStatus));
-        return false;
+
+    // status==0（接続失敗・タイムアウト・DNS 解決失敗）または 5xx は一時エラー扱い
+    if (httpStatus == 0 || (httpStatus >= 500 && httpStatus < 600)) {
+        writeLog("refresh token network error: status " + std::to_string(httpStatus));
+        return RefreshResult::NetworkError;
+    }
+
+    if (httpStatus != 200) {
+        // 4xx（invalid_grant など）はフル認証が必要
+        writeLog("refresh token rejected: status " + std::to_string(httpStatus));
+        return RefreshResult::AuthRequired;
     }
 
     try {
         auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
-        if (!applyTokenResponse(obj)) return false;
+        if (!applyTokenResponse(obj)) return RefreshResult::AuthRequired;
 
         writeLog("access token refreshed");
-        return true;
+        return RefreshResult::Ok;
     }
     catch (...) {
         writeLog("refresh token: JSON parse error");
-        return false;
+        return RefreshResult::AuthRequired;
     }
 }
 
-// アクセストークン確保のオーケストレータ
+// アクセストークン確保（非対話）
 //
-// 1. 有効期限内（5分マージン）なら即 return true
+// Toast もブラウザも起動しない。ポーリングループから呼び出される。
+// 1. 有効期限内（5 分マージン）なら即 Ok
 // 2. レジストリの refresh_token でリフレッシュを試みる
-// 3. 失敗なら Toast 通知でブラウザ認証フロー起動
-static bool ensureAccessToken() {
-    // 有効期限確認（5分のマージンを持たせる）
+// 3. refresh_token がなければ AuthRequired
+static RefreshResult tryRefreshAccessToken() {
+    // 有効期限確認（5 分のマージンを持たせる）
     if (!g_accessToken.empty()) {
         FILETIME ft = {};
         GetSystemTimeAsFileTime(&ft);
@@ -875,45 +907,69 @@ static bool ensureAccessToken() {
         now.LowPart  = ft.dwLowDateTime;
         now.HighPart = ft.dwHighDateTime;
         if (now.QuadPart + 5uLL * 60 * 10'000'000 < g_tokenExpiry.QuadPart)
-            return true;
+            return RefreshResult::Ok;
     }
 
-    // refresh_token でリフレッシュを試みる
     auto refreshToken = readRegString(REG_REFRESH_TOKEN);
-    if (!refreshToken.empty()) {
-        if (refreshAccessToken(refreshToken)) return true;
-        writeLog("refresh failed, falling back to full auth flow");
+    if (refreshToken.empty()) return RefreshResult::AuthRequired;
+
+    return refreshAccessToken(refreshToken);
+}
+
+// 対話的 OAuth フロー
+//
+// ユーザアクション（Toast クリック・未認証時のトレイ左クリック）からのみ起動される。
+// ループバックサーバを起動し、ブラウザで Google 認証画面を開いて authorization code を待ち受ける。
+// 二重起動は g_authInProgress で防止する。別スレッドで実行される想定。
+// 成功時: g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
+static void startInteractiveAuth() {
+    // 二重起動防止（CAS）
+    bool expected = false;
+    if (!g_authInProgress.compare_exchange_strong(expected, true)) {
+        writeLog("interactive auth already in progress, skip");
+        return;
     }
 
-    // フル認証フロー（ブラウザで OAuth 同意画面を開く）
-    writeLog("starting OAuth authorization flow");
-    showToast(L"認証が必要", L"ブラウザで Google 認証してください", L"");
+    bool succeeded = false;
+    try {
+        writeLog("starting OAuth authorization flow (user-initiated)");
 
-    SOCKET serverSocket = INVALID_SOCKET;
-    int port = startLoopbackServer(serverSocket);
-    if (port == 0) {
-        writeLog("failed to start loopback server");
-        return false;
+        SOCKET serverSocket = INVALID_SOCKET;
+        int port = startLoopbackServer(serverSocket);
+        if (port == 0) {
+            // startLoopbackServer 内で WSACleanup 済み（呼び出し側での後始末は不要）
+            writeLog("failed to start loopback server");
+        }
+        else {
+            // ループバックサーバ起動成功時はここで closesocket + WSACleanup を一括処理する
+            auto codeVerifier = generateCodeVerifier();
+            if (codeVerifier.empty()) {
+                writeLog("failed to generate PKCE code verifier");
+            }
+            else {
+                openBrowserForAuth(port, codeVerifier);
+
+                auto authCode = waitForAuthCode(serverSocket);
+                if (authCode.empty()) {
+                    writeLog("OAuth auth code not received (timeout?)");
+                }
+                else if (exchangeCodeForTokens(authCode, port, codeVerifier)) {
+                    succeeded = true;
+                }
+            }
+            closesocket(serverSocket);
+            WSACleanup();
+        }
+    }
+    catch (...) {
+        writeLog("interactive auth: unexpected exception");
     }
 
-    auto codeVerifier = generateCodeVerifier();
-    if (codeVerifier.empty()) {
-        writeLog("failed to generate PKCE code verifier");
-        closesocket(serverSocket);
-        WSACleanup();
-        return false;
+    if (succeeded) {
+        g_authRequired.store(false);
+        g_forcePoll.store(true);  // 認証成功直後に即時ポーリングを誘発
     }
-    openBrowserForAuth(port, codeVerifier);
-
-    auto authCode = waitForAuthCode(serverSocket);
-    closesocket(serverSocket);
-    WSACleanup();
-
-    if (authCode.empty()) {
-        writeLog("OAuth auth code not received (timeout?)");
-        return false;
-    }
-    return exchangeCodeForTokens(authCode, port, codeVerifier);
+    g_authInProgress.store(false);
 }
 
 // ==================== Calendar イベント処理 ====================
@@ -2242,6 +2298,80 @@ static void showErrorToast(const std::wstring& title, const std::wstring& body)
     }
 }
 
+// 認証必要 Toast を表示する
+//
+// XML に launch="auth" を付与し、Toast 本体クリックで Activated イベントが発火するようにする。
+// Activated ハンドラから WM_AUTH_REQUESTED を WndProc に送り、UI スレッド経由で startInteractiveAuth を起動する。
+//
+// ライフタイム対策: ToastNotification がスコープを抜けるとイベントが発火しないため、
+// プロセス寿命の static vector に保持して延命する（直近 4 件まで保持）。
+static void showAuthRequiredToast() {
+    static std::mutex                                                   tokensMtx;
+    static std::vector<winrt::Windows::UI::Notifications::ToastNotification> tokens;
+
+    std::wstring xml =
+        L"<toast launch=\"auth\" activationType=\"foreground\">"
+        L"<visual><binding template=\"ToastGeneric\">"
+        + buildIconTag() +
+        L"<text>Google 認証が必要です</text>"
+        L"<text>クリックしてブラウザで認証してください</text>"
+        L"</binding></visual>"
+        L"<audio silent=\"true\"/>"
+        L"</toast>";
+
+    try {
+        winrt::Windows::Data::Xml::Dom::XmlDocument doc;
+        doc.LoadXml(xml);
+
+        auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager
+            ::CreateToastNotifier(APP_AUMID);
+        winrt::Windows::UI::Notifications::ToastNotification notification(doc);
+
+        notification.Activated([](
+            winrt::Windows::UI::Notifications::ToastNotification const&,
+            winrt::Windows::Foundation::IInspectable const& args)
+        {
+            // Toast 本体クリック時は ToastActivatedEventArgs::Arguments() == launch 属性値（"auth"）
+            try {
+                auto e = args.try_as<winrt::Windows::UI::Notifications::ToastActivatedEventArgs>();
+                if (e && e.Arguments() != L"auth") return;
+            }
+            catch (...) { /* try_as 失敗は本体クリック扱いで続行 */ }
+            if (g_hWnd) PostMessage(g_hWnd, WM_AUTH_REQUESTED, 0, 0);
+        });
+
+        notifier.Show(notification);
+
+        std::lock_guard<std::mutex> lk(tokensMtx);
+        tokens.push_back(notification);
+        if (tokens.size() > 4) tokens.erase(tokens.begin());
+    }
+    catch (winrt::hresult_error const& e) {
+        writeLog("showAuthRequiredToast failed: " + winrt::to_string(e.message()));
+    }
+    catch (...) {
+        writeLog("showAuthRequiredToast failed: unknown exception");
+    }
+}
+
+// 認証必要状態の通知（状態遷移＋クールダウン制御つき）
+//
+// ポーリングループから呼び出される。認証フロー実行中は何もしない。
+// g_authRequired が false→true へ遷移したタイミング、または前回 Toast から
+// AUTH_TOAST_COOLDOWN_MS 以上経過した場合のみ Toast を表示する。
+static void notifyAuthRequired() {
+    if (g_authInProgress.load()) return;
+
+    bool wasFalse = !g_authRequired.exchange(true);
+    ULONGLONG now = GetTickCount64();
+    bool cooldownPassed = (now - g_lastAuthToastTime.load() >= AUTH_TOAST_COOLDOWN_MS);
+
+    if (wasFalse || cooldownPassed) {
+        g_lastAuthToastTime.store(now);
+        showAuthRequiredToast();
+    }
+}
+
 // ==================== トレイアイコン ====================
 
 // メッセージポンプしつつ指定時間（ミリ秒）待機する Sleep() 代替
@@ -2404,6 +2534,18 @@ static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
     g_tooltipUpdating = true;
+
+    // 未認証時はその旨を最優先で表示する（左クリックで認証フローを起動できる）
+    if (g_authRequired.load()) {
+        auto nid = makeTrayNid(hWnd);
+        nid.uFlags = NIF_TIP;
+        wcscpy_s(nid.szTip, L"Google 認証が必要です（クリックで開始）");
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+        updateTrayIcon(hWnd, false);
+        g_tooltipUpdating = false;
+        return;
+    }
+
     std::vector<CalendarEvent> events;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2583,6 +2725,13 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             updateTrayTooltip(hWnd);
         }
         else if (lParam == WM_LBUTTONUP) {
+            // 未認証時はメニューを挟まず即フロー起動（KISS）。tooltip で事前にユーザに告知済み
+            if (g_authRequired.load()) {
+                if (!g_authInProgress.load()) {
+                    std::thread(startInteractiveAuth).detach();
+                }
+                return 0;
+            }
             g_popupShowing.store(true);
             clearTrayTooltip(hWnd);
             showSchedulePopup(hWnd);
@@ -2593,6 +2742,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_UPDATE_TOOLTIP) {
         updateTrayTooltip(hWnd);
+        return 0;
+    }
+    if (msg == WM_AUTH_REQUESTED) {
+        if (!g_authInProgress.load()) {
+            std::thread(startInteractiveAuth).detach();
+        }
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_TOOLTIP_REFRESH) {
@@ -3204,6 +3359,14 @@ int wmain() {
 
         while (!g_shutdownRequested) {
             try {
+                // 対話的認証フロー実行中はトークン操作を一切行わない。
+                // これにより g_accessToken / g_tokenExpiry の data race と
+                // notifyAuthRequired の TOCTOU を回避する。
+                if (g_authInProgress.load()) {
+                    waitWithMessages(RETRY_WAIT_MS);
+                    continue;
+                }
+
                 // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
                 bool forceTriggered = g_forcePoll.exchange(false);
                 ULONGLONG tickNow   = GetTickCount64();
@@ -3235,12 +3398,21 @@ int wmain() {
 
                 int pollsPerHour = cfg.schedule[jstNow.wHour];
 
-                // アクセストークン確保（有効期限内 → 即 return、それ以外 → リフレッシュまたは完全認証）
-                if (!ensureAccessToken()) {
-                    writeLog("OAuth authentication failed");
-                    showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
-                    waitWithMessages(RETRY_WAIT_MS);
-                    continue;
+                // アクセストークン確保（非対話）。認証失敗時もブラウザは自動起動しない。
+                {
+                    auto rr = tryRefreshAccessToken();
+                    if (rr == RefreshResult::NetworkError) {
+                        // ネットワーク不通は接続エラー扱い。認証 Toast は出さない。
+                        // 後段の Calendar API 呼び出しでも失敗するため、そちらの「接続エラー」Toast に任せる。
+                        waitWithMessages(RETRY_WAIT_MS);
+                        continue;
+                    }
+                    if (rr == RefreshResult::AuthRequired) {
+                        notifyAuthRequired();  // Toast 表示（クールダウンつき）。ブラウザは開かない。
+                        waitWithMessages(RETRY_WAIT_MS);
+                        continue;
+                    }
+                    g_authRequired.store(false);  // 認証復旧時にフラグをクリア（tooltip も次更新で通常表示へ）
                 }
 
                 // Calendar API v3 クエリパラメータ（全カレンダー共通）
@@ -3274,12 +3446,14 @@ int wmain() {
                     DWORD httpStatus = 0;
                     auto body = httpGet(calUrl, g_accessToken, &httpStatus);
 
-                    // 401: アクセストークン失効 → リフレッシュしてリトライ
+                    // 401: アクセストークン失効 → リフレッシュしてリトライ（非対話）
                     if (httpStatus == 401) {
                         writeLog("access token expired (401), refreshing...");
                         g_accessToken.clear();
                         g_tokenExpiry = {};
-                        if (!ensureAccessToken()) {
+                        auto rr = tryRefreshAccessToken();
+                        if (rr != RefreshResult::Ok) {
+                            if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
                             authFailed = true;
                             break;
                         }
@@ -3308,7 +3482,7 @@ int wmain() {
                 ULONGLONG elapsed = GetTickCount64() - t0;
 
                 if (authFailed) {
-                    showErrorToast(L"認証エラー", L"Google 認証に失敗しました。ログを確認してください");
+                    // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
                     waitWithMessages(RETRY_WAIT_MS);
                     continue;
                 }
