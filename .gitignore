@@ -14,3 +14,5 @@ intro.mp3
 
 # git ワークツリー
 .worktrees/
+# Added by code-review-graph
+.code-review-graph/
