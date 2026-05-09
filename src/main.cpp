@@ -130,6 +130,9 @@ static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
 static constexpr wchar_t DEFAULT_SOUND_FILE[] = L"sound.wav";
 
+// 通知音 WAV ファイルの最大サイズ（バイト）。これを超えると不正ファイル扱いで読み込みを拒否する。
+static constexpr DWORD MAX_WAV_FILE_BYTES = 16u * 1024 * 1024;
+
 // 円周率（MSVC では M_PI に _USE_MATH_DEFINES が必要なため自前定義）
 static constexpr double PI = 3.14159265358979323846;
 
@@ -159,6 +162,9 @@ static constexpr const wchar_t* CALENDAR_API_HOST = L"www.googleapis.com";
 
 // PKCE code_verifier のバイト数（Base64url で 86 文字）
 static constexpr size_t PKCE_VERIFIER_BYTES = 64;
+
+// OAuth state パラメータの乱数バイト数（CSRF 耐性のため十分なエントロピー）
+static constexpr size_t OAUTH_STATE_BYTES = 32;
 
 // レジストリ値名（refresh token）
 static constexpr const wchar_t* REG_REFRESH_TOKEN = L"RefreshToken";
@@ -191,6 +197,9 @@ static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 static UINT WM_TASKBAR_CREATED = 0;
 
 // OAuth アクセストークンと有効期限（FILETIME 単位、100 ナノ秒）
+// pollThread と切り離し認証スレッド（startInteractiveAuth）から並行アクセスされるため
+// g_tokenMtx で保護する。読み書きは必ずロックを取得して行うこと。
+static std::mutex     g_tokenMtx;
 static std::wstring   g_accessToken;
 static ULARGE_INTEGER g_tokenExpiry = {};
 
@@ -493,19 +502,30 @@ static void logSchedule(const std::vector<int>& schedule) {
     writeLog(s);
 }
 
-// 次のポーリング予定時刻を "HH:MM" 形式で返す（calcSleepUntilNextPoll と同じロジック）
-static std::string nextPollTimeStr(int pollsPerHour) {
+// 次のポーリング予定時刻（時・分）を計算する共通ロジック
+// 60/pollsPerHour 分間隔で正時 :00 起点。次の境界が 60 分以上に達したら翌時 00 分へ繰り上げる。
+// 設定ロード側で [1, 60] にクランプ済みだが、ヘルパー単体での除算ゼロを防ぐためガードする。
+static void calcNextPollTime(int pollsPerHour, int& outHour, int& outMin) {
+    if (pollsPerHour <= 0) pollsPerHour = 1;
     SYSTEMTIME now;
     GetLocalTime(&now);
-    int nextHour = now.wHour;
     int intervalMin = 60 / pollsPerHour;
     int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
+    int nextHour = now.wHour;
     if (nextMin >= 60) {
         nextMin  = 0;
         nextHour = (now.wHour + 1) % 24;
     }
+    outHour = nextHour;
+    outMin  = nextMin;
+}
+
+// 次のポーリング予定時刻を "HH:MM" 形式で返す
+static std::string nextPollTimeStr(int pollsPerHour) {
+    int h = 0, m = 0;
+    calcNextPollTime(pollsPerHour, h, m);
     char buf[6];
-    sprintf_s(buf, sizeof(buf), "%02d:%02d", nextHour, nextMin);
+    sprintf_s(buf, sizeof(buf), "%02d:%02d", h, m);
     return buf;
 }
 
@@ -514,10 +534,11 @@ static std::string nextPollTimeStr(int pollsPerHour) {
 static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    int intervalMin = 60 / pollsPerHour;
-    int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
-    if (nextMin > 60) nextMin = 60;
-    long long sleepMs = (long long)(nextMin - now.wMinute) * 60000LL
+    int nextHour = 0, nextMin = 0;
+    calcNextPollTime(pollsPerHour, nextHour, nextMin);
+    // 翌時 00 分への繰り上がりは「現在時の 60 分時点」として扱う
+    int targetMinFromNowHour = (nextHour == now.wHour) ? nextMin : 60;
+    long long sleepMs = (long long)(targetMinFromNowHour - now.wMinute) * 60000LL
                         - (long long)now.wSecond * 1000LL
                         - (long long)now.wMilliseconds;
     if (sleepMs < 1000) sleepMs = 1000;
@@ -649,6 +670,18 @@ static std::string generateCodeVerifier() {
     return base64urlEncode(buf, sizeof(buf));
 }
 
+// OAuth state パラメータ生成（BCryptGenRandom + Base64url）
+// 認可リクエストとリダイレクト応答の対応関係を検証して CSRF 攻撃を防ぐ。
+// 失敗時は空文字列を返し、呼び出し元で認証フローを中止する。
+static std::string generateOAuthState() {
+    unsigned char buf[OAUTH_STATE_BYTES];
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, buf, sizeof(buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        writeLog("BCryptGenRandom failed (state)");
+        return {};
+    }
+    return base64urlEncode(buf, sizeof(buf));
+}
+
 // PKCE code_challenge 生成（SHA-256 + Base64url）
 // 各 BCrypt API の失敗時はリソースを解放して空文字列を返す
 static std::string generateCodeChallenge(const std::string& verifier) {
@@ -722,7 +755,9 @@ static int startLoopbackServer(SOCKET& serverSocket) {
 }
 
 // OAuth 認証 URL を構築してブラウザを開く
-static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier) {
+static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier,
+    const std::string& state)
+{
     auto challenge = generateCodeChallenge(codeVerifier);
     std::string redirectUri = "http://127.0.0.1:" + std::to_string(redirectPort);
     std::string url = wideToUtf8(OAUTH_AUTH_URL);
@@ -734,19 +769,45 @@ static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier
     url += "&code_challenge_method=S256";
     url += "&access_type=offline";
     url += "&prompt=consent";
+    url += "&state="                 + urlEncode(state);
     ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// クエリ文字列から指定キーの値を抽出する
+// req は HTTP リクエスト全体、key は "code" や "state"（"=" は不要）。
+// 見つからない場合は空文字列。値の URL デコードまでは行わない（ASCII 範囲のみ想定）。
+static std::string extractQueryValue(const std::string& req, const std::string& key) {
+    std::string pattern = key + "=";
+    size_t pos = req.find(pattern);
+    if (pos == std::string::npos) return {};
+    pos += pattern.size();
+    size_t end = req.find_first_of("& \r\n", pos);
+    if (end == std::string::npos) end = req.size();
+    return req.substr(pos, end - pos);
 }
 
 // ループバックサーバで認証コードを待ち受ける（120秒タイムアウト）
 // select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
 // \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
-static std::string waitForAuthCode(SOCKET serverSocket) {
-    // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(serverSocket, &readSet);
-    timeval tv = { AUTH_CODE_TIMEOUT_SEC, 0 };
-    if (select(0, &readSet, nullptr, nullptr, &tv) <= 0) return {};
+// expectedState が非空の場合、受信した state と一致しなければ空文字列を返す（CSRF 対策）。
+// シャットダウン要求時は 1 秒以内にループから抜けて空文字列を返す（プロセス停止を阻害しないため）。
+static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState) {
+    // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
+    // 1 秒ごとに g_shutdownRequested を確認し、必要なら早期に脱出する。
+    int waited = 0;
+    int ready  = 0;
+    while (waited < AUTH_CODE_TIMEOUT_SEC) {
+        if (g_shutdownRequested.load()) return {};
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(serverSocket, &readSet);
+        timeval tv = { 1, 0 };
+        ready = select(0, &readSet, nullptr, nullptr, &tv);
+        if (ready < 0) return {};
+        if (ready > 0) break;
+        ++waited;
+    }
+    if (ready <= 0) return {};
 
     SOCKET client = accept(serverSocket, nullptr, nullptr);
     if (client == INVALID_SOCKET) return {};
@@ -765,7 +826,9 @@ static std::string waitForAuthCode(SOCKET serverSocket) {
         req.append(chunk, static_cast<size_t>(n));
     }
 
-    static const char* response =
+    // 認証完了応答（UTF-8 バイト列で「認証完了。このタブは閉じてください。」を埋め込む）
+    // 完成後の HTML をブラウザに返してタブのクローズを促す。
+    static const char* RESPONSE_OK =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
@@ -773,30 +836,53 @@ static std::string waitForAuthCode(SOCKET serverSocket) {
         "\xE3\x81\x93\xE3\x81\xAE\xE3\x82\xBF\xE3\x83\x96\xE3\x81\xAF\xE9\x96\x89\xE3"
         "\x81\x98\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80"
         "\x82</p></body></html>";
-    send(client, response, static_cast<int>(strlen(response)), 0);
+
+    // state ミスマッチ応答（UTF-8 で「認証情報が一致しません。再度お試しください。」を埋め込む）
+    // ユーザに認証完了と誤認させないため、state 検証失敗時はこちらを返す。
+    static const char* RESPONSE_STATE_MISMATCH =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE6\x83\x85\xE5\xA0\xB1\xE3\x81\x8C"
+        "\xE4\xB8\x80\xE8\x87\xB4\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x9B\xE3\x82\x93\xE3"
+        "\x80\x82\xE5\x86\x8D\xE5\xBA\xA6\xE3\x81\x8A\xE8\xA9\xA6\xE3\x81\x97\xE3\x81"
+        "\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p></body></html>";
+
+    // state 検証を最初に行う（CSRF 対策）。失敗時はエラー応答を返してから終了する。
+    if (!expectedState.empty()) {
+        auto receivedState = extractQueryValue(req, "state");
+        if (receivedState != expectedState) {
+            writeLog("OAuth state mismatch: ignoring callback");
+            send(client, RESPONSE_STATE_MISMATCH, static_cast<int>(strlen(RESPONSE_STATE_MISMATCH)), 0);
+            closesocket(client);
+            return {};
+        }
+    }
+
+    send(client, RESPONSE_OK, static_cast<int>(strlen(RESPONSE_OK)), 0);
     closesocket(client);
 
-    // GET /?code=xxxx から auth_code を抽出
-    size_t codePos = req.find("code=");
-    if (codePos == std::string::npos) return {};
-    codePos += 5;
-    size_t codeEnd = req.find_first_of("& \r\n", codePos);
-    if (codeEnd == std::string::npos) codeEnd = req.size();
-    return req.substr(codePos, codeEnd - codePos);
+    return extractQueryValue(req, "code");
 }
 
 // トークンレスポンス JSON からアクセストークンと有効期限を更新する
 // access_token が含まれない場合は false を返す
+// g_tokenMtx を取得してから書き込む（並行スレッドからの読み出しと競合しないため）
 static bool applyTokenResponse(const winrt::Windows::Data::Json::JsonObject& obj) {
     if (!obj.HasKey(L"access_token")) return false;
-    g_accessToken = obj.GetNamedString(L"access_token", L"").c_str();
+    auto token = obj.GetNamedString(L"access_token", L"").c_str();
 
     double expiresIn = obj.GetNamedNumber(L"expires_in", 3600);
     FILETIME ft = {};
     GetSystemTimeAsFileTime(&ft);
-    g_tokenExpiry.LowPart  = ft.dwLowDateTime;
-    g_tokenExpiry.HighPart = ft.dwHighDateTime;
-    g_tokenExpiry.QuadPart += static_cast<ULONGLONG>(expiresIn * 10'000'000.0);
+    ULARGE_INTEGER expiry;
+    expiry.LowPart  = ft.dwLowDateTime;
+    expiry.HighPart = ft.dwHighDateTime;
+    expiry.QuadPart += static_cast<ULONGLONG>(expiresIn * 10'000'000.0);
+
+    std::lock_guard<std::mutex> lk(g_tokenMtx);
+    g_accessToken = token;
+    g_tokenExpiry = expiry;
     return true;
 }
 
@@ -900,14 +986,17 @@ static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
 // 3. refresh_token がなければ AuthRequired
 static RefreshResult tryRefreshAccessToken() {
     // 有効期限確認（5 分のマージンを持たせる）
-    if (!g_accessToken.empty()) {
-        FILETIME ft = {};
-        GetSystemTimeAsFileTime(&ft);
-        ULARGE_INTEGER now;
-        now.LowPart  = ft.dwLowDateTime;
-        now.HighPart = ft.dwHighDateTime;
-        if (now.QuadPart + 5uLL * 60 * 10'000'000 < g_tokenExpiry.QuadPart)
-            return RefreshResult::Ok;
+    {
+        std::lock_guard<std::mutex> lk(g_tokenMtx);
+        if (!g_accessToken.empty()) {
+            FILETIME ft = {};
+            GetSystemTimeAsFileTime(&ft);
+            ULARGE_INTEGER now;
+            now.LowPart  = ft.dwLowDateTime;
+            now.HighPart = ft.dwHighDateTime;
+            if (now.QuadPart + 5uLL * 60 * 10'000'000 < g_tokenExpiry.QuadPart)
+                return RefreshResult::Ok;
+        }
     }
 
     auto refreshToken = readRegString(REG_REFRESH_TOKEN);
@@ -930,6 +1019,17 @@ static void startInteractiveAuth() {
         return;
     }
 
+    // 切り離しスレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
+    // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存する。
+    bool comInitialized = false;
+    try {
+        winrt::init_apartment();
+        comInitialized = true;
+    }
+    catch (...) {
+        writeLog("interactive auth: winrt::init_apartment failed");
+    }
+
     bool succeeded = false;
     try {
         writeLog("starting OAuth authorization flow (user-initiated)");
@@ -943,15 +1043,16 @@ static void startInteractiveAuth() {
         else {
             // ループバックサーバ起動成功時はここで closesocket + WSACleanup を一括処理する
             auto codeVerifier = generateCodeVerifier();
-            if (codeVerifier.empty()) {
-                writeLog("failed to generate PKCE code verifier");
+            auto stateValue   = generateOAuthState();
+            if (codeVerifier.empty() || stateValue.empty()) {
+                writeLog("failed to generate PKCE/state");
             }
             else {
-                openBrowserForAuth(port, codeVerifier);
+                openBrowserForAuth(port, codeVerifier, stateValue);
 
-                auto authCode = waitForAuthCode(serverSocket);
+                auto authCode = waitForAuthCode(serverSocket, stateValue);
                 if (authCode.empty()) {
-                    writeLog("OAuth auth code not received (timeout?)");
+                    writeLog("OAuth auth code not received (timeout/state mismatch)");
                 }
                 else if (exchangeCodeForTokens(authCode, port, codeVerifier)) {
                     succeeded = true;
@@ -969,6 +1070,7 @@ static void startInteractiveAuth() {
         g_authRequired.store(false);
         g_forcePoll.store(true);  // 認証成功直後に即時ポーリングを誘発
     }
+    if (comInitialized) winrt::uninit_apartment();
     g_authInProgress.store(false);
 }
 
@@ -1118,6 +1220,42 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 
 // ==================== イベントキャッシュ ====================
 
+// JSON 文字列をアトミックにファイルへ書き出す（"<path>.tmp" 経由で MoveFileEx 置換）
+// 電源断・クラッシュで本体ファイルが壊れる可能性を避ける。
+// logTag はエラー出力用の識別子（"cache" / "muted" 等）。成功時 true、失敗時 false。
+static bool atomicWriteJson(const std::wstring& path, const std::string& json,
+    const char* logTag)
+{
+    auto tmpPath = path + L".tmp";
+    HANDLE hFile = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        writeLog(std::string(logTag) + ": save failed (CreateFileW error "
+            + std::to_string(GetLastError()) + ")");
+        return false;
+    }
+    DWORD written = 0;
+    BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+    if (writeOk && written == static_cast<DWORD>(json.size())) {
+        FlushFileBuffers(hFile);
+    }
+    CloseHandle(hFile);
+    if (!writeOk || written != static_cast<DWORD>(json.size())) {
+        writeLog(std::string(logTag) + ": write failed ("
+            + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmpPath.c_str(), path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        writeLog(std::string(logTag) + ": rename failed (error "
+            + std::to_string(GetLastError()) + ")");
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    return true;
+}
+
 // イベントキャッシュの保存
 // ポーリング成功時に呼び出し、イベントリストを JSON ファイルに上書き保存する。
 // ファイル I/O はロック外で呼ぶこと（events は呼び出し元のローカルコピー）。
@@ -1137,20 +1275,7 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
             arr.Append(obj);
         }
         auto json = winrt::to_string(arr.Stringify());
-
-        auto path = dir + L"\\" + CACHE_FILENAME;
-        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            writeLog("cache: save failed (CreateFileW error " + std::to_string(GetLastError()) + ")");
-            return;
-        }
-        DWORD written = 0;
-        BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
-        CloseHandle(hFile);
-        if (!writeOk || written != static_cast<DWORD>(json.size())) {
-            writeLog("cache: write failed (" + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
-        }
+        atomicWriteJson(dir + L"\\" + CACHE_FILENAME, json, "cache");
     }
     catch (...) {
         writeLog("cache: save failed (exception)");
@@ -1247,19 +1372,7 @@ static void saveMutedEvents(const std::wstring& dir) {
             }
         }
         auto json = winrt::to_string(arr.Stringify());
-
-        auto path = dir + L"\\" + MUTED_CACHE_FILENAME;
-        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            writeLog("muted: save failed (CreateFileW error " + std::to_string(GetLastError()) + ")");
-            return;
-        }
-        DWORD written = 0;
-        BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
-        CloseHandle(hFile);
-        if (!writeOk || written != static_cast<DWORD>(json.size()))
-            writeLog("muted: write failed (" + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+        atomicWriteJson(dir + L"\\" + MUTED_CACHE_FILENAME, json, "muted");
     }
     catch (...) {
         writeLog("muted: save failed (exception)");
@@ -1843,6 +1956,17 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
         return;
     }
 
+    // ファイルサイズ上限の検証（不正ファイルでの過大メモリ確保を防止）
+    {
+        LARGE_INTEGER fsz = {};
+        if (!GetFileSizeEx(hFile, &fsz) || fsz.QuadPart <= 0
+                || static_cast<ULONGLONG>(fsz.QuadPart) > MAX_WAV_FILE_BYTES) {
+            writeLog("loadWavAndNormalize: sound.wav size out of range");
+            CloseHandle(hFile);
+            return;
+        }
+    }
+
     WAVEFORMATEX wavFmt = {};
     std::vector<int16_t> samples;
 
@@ -1885,7 +2009,11 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                     writeLog("loadWavAndNormalize: data chunk before fmt chunk");
                     goto cleanup;
                 }
-                // data チャンク全体を一括読み込み
+                // data チャンク全体を一括読み込み（チャンクサイズも上限で防御）
+                if (chunkSize > MAX_WAV_FILE_BYTES) {
+                    writeLog("loadWavAndNormalize: data chunk size out of range");
+                    goto cleanup;
+                }
                 DWORD totalBytes = chunkSize;
                 samples.resize(totalBytes / sizeof(int16_t));
                 ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr);
@@ -2097,10 +2225,12 @@ cleanup:
 
 // 通知音を再生し、ダッキング解除するスレッド関数
 //
-// STA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
+// MTA で COM 初期化し、playWavToWasapi を同期呼び出しで実行する。
 // 末尾ガードトーン再生完了後にダッキングを解除する。
+// 呼び出し元の通知スレッド（notifyThreadFunc）も MTA のため、
+// duckAudioSessions が確保した ISimpleAudioVolume をマーシャリング無しで安全に解放できる。
 static DWORD WINAPI soundThread(LPVOID param) {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto* ctx  = static_cast<SoundContext*>(param);
     bool comOk = (hr == S_OK || hr == S_FALSE);
 
@@ -2134,6 +2264,21 @@ static void launchSound(const Config& cfg) {
         return;
     }
 
+    // 前回スレッドの完了を待ってから新スレッドを起動する
+    // 旧スレッドが再生中に新スレッドを起動すると、旧スレッドの unduck と新スレッドの duck が競合し、
+    // 新スレッド再生中に他プロセスが意図せずミュート解除される問題が起きる。
+    // 通知間隔は分単位、WAV は数秒なので待機しても実害はない。
+    // 想定外の長時間化に備えて 10 秒タイムアウトを設けている。
+    if (g_soundThread) {
+        DWORD waitResult = WaitForSingleObject(g_soundThread, 10000);
+        if (waitResult == WAIT_TIMEOUT) {
+            writeLog("launchSound: previous sound thread did not finish, skipping new sound");
+            return;
+        }
+        CloseHandle(g_soundThread);
+        g_soundThread = nullptr;
+    }
+
     // ダッキング開始（通知音再生前にミュート）
     auto mutedSessions = duckAudioSessions(cfg.duckTargets);
 
@@ -2142,13 +2287,6 @@ static void launchSound(const Config& cfg) {
         .cfg   = cfg,
         .muted = std::move(mutedSessions)
     };
-    // 前回スレッドが完了していれば解放（通常はとっくに終わっているが念のため）
-    if (g_soundThread) {
-        if (WaitForSingleObject(g_soundThread, 0) == WAIT_OBJECT_0) {
-            CloseHandle(g_soundThread);
-            g_soundThread = nullptr;
-        }
-    }
 
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
@@ -2685,55 +2823,245 @@ static void showSchedulePopup(HWND hWnd) {
 }
 
 // トレイアイコン用ウィンドウプロシージャ
+// 右クリックトレイメニューの構築と表示
+// メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
+// その場で構築する（チェック状態は呼び出し時の最新値を反映）。
+static void showTrayContextMenu(HWND hWnd) {
+    g_popupShowing.store(true);
+    clearTrayTooltip(hWnd);
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // 音声通知（親: レジストリ永続化）
+    AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
+        IDM_SOUND_ENABLED, L"通知音を鳴らす");
+
+    // 子項目: 親が OFF なら非活性
+    UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
+    AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
+        IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
+
+    // スタートアップ登録トグル（HKCU Run キー）
+    AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
+        IDM_STARTUP, L"スタートアップ登録");
+
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
+    forceForeground(hWnd);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+    DestroyMenu(hMenu);
+    g_popupShowing.store(false);
+    updateTrayTooltip(hWnd);
+}
+
+// トレイアイコン左クリック時の処理
+// 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
+static void handleTrayLeftClick(HWND hWnd) {
+    // 未認証時はメニューを挟まず即フロー起動（KISS）。tooltip で事前にユーザに告知済み
+    if (g_authRequired.load()) {
+        if (!g_authInProgress.load()) {
+            std::thread(startInteractiveAuth).detach();
+        }
+        return;
+    }
+    g_popupShowing.store(true);
+    clearTrayTooltip(hWnd);
+    showSchedulePopup(hWnd);
+    g_popupShowing.store(false);
+    updateTrayTooltip(hWnd);
+}
+
+// 当日ログファイルのパスを取得し、存在しなければ logs フォルダのパスを返す
+static std::wstring getCurrentLogTarget() {
+    if (g_logDir.empty()) return {};
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    st = utcToJst(st);
+    char dateBuf[12];
+    sprintf_s(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    std::wstring logPath = g_logDir + L"\\" + toWide(dateBuf) + L".log";
+    DWORD attr = GetFileAttributesW(logPath.c_str());
+    bool logExists = (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+    return logExists ? logPath : g_logDir;
+}
+
+// WM_COMMAND ディスパッチ
+// メニュー選択（IDM_*）と予定一覧クリック（IDM_EVENT_BASE 以降）を処理する。
+static void handleTrayCommand(UINT id) {
+    if (id == IDM_EXIT) {
+        // 終了要求
+        // g_shutdownRequested フラグでバックグラウンドスレッドへ伝達し、
+        // PostQuitMessage で wmain のメッセージループを抜ける
+        g_shutdownRequested = true;
+        PostQuitMessage(0);
+        return;
+    }
+    if (id == IDM_SOUND_ENABLED) {
+        // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
+        g_soundEnabled.store(!g_soundEnabled.load());
+        writeRegDword(REG_SOUND_ENABLED, g_soundEnabled.load() ? 1u : 0u);
+        return;
+    }
+    if (id == IDM_MUTE_IN_MEETING) {
+        // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
+        if (g_soundEnabled.load()) {
+            g_muteInMeeting.store(!g_muteInMeeting.load());
+            writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
+        }
+        return;
+    }
+    if (id == IDM_STARTUP) {
+        if (isStartupRegistered()) unregisterStartup();
+        else                       registerStartup();
+        return;
+    }
+    if (id == IDM_OPEN_GITHUB) {
+        ShellExecuteW(nullptr, L"open", GITHUB_URL, nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id == IDM_OPEN_CALENDAR_TODAY) {
+        ShellExecuteW(nullptr, L"open", CALENDAR_TODAY_URL, nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id == IDM_OPEN_CONFIG) {
+        // 設定ファイルを OS デフォルトのエディタで開く（変更反映には再起動が必要）
+        std::wstring toml = getExeDir() + L"\\gcalntfy.toml";
+        ShellExecuteW(nullptr, L"open", toml.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id == IDM_OPEN_LOG) {
+        auto target = getCurrentLogTarget();
+        if (!target.empty())
+            ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
+        UINT idx = id - IDM_EVENT_BASE;
+        if (idx < g_scheduleItems.size() && isHttpUrl(g_scheduleItems[idx].permalink)) {
+            ShellExecuteW(nullptr, L"open", g_scheduleItems[idx].permalink.c_str(),
+                          nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+}
+
+// 左クリックポップアップの owner-draw 項目サイズ計算
+// 戻り値: TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
+static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
+    if (mis->CtlType != ODT_MENU) return FALSE;
+    UINT eidx = static_cast<UINT>(mis->itemData);
+    if (eidx >= g_scheduleItems.size()) return FALSE;
+    const auto& item = g_scheduleItems[eidx];
+    HDC   hdc = GetDC(hWnd);
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    SIZE  sz  = {};
+    GetTextExtentPoint32W(hdc, item.label.c_str(),
+        static_cast<int>(item.label.size()), &sz);
+    SelectObject(hdc, old);
+    ReleaseDC(hWnd, hdc);
+    // 左右パディングとして 16 px ずつ確保する
+    mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
+    mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
+    return TRUE;
+}
+
+// 左クリックポップアップの owner-draw 項目描画
+// ODS_SELECTED に応じた背景色・テキスト色を切り替え、muted フラグが立つ項目には
+// DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
+    if (dis->CtlType != ODT_MENU) return FALSE;
+    UINT eidx = static_cast<UINT>(dis->itemData);
+    if (eidx >= g_scheduleItems.size()) return FALSE;
+    const auto& item     = g_scheduleItems[eidx];
+    bool        selected = (dis->itemState & ODS_SELECTED) != 0;
+
+    FillRect(dis->hDC, &dis->rcItem,
+        reinterpret_cast<HBRUSH>(
+            static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+
+    RECT textRect  = dis->rcItem;
+    textRect.left += 16;
+    SetBkMode(dis->hDC, TRANSPARENT);
+    COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+    SetTextColor(dis->hDC, textColor);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
+    DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    if (item.muted) {
+        SIZE sz = {};
+        GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
+            static_cast<int>(item.label.size()), &sz);
+        constexpr int STRIKE_THICKNESS = 2;
+        // 中央から 1 px だけ下寄せにして視認性を上げる
+        constexpr int STRIKE_Y_OFFSET  = 1;
+        // テキスト左端より 3 px、右端より 4 px 外側まで線を伸ばす
+        constexpr int STRIKE_MARGIN_LEFT  = 3;
+        constexpr int STRIKE_MARGIN_RIGHT = 4;
+        int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
+        RECT strikeRect = {
+            textRect.left - STRIKE_MARGIN_LEFT,
+            lineY - STRIKE_THICKNESS / 2,
+            textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
+            lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
+        };
+        HBRUSH hLineBrush = CreateSolidBrush(textColor);
+        FillRect(dis->hDC, &strikeRect, hLineBrush);
+        DeleteObject(hLineBrush);
+    }
+    SelectObject(dis->hDC, oldFont);
+    return TRUE;
+}
+
+// 予定項目の通知抑制をトグルする（左クリックポップアップ上の右クリック）
+// g_mutedEvents と item.muted をトグルし、自スレッド所有のメニューウィンドウを再描画する。
+static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
+    UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
+    if (id < IDM_EVENT_BASE || id >= IDM_EVENT_MAX) return;
+    UINT eidx = id - IDM_EVENT_BASE;
+    if (eidx >= g_scheduleItems.size()) return;
+
+    auto& item = g_scheduleItems[eidx];
+    bool nowMuted;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_mutedEvents.find(item.key);
+        if (it != g_mutedEvents.end()) {
+            g_mutedEvents.erase(it);
+            nowMuted = false;
+        }
+        else {
+            g_mutedEvents[item.key] = item.date;
+            nowMuted = true;
+        }
+    }
+    item.muted = nowMuted;
+    // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
+    // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
+    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
+        wchar_t className[16] = {};
+        if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
+            && wcscmp(className, L"#32768") == 0) {
+            InvalidateRect(hwnd, nullptr, TRUE);
+            UpdateWindow(hwnd);
+        }
+        return TRUE;
+    }, 0);
+    saveMutedEvents(g_exeDir);
+    g_forcePoll.store(true);
+    writeLog(std::string("muted: ") + (nowMuted ? "added " : "removed ") + item.key);
+}
+
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
-            g_popupShowing.store(true);
-            clearTrayTooltip(hWnd);
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-
-            // 音声通知（親: レジストリ永続化）
-            AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
-                IDM_SOUND_ENABLED, L"通知音を鳴らす");
-
-            // 子項目: 親が OFF なら非活性
-            UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
-            AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
-                IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
-
-            // スタートアップ登録トグル（HKCU Run キー）
-            AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
-                IDM_STARTUP, L"スタートアップ登録");
-
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
-            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
-            forceForeground(hWnd);
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
-            DestroyMenu(hMenu);
-            g_popupShowing.store(false);
-            updateTrayTooltip(hWnd);
-        }
-        else if (lParam == WM_LBUTTONUP) {
-            // 未認証時はメニューを挟まず即フロー起動（KISS）。tooltip で事前にユーザに告知済み
-            if (g_authRequired.load()) {
-                if (!g_authInProgress.load()) {
-                    std::thread(startInteractiveAuth).detach();
-                }
-                return 0;
-            }
-            g_popupShowing.store(true);
-            clearTrayTooltip(hWnd);
-            showSchedulePopup(hWnd);
-            g_popupShowing.store(false);
-            updateTrayTooltip(hWnd);
-        }
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
+            showTrayContextMenu(hWnd);
+        else if (lParam == WM_LBUTTONUP)
+            handleTrayLeftClick(hWnd);
         return 0;
     }
     if (msg == WM_UPDATE_TOOLTIP) {
@@ -2751,179 +3079,21 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_COMMAND) {
-        UINT id = LOWORD(wParam);
-        if (id == IDM_EXIT) {
-            // 終了要求
-            // g_shutdownRequested フラグでバックグラウンドスレッドへ伝達し、
-            // PostQuitMessage で wmain のメッセージループを抜ける
-            g_shutdownRequested = true;
-            PostQuitMessage(0);
-        }
-        else if (id == IDM_SOUND_ENABLED) {
-            // load/store を明示（WndProc はシングルスレッドだが意図を明確にする）
-            g_soundEnabled.store(!g_soundEnabled.load());
-            writeRegDword(REG_SOUND_ENABLED, g_soundEnabled.load() ? 1u : 0u);
-        }
-        else if (id == IDM_MUTE_IN_MEETING) {
-            // 音声通知 OFF 中はグレーアウト項目への誤クリックを無視する
-            if (g_soundEnabled.load()) {
-                g_muteInMeeting.store(!g_muteInMeeting.load());
-                writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
-            }
-        }
-        else if (id == IDM_STARTUP) {
-            if (isStartupRegistered()) {
-                unregisterStartup();
-            }
-            else {
-                registerStartup();
-            }
-        }
-        else if (id == IDM_OPEN_GITHUB) {
-            ShellExecuteW(nullptr, L"open", GITHUB_URL, nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        else if (id == IDM_OPEN_CALENDAR_TODAY) {
-            ShellExecuteW(nullptr, L"open", CALENDAR_TODAY_URL, nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        else if (id == IDM_OPEN_CONFIG) {
-            // 設定ファイルを OS デフォルトのエディタで開く（変更反映には再起動が必要）
-            std::wstring toml = getExeDir() + L"\\gcalntfy.toml";
-            ShellExecuteW(nullptr, L"open", toml.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        else if (id == IDM_OPEN_LOG) {
-            // 当日のログファイルを開く（なければ logs フォルダをエクスプローラで開く）
-            if (g_logDir.empty()) return 0;
-            SYSTEMTIME st;
-            GetSystemTime(&st);
-            st = utcToJst(st);
-            char dateBuf[12];
-            sprintf_s(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
-            std::wstring logPath = g_logDir + L"\\" + toWide(dateBuf) + L".log";
-            DWORD attr = GetFileAttributesW(logPath.c_str());
-            bool logExists = (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
-            const wchar_t* target = logExists ? logPath.c_str() : g_logDir.c_str();
-            ShellExecuteW(nullptr, L"open", target, nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        else if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
-            UINT idx = id - IDM_EVENT_BASE;
-            if (idx < g_scheduleItems.size() && isHttpUrl(g_scheduleItems[idx].permalink)) {
-                ShellExecuteW(nullptr, L"open", g_scheduleItems[idx].permalink.c_str(),
-                              nullptr, nullptr, SW_SHOWNORMAL);
-            }
-        }
+        handleTrayCommand(LOWORD(wParam));
         return 0;
     }
-    // 左クリックポップアップの owner-draw 項目サイズ計算
     if (msg == WM_MEASUREITEM) {
-        auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (mis->CtlType == ODT_MENU) {
-            UINT eidx = static_cast<UINT>(mis->itemData);
-            if (eidx < g_scheduleItems.size()) {
-                const auto& item = g_scheduleItems[eidx];
-                HDC   hdc = GetDC(hWnd);
-                HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
-                SIZE  sz  = {};
-                GetTextExtentPoint32W(hdc, item.label.c_str(),
-                    static_cast<int>(item.label.size()), &sz);
-                SelectObject(hdc, old);
-                ReleaseDC(hWnd, hdc);
-                // 左右パディングとして 16 px ずつ確保する
-                mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
-                mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
-                return TRUE;
-            }
-        }
+        if (measureScheduleMenuItem(hWnd, reinterpret_cast<MEASUREITEMSTRUCT*>(lParam)))
+            return TRUE;
     }
-    // 左クリックポップアップの owner-draw 項目描画
-    // ODS_SELECTED に応じた背景色・テキスト色を切り替え、muted フラグが立つ項目には
-    // DrawTextW 後に 2 px の取消線を手動で重ね描画する。
     if (msg == WM_DRAWITEM) {
-        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-        if (dis->CtlType == ODT_MENU) {
-            UINT eidx = static_cast<UINT>(dis->itemData);
-            if (eidx < g_scheduleItems.size()) {
-                const auto& item     = g_scheduleItems[eidx];
-                bool        selected = (dis->itemState & ODS_SELECTED) != 0;
-
-                FillRect(dis->hDC, &dis->rcItem,
-                    reinterpret_cast<HBRUSH>(
-                        static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
-
-                RECT textRect  = dis->rcItem;
-                textRect.left += 16;
-                SetBkMode(dis->hDC, TRANSPARENT);
-                COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
-                SetTextColor(dis->hDC, textColor);
-                HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
-                DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
-                    DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-                if (item.muted) {
-                    SIZE sz = {};
-                    GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
-                        static_cast<int>(item.label.size()), &sz);
-                    constexpr int STRIKE_THICKNESS = 2;
-                    // 中央から 1 px だけ下寄せにして視認性を上げる
-                    constexpr int STRIKE_Y_OFFSET  = 1;
-                    // テキスト左端より 3 px、右端より 4 px 外側まで線を伸ばす
-                    constexpr int STRIKE_MARGIN_LEFT  = 3;
-                    constexpr int STRIKE_MARGIN_RIGHT = 4;
-                    int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
-                    RECT strikeRect = {
-                        textRect.left - STRIKE_MARGIN_LEFT,
-                        lineY - STRIKE_THICKNESS / 2,
-                        textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
-                        lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
-                    };
-                    HBRUSH hLineBrush = CreateSolidBrush(textColor);
-                    FillRect(dis->hDC, &strikeRect, hLineBrush);
-                    DeleteObject(hLineBrush);
-                }
-                SelectObject(dis->hDC, oldFont);
-                return TRUE;
-            }
-        }
+        if (drawScheduleMenuItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)))
+            return TRUE;
     }
     // 左クリックポップアップ上の右クリック: 通知抑制をトグルする
     // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
-    // g_mutedEvents と item.muted をトグルし、EnumThreadWindows で menu window を特定して再描画する。
     if (msg == WM_MENURBUTTONUP) {
-        UINT  itemIdx = static_cast<UINT>(wParam);
-        HMENU hm      = reinterpret_cast<HMENU>(lParam);
-        UINT  id      = GetMenuItemID(hm, static_cast<int>(itemIdx));
-        if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
-            UINT eidx = id - IDM_EVENT_BASE;
-            if (eidx < g_scheduleItems.size()) {
-                auto& item = g_scheduleItems[eidx];
-                bool nowMuted;
-                {
-                    std::lock_guard<std::mutex> lk(g_mtx);
-                    auto it = g_mutedEvents.find(item.key);
-                    if (it != g_mutedEvents.end()) {
-                        g_mutedEvents.erase(it);
-                        nowMuted = false;
-                    }
-                    else {
-                        g_mutedEvents[item.key] = item.date;
-                        nowMuted = true;
-                    }
-                }
-                item.muted = nowMuted;
-                // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
-                // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
-                EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-                    wchar_t className[16] = {};
-                    if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
-                        && wcscmp(className, L"#32768") == 0) {
-                        InvalidateRect(hwnd, nullptr, TRUE);
-                        UpdateWindow(hwnd);
-                    }
-                    return TRUE;
-                }, 0);
-                saveMutedEvents(g_exeDir);
-                g_forcePoll.store(true);
-                writeLog(std::string("muted: ") + (nowMuted ? "added " : "removed ") + item.key);
-            }
-        }
+        toggleScheduleItemMute(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
         return 0;
     }
     if (msg == WM_DESTROY) {
@@ -3078,6 +3248,61 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
     }
 }
 
+// 通知発火: Toast 表示と音声再生を実行し、notifiedSet を更新する
+// 音声スキップ判定（音声 OFF・会議中）はここで行い、Toast はグループ全件に出す。
+static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group,
+    const std::string& targetDatetime, long long targetLeadMs,
+    const Config& localConfig, std::set<std::string>& notifiedSet)
+{
+    auto jstTimeW = utcToJstHHMM(targetDatetime);
+    auto jstTime  = wideToUtf8(jstTimeW);
+    writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s), "
+        + std::to_string(targetLeadMs / 60000) + "min before)");
+    // 音声スキップ判定: 音声通知OFF > マイク/カメラ使用中ミュート > 通常再生
+    if (!g_soundEnabled) {
+        writeLog("sound skipped (sound disabled)");
+    }
+    else if (g_muteInMeeting && isMeetingActive()) {
+        writeLog("sound skipped (mic/camera in use)");
+    }
+    else {
+        launchSound(localConfig);
+    }
+    for (const auto* ev : group) {
+        showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
+        notifiedSet.insert(notifyKey(*ev, targetLeadMs));
+    }
+}
+
+// 発火対象を特定する: 通知タイミングが到来しかつ未通知のイベントから最初の (datetime, leadMs) を返す
+// 見つからなければ targetDatetime を空のまま返す。
+static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
+    const std::string& nowUtc, const std::set<std::string>& notifiedSet,
+    const std::unordered_set<std::string>& mutedKeys, long long leadMs,
+    std::string& targetDatetime, long long& targetLeadMs)
+{
+    targetDatetime.clear();
+    targetLeadMs = 0;
+    for (const auto& e : localEvents) {
+        long long diffMs = calcDiffMs(e.datetime, nowUtc);
+        if (diffMs <= 0) continue;
+        if (mutedKeys.count(eventKey(e))) continue;
+
+        auto tryLead = [&](long long lv) -> bool {
+            auto key = notifyKey(e, lv);
+            if (!notifiedSet.count(key) && diffMs - lv <= 0) {
+                targetDatetime = e.datetime;
+                targetLeadMs   = lv;
+                return true;
+            }
+            return false;
+        };
+        if (tryLead(leadMs)) return;
+        for (int m : e.reminderMinutes)
+            if (tryLead(static_cast<long long>(m) * 60000)) return;
+    }
+}
+
 // 通知スレッド: メインスレッドから予定リストを受け取り、通知を実行する
 //
 // STA で COM/WinRT を初期化し、g_cv で予定リスト更新を待機する。
@@ -3172,25 +3397,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             // 発火対象の (datetime, leadMsVal) を特定
             std::string targetDatetime;
             long long   targetLeadMs = 0;
-            for (const auto& e : localEvents) {
-                long long diffMs = calcDiffMs(e.datetime, nowUtc);
-                if (diffMs <= 0) continue;
-                if (mutedKeys.count(eventKey(e))) continue;
-
-                auto tryLead = [&](long long lv) -> bool {
-                    auto key = notifyKey(e, lv);
-                    if (!notifiedSet.count(key) && diffMs - lv <= 0) {
-                        targetDatetime = e.datetime;
-                        targetLeadMs   = lv;
-                        return true;
-                    }
-                    return false;
-                };
-                if (tryLead(leadMs)) break;
-                for (int m : e.reminderMinutes)
-                    if (tryLead(static_cast<long long>(m) * 60000)) goto found;
-            }
-            found:
+            selectFireTarget(localEvents, nowUtc, notifiedSet, mutedKeys, leadMs,
+                targetDatetime, targetLeadMs);
             if (targetDatetime.empty()) continue; // 発火対象なし（稀なケース）
 
             // 同 datetime かつ同 targetLeadMs のイベントをグループ化
@@ -3209,25 +3417,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 if (!notifiedSet.count(key)) group.push_back(&e);
             }
 
-            // 通知実行
-            auto jstTimeW = utcToJstHHMM(targetDatetime);
-            auto jstTime  = wideToUtf8(jstTimeW);
-            writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s), "
-                + std::to_string(targetLeadMs / 60000) + "min before)");
-            // 音声スキップ判定: 音声通知OFF > マイク/カメラ使用中ミュート > 通常再生
-            if (!g_soundEnabled) {
-                writeLog("sound skipped (sound disabled)");
-            }
-            else if (g_muteInMeeting && isMeetingActive()) {
-                writeLog("sound skipped (mic/camera in use)");
-            }
-            else {
-                launchSound(localConfig);
-            }
-            for (const auto* ev : group) {
-                showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
-                notifiedSet.insert(notifyKey(*ev, targetLeadMs));
-            }
+            fireNotificationGroup(group, targetDatetime, targetLeadMs, localConfig, notifiedSet);
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
         }
@@ -3256,6 +3446,143 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
 static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE type) {
     if (type != MibAddInstance && type != MibParameterNotification) return;
     g_forcePoll.store(true);
+}
+
+// Calendar API クエリパラメータの構築
+//
+// timeMin に現在時刻、timeMax に「JST 翌日 23:59:59」を設定して
+// 当日と翌日の予定をまとめて取得するためのクエリ文字列を返す。
+static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
+    auto nowUtc = getCurrentUtcISO();
+    SYSTEMTIME jstMidnight = utcToJst(utcNow);
+    jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
+    auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
+    auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
+    auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
+
+    std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
+    queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
+    queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
+    queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
+    return queryParams;
+}
+
+// 全カレンダーのイベント取得
+//
+// primary と ext_calendar_ids の各カレンダーに対して Calendar API を呼び、
+// 取得したイベントを events に追加する。401 を検出した場合は
+// アクセストークンをクリアしてリフレッシュ後に 1 回だけリトライする。
+// outAnySuccess: 1 件以上取得できれば true。
+// outAuthFailed: リフレッシュ後も認証エラーで全停止する場合に true。
+static void fetchAllCalendarEvents(
+    const std::vector<std::string>& calendarIds,
+    const std::wstring& queryParams,
+    std::vector<CalendarEvent>& events,
+    bool& outAnySuccess,
+    bool& outAuthFailed)
+{
+    outAnySuccess = false;
+    outAuthFailed = false;
+
+    for (const auto& calId : calendarIds) {
+        std::wstring calUrl = L"https://";
+        calUrl += CALENDAR_API_HOST;
+        calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
+        calUrl += queryParams;
+
+        DWORD httpStatus = 0;
+        std::wstring tokenSnapshot;
+        {
+            std::lock_guard<std::mutex> lk(g_tokenMtx);
+            tokenSnapshot = g_accessToken;
+        }
+        auto body = httpGet(calUrl, tokenSnapshot, &httpStatus);
+
+        // 401: アクセストークン失効 → リフレッシュしてリトライ（非対話）
+        if (httpStatus == 401) {
+            writeLog("access token expired (401), refreshing...");
+            {
+                std::lock_guard<std::mutex> lk(g_tokenMtx);
+                g_accessToken.clear();
+                g_tokenExpiry = {};
+            }
+            auto rr = tryRefreshAccessToken();
+            if (rr != RefreshResult::Ok) {
+                if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
+                outAuthFailed = true;
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_tokenMtx);
+                tokenSnapshot = g_accessToken;
+            }
+            body = httpGet(calUrl, tokenSnapshot, &httpStatus);
+        }
+
+        if (body.empty()) {
+            writeLog("poll: calendar " + calId + " failed"
+                + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
+            continue;
+        }
+
+        auto [calEvents, errorMsg] = parseCalendarEvents(body);
+        if (!errorMsg.empty()) {
+            writeLog("poll: calendar " + calId + ": " + errorMsg);
+            continue;
+        }
+
+        // カレンダー ID をプレフィックスとして付与（カレンダー間の ID 衝突を防ぐ）
+        for (auto& ev : calEvents) {
+            if (!ev.id.empty()) ev.id = calId + "/" + ev.id;
+        }
+        events.insert(events.end(), calEvents.begin(), calEvents.end());
+        outAnySuccess = true;
+    }
+}
+
+// ポーリング結果の引き渡しと変更検知
+//
+// 取得したイベントを通知スレッドへ受け渡し、当日分について
+// ベースラインからの差分を検出して Toast 通知する。
+// キャッシュファイル更新とトレイのツールチップ更新もここで実行する。
+static void deliverPollResults(
+    const std::wstring& exeDir,
+    std::vector<CalendarEvent> events,
+    const SYSTEMTIME& jstNow,
+    bool baselineEstablished)
+{
+    std::vector<CalendarEvent> prevEvents;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        prevEvents      = std::move(g_pendingEvents);
+        g_pendingEvents = events;
+        g_eventsUpdated = true;
+    }
+    g_cv.notify_one();
+
+    // 変更検知は当日の予定のみを対象とする
+    // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
+    auto isToday = [&](const CalendarEvent& e) {
+        auto jst = utcIsoToJstSt(e.datetime);
+        return jst && jst->wYear == jstNow.wYear
+                   && jst->wMonth == jstNow.wMonth
+                   && jst->wDay == jstNow.wDay;
+    };
+    std::vector<CalendarEvent> todayPrev, todayNew;
+    for (const auto& e : prevEvents) {
+        if (isToday(e)) todayPrev.push_back(e);
+    }
+    for (const auto& e : events) {
+        if (isToday(e)) todayNew.push_back(e);
+    }
+
+    std::vector<EventChange> changes;
+    if (baselineEstablished) {
+        changes = collectEventChanges(todayPrev, todayNew);
+    }
+    notifyEventChanges(changes);
+    saveCacheFile(exeDir, events);
+    if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
 
 // ポーリングスレッド本体
@@ -3333,69 +3660,18 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             }
 
             // Calendar API v3 クエリパラメータ（全カレンダー共通）
-            auto nowUtc = getCurrentUtcISO();
-            // JST の今日 00:00:00 に +48h - 1s = 翌日 JST 23:59:59。UTC に変換（-9h）して timeMax とする
-            SYSTEMTIME jstMidnight = utcToJst(utcNow);
-            jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
-            auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
-            auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
-            auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
-            std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
-            queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
-            queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
-            queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
+            auto queryParams = buildCalendarQueryParams(utcNow);
 
             // ポーリング対象カレンダー（primary + ext_calendar_ids）
             std::vector<std::string> calendarIds = {"primary"};
             for (const auto& id : cfg.extCalendarIds) calendarIds.push_back(id);
 
             std::vector<CalendarEvent> events;
-            bool anySuccess  = false;
-            bool authFailed  = false;
-            ULONGLONG t0     = GetTickCount64();
+            bool anySuccess = false;
+            bool authFailed = false;
+            ULONGLONG t0    = GetTickCount64();
 
-            for (const auto& calId : calendarIds) {
-                std::wstring calUrl = L"https://";
-                calUrl += CALENDAR_API_HOST;
-                calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
-                calUrl += queryParams;
-
-                DWORD httpStatus = 0;
-                auto body = httpGet(calUrl, g_accessToken, &httpStatus);
-
-                // 401: アクセストークン失効 → リフレッシュしてリトライ（非対話）
-                if (httpStatus == 401) {
-                    writeLog("access token expired (401), refreshing...");
-                    g_accessToken.clear();
-                    g_tokenExpiry = {};
-                    auto rr = tryRefreshAccessToken();
-                    if (rr != RefreshResult::Ok) {
-                        if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
-                        authFailed = true;
-                        break;
-                    }
-                    body = httpGet(calUrl, g_accessToken, &httpStatus);
-                }
-
-                if (body.empty()) {
-                    writeLog("poll: calendar " + calId + " failed"
-                        + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
-                    continue;
-                }
-
-                auto [calEvents, errorMsg] = parseCalendarEvents(body);
-                if (!errorMsg.empty()) {
-                    writeLog("poll: calendar " + calId + ": " + errorMsg);
-                    continue;
-                }
-
-                // カレンダー ID をプレフィックスとして付与（カレンダー間の ID 衝突を防ぐ）
-                for (auto& ev : calEvents) {
-                    if (!ev.id.empty()) ev.id = calId + "/" + ev.id;
-                }
-                events.insert(events.end(), calEvents.begin(), calEvents.end());
-                anySuccess = true;
-            }
+            fetchAllCalendarEvents(calendarIds, queryParams, events, anySuccess, authFailed);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
             if (authFailed) {
@@ -3421,40 +3697,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
 
             // ポーリング結果を通知スレッドへ渡す
-            {
-                std::vector<CalendarEvent> prevEvents;
-                {
-                    std::lock_guard<std::mutex> lk(g_mtx);
-                    prevEvents      = std::move(g_pendingEvents);
-                    g_pendingEvents = events;
-                    g_eventsUpdated = true;
-                }
-                g_cv.notify_one();
-                // 変更検知は当日の予定のみを対象とする
-                // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
-                // jstNow の年月日と一致するイベントのみ true を返す
-                auto isToday = [&](const CalendarEvent& e) {
-                    auto jst = utcIsoToJstSt(e.datetime);
-                    return jst && jst->wYear == jstNow.wYear
-                               && jst->wMonth == jstNow.wMonth
-                               && jst->wDay == jstNow.wDay;
-                };
-                std::vector<CalendarEvent> todayPrev, todayNew;
-                for (const auto& e : prevEvents) {
-                    if (isToday(e)) todayPrev.push_back(e);
-                }
-                for (const auto& e : events) {
-                    if (isToday(e)) todayNew.push_back(e);
-                }
-
-                std::vector<EventChange> changes;
-                if (baselineEstablished) {
-                    changes = collectEventChanges(todayPrev, todayNew);
-                }
-                notifyEventChanges(changes);
-                saveCacheFile(exeDir, events);
-                if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
-            }
+            deliverPollResults(exeDir, events, jstNow, baselineEstablished);
 
             firstPoll           = false;
             baselineEstablished = true;
