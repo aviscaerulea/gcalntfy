@@ -782,7 +782,10 @@ static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier
 }
 
 // クエリ文字列から指定キーの値を抽出する
-// req は HTTP リクエスト全体、key は "code" や "state"（"=" は不要）。
+// req は HTTP リクエストの Request-Line（"GET /path?... HTTP/1.1"）を想定する。
+// ヘッダ部（Referer 等）に細工された code=/state= を誤マッチしないよう、
+// 呼び出し側で最初の "\r\n" 以前に限定して渡すこと。
+// key は "code" や "state"（"=" は不要）。
 // "?" または "&" の直後に出現する key=value のみを対象とし、
 // "scope=" が "code=" にマッチするような部分一致を回避する。
 // 見つからない場合は空文字列。値の URL デコードまでは行わない（ASCII 範囲のみ想定）。
@@ -833,11 +836,22 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
+    // 受信エラー応答（UTF-8 で「認証中にエラーが発生しました。再度お試しください。」を埋め込む）
+    // ブラウザのタブが永久にローディング状態になるのを防ぐため、不完全リクエスト検知時もレスポンスを返す。
+    static const char* RESPONSE_RECV_ERROR =
+        "HTTP/1.1 500 Internal Server Error\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE4\xB8\xAD\xE3\x81\xAB"
+        "\xE3\x82\xA8\xE3\x83\xA9\xE3\x83\xBC\xE3\x81\x8C\xE7\x99\xBA\xE7\x94\x9F"
+        "\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x97\xE3\x81\x9F\xE3\x80\x82"
+        "\xE5\x86\x8D\xE5\xBA\xA6\xE3\x81\x8A\xE8\xA9\xA6\xE3\x81\x97\xE3\x81\x8F"
+        "\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p></body></html>";
+
     std::string req;
     // HTTP リクエスト読み出しループ
     // recv の戻り値: 正値=受信バイト数、0=ピア close、SOCKET_ERROR(-1)=エラー
-    // エラー・close 時は req が不完全なまま抜け、後続の extractQueryValue が空文字を返して
-    // 認証フローが安全に失敗する（不完全リクエストのまま強引に処理を進めない）。
+    // ループ離脱後、"\r\n\r\n" が未受信なら不完全リクエスト検知で弾かれる（後段を参照）。
     char chunk[1024];
     while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
         int n = recv(client, chunk, sizeof(chunk), 0);
@@ -847,10 +861,20 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         }
         if (n == SOCKET_ERROR) {
             writeLog("waitForAuthCode: recv failed, WSA error " + std::to_string(WSAGetLastError()));
+            send(client, RESPONSE_RECV_ERROR, static_cast<int>(strlen(RESPONSE_RECV_ERROR)), 0);
             closesocket(client);
             return {};
         }
         req.append(chunk, static_cast<size_t>(n));
+    }
+
+    // 不完全リクエスト検知（peer close または 65536 バイト上限到達でヘッダ終端 "\r\n\r\n" 未受信）
+    // n==0 と recv 上限超過の両方のケースを一律で弾き、後段の解析を停止する。
+    if (req.find("\r\n\r\n") == std::string::npos) {
+        writeLog("waitForAuthCode: incomplete request, abort");
+        send(client, RESPONSE_RECV_ERROR, static_cast<int>(strlen(RESPONSE_RECV_ERROR)), 0);
+        closesocket(client);
+        return {};
     }
 
     // 認証完了応答（UTF-8 バイト列で「認証完了。このタブは閉じてください。」を埋め込む）
@@ -875,9 +899,14 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         "\x80\x82\xE5\x86\x8D\xE5\xBA\xA6\xE3\x81\x8A\xE8\xA9\xA6\xE3\x81\x97\xE3\x81"
         "\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p></body></html>";
 
+    // クエリ抽出範囲の Request-Line 限定
+    // ヘッダ部の Referer 等に細工された code=/state= の誤マッチを防ぐため、
+    // 最初の "\r\n" 以前のみを抽出対象とする（"\r\n\r\n" を含む前提のため必ず見つかる）。
+    std::string requestLine = req.substr(0, req.find("\r\n"));
+
     // state 検証を最初に行う（CSRF 対策）。失敗時はエラー応答を返してから終了する。
     if (!expectedState.empty()) {
-        auto receivedState = extractQueryValue(req, "state");
+        auto receivedState = extractQueryValue(requestLine, "state");
         if (receivedState != expectedState) {
             writeLog("OAuth state mismatch: ignoring callback");
             send(client, RESPONSE_STATE_MISMATCH, static_cast<int>(strlen(RESPONSE_STATE_MISMATCH)), 0);
@@ -889,7 +918,7 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     send(client, RESPONSE_OK, static_cast<int>(strlen(RESPONSE_OK)), 0);
     closesocket(client);
 
-    return extractQueryValue(req, "code");
+    return extractQueryValue(requestLine, "code");
 }
 
 // トークンレスポンス JSON からアクセストークンと有効期限を更新する
@@ -1265,21 +1294,25 @@ static bool atomicWriteJson(const std::wstring& path, const std::string& json,
         return false;
     }
     DWORD written = 0;
-    BOOL writeOk = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
-    BOOL flushOk = TRUE;
+    BOOL  writeOk  = WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+    DWORD writeErr = writeOk ? 0 : GetLastError();
+    BOOL  flushOk  = TRUE;
+    DWORD flushErr = 0;
     if (writeOk && written == static_cast<DWORD>(json.size())) {
         flushOk = FlushFileBuffers(hFile);
+        if (!flushOk) flushErr = GetLastError();
     }
     CloseHandle(hFile);
     if (!writeOk || written != static_cast<DWORD>(json.size())) {
         writeLog(std::string(logTag) + ": write failed ("
-            + std::to_string(written) + "/" + std::to_string(json.size()) + " bytes)");
+            + std::to_string(written) + "/" + std::to_string(json.size())
+            + " bytes, error " + std::to_string(writeErr) + ")");
         DeleteFileW(tmpPath.c_str());
         return false;
     }
     if (!flushOk) {
         writeLog(std::string(logTag) + ": flush failed (error "
-            + std::to_string(GetLastError()) + ")");
+            + std::to_string(flushErr) + ")");
         DeleteFileW(tmpPath.c_str());
         return false;
     }
@@ -2304,10 +2337,30 @@ static void launchSound(const Config& cfg) {
     // 新スレッド再生中に他プロセスが意図せずミュート解除される問題が起きる。
     // タイムアウト時はハンドルを保持したまま今回の再生を諦める（強制終了するとスレッド固有 COM/WASAPI
     // リソースが宙に浮くため）。次回 launchSound 呼び出し時に再度 join を試みる。
+    // 待機ループは 1 秒単位で g_shutdownRequested を監視し、シャットダウン要求があれば即時放棄する。
+    // WAIT_OBJECT_0 以外（WAIT_FAILED 等）は異常終了として再生を見送る。
     if (g_soundThread) {
-        DWORD waitResult = WaitForSingleObject(g_soundThread, 10000);
+        DWORD waitResult = WAIT_TIMEOUT;
+        for (int waited = 0; waited < 10; ++waited) {
+            if (g_shutdownRequested.load()) {
+                writeLog("launchSound: shutdown requested while waiting previous thread, skipping this play");
+                return;
+            }
+            waitResult = WaitForSingleObject(g_soundThread, 1000);
+            if (waitResult != WAIT_TIMEOUT) break;
+        }
         if (waitResult == WAIT_TIMEOUT) {
             writeLog("launchSound: previous sound thread did not finish within 10s, skipping this play");
+            return;
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            // WAIT_FAILED はハンドル無効の可能性があるため、クリアして次回の再試行を可能にする。
+            // WAIT_TIMEOUT は上記で処理済みなので、ここに来るのは WAIT_FAILED のみ（実質）。
+            DWORD failErr = (waitResult == WAIT_FAILED) ? GetLastError() : 0;
+            writeLog("launchSound: WaitForSingleObject returned " + std::to_string(waitResult)
+                + " (error " + std::to_string(failErr) + "), skipping this play");
+            CloseHandle(g_soundThread);
+            g_soundThread = nullptr;
             return;
         }
         CloseHandle(g_soundThread);
