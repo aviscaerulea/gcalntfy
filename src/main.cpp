@@ -2997,7 +2997,7 @@ static void checkForUpdates() {
                 try {
                     showToast3(L"新しいバージョンがあります",
                                std::wstring(L"v") + APP_VERSION + L" → " + tagName,
-                               L"クリックしてリリースページを開く",
+                               L"クリックしてリリースページを開いてください",
                                GITHUB_RELEASES_URL);
                 }
                 catch (...) {}
