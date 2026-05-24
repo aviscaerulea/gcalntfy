@@ -245,9 +245,7 @@ struct Config {
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
-    bool  guardEnabled;     // ガードトーン有効/無効（デフォルト true）
-    float guardLeadIn;      // リードイン秒数（デフォルト 1.2）
-    float guardLeadOut;     // リードアウト秒数（デフォルト 1.2）
+    int   guardToneMs;      // ガードトーン長（冒頭・末尾共通、ms。0 で無効、デフォルト 1500）
 
     // [loudness] ラウドネスノーマライズ設定
     bool  loudnessEnabled;      // ノーマライズ有効/無効（デフォルト true）
@@ -1606,9 +1604,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     };
 
     // [guard] ガードトーン設定
-    cfg.guardEnabled = readConfigBool("guard", "enabled", true);
-    cfg.guardLeadIn  = readConfigFloat("guard", "lead_in_duration", 1.2f, 0.0f, 5.0f);
-    cfg.guardLeadOut = readConfigFloat("guard", "lead_out_duration", 1.2f, 0.0f, 5.0f);
+    cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
 
     // [loudness] ラウドネスノーマライズ設定
     cfg.loudnessEnabled     = readConfigBool("loudness", "enabled", true);
@@ -2261,8 +2257,8 @@ static bool playWavToWasapi(const Config& cfg) {
         };
 
         // 冒頭ガードトーン（BLE ヘッドホン対処：省電力移行防止）
-        if (cfg.guardEnabled && cfg.guardLeadIn > 0.0f) {
-            UINT32 toneFrames = static_cast<UINT32>(wavFmt.nSamplesPerSec * cfg.guardLeadIn);
+        if (cfg.guardToneMs > 0) {
+            UINT32 toneFrames = wavFmt.nSamplesPerSec * cfg.guardToneMs / 1000;
             client->Start();
             runToneLoop(toneFrames);
             client->Stop();
@@ -2303,8 +2299,8 @@ static bool playWavToWasapi(const Config& cfg) {
         }
 
         // 末尾ガードトーン（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
-        if (cfg.guardEnabled && cfg.guardLeadOut > 0.0f && eof) {
-            UINT32 trailFrames = static_cast<UINT32>(wavFmt.nSamplesPerSec * cfg.guardLeadOut);
+        if (cfg.guardToneMs > 0 && eof) {
+            UINT32 trailFrames = wavFmt.nSamplesPerSec * cfg.guardToneMs / 1000;
             runToneLoop(trailFrames);
         }
 
