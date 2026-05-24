@@ -2077,7 +2077,10 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
 
             if (memcmp(id, "fmt ", 4) == 0) {
                 DWORD readSize = min(chunkSize, (DWORD)sizeof(WAVEFORMATEX));
-                ReadFile(hFile, &wavFmt, readSize, &nRead, nullptr);
+                if (!ReadFile(hFile, &wavFmt, readSize, &nRead, nullptr) || nRead != readSize) {
+                    writeLog("loadWavAndNormalize: failed to read fmt chunk");
+                    goto cleanup;
+                }
                 if (chunkSize > readSize)
                     SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
                 if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
@@ -2098,14 +2101,21 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                     writeLog("loadWavAndNormalize: data chunk size out of range");
                     goto cleanup;
                 }
-                DWORD totalBytes = chunkSize;
+                // 奇数サイズの WAV で ReadFile がバッファ境界外を要求しないよう int16_t に整列
+                DWORD totalBytes = chunkSize & ~1u;
                 samples.resize(totalBytes / sizeof(int16_t));
                 ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr);
                 samples.resize(nRead / sizeof(int16_t));
                 hasData = true;
             }
             else {
-                SetFilePointer(hFile, (LONG)((chunkSize + 1) & ~1u), nullptr, FILE_CURRENT);
+                // 奇数サイズのチャンクは 1 バイトパディングを含む（RIFF 仕様）
+                // chunkSize+1 のオーバーフロー・LONG 範囲超過・シーク失敗は走査終了として扱う
+                DWORD skipSize = chunkSize + 1;
+                if (skipSize < chunkSize || skipSize > (DWORD)LONG_MAX) break;
+                skipSize &= ~1u;
+                if (SetFilePointer(hFile, (LONG)skipSize, nullptr, FILE_CURRENT) == INVALID_SET_FILE_POINTER)
+                    break;
             }
         }
         if (!hasFmt || !hasData) {
@@ -2950,56 +2960,57 @@ static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
 // 起動時に detach したスレッドで 1 回だけ実行する
 static void checkForUpdates() {
     winrt::init_apartment();
-
-    DWORD status = 0;
-    std::string body = httpGet(GITHUB_API_RELEASES_LATEST, L"", &status);
-    if (status != 200 || body.empty()) {
-        writeLog("update check: request failed, status=" + std::to_string(status));
-        winrt::uninit_apartment();
-        return;
-    }
-
-    std::wstring tagName;
+    // 予期しない例外でスレッドが std::terminate しないよう全体を保護する
     try {
-        auto json = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
-        tagName = json.GetNamedString(L"tag_name");
+        do {
+            DWORD status = 0;
+            std::string body = httpGet(GITHUB_API_RELEASES_LATEST, L"", &status);
+            if (status != 200 || body.empty()) {
+                writeLog("update check: request failed, status=" + std::to_string(status));
+                break;
+            }
+
+            std::wstring tagName;
+            try {
+                auto json = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+                tagName = json.GetNamedString(L"tag_name");
+            }
+            catch (...) {
+                writeLog("update check: JSON parse failed");
+                break;
+            }
+            if (tagName.empty()) {
+                writeLog("update check: tag_name empty");
+                break;
+            }
+
+            // 現在版より新しければグローバル状態を更新
+            if (!isNewerVersion(tagName, APP_VERSION)) break;
+
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_latestVersion = tagName;
+            }
+            g_updateAvailable.store(true);
+            writeLog("update available: " + wideToUtf8(tagName));
+
+            // Toast: 同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
+            std::wstring notifiedVer = readRegString(REG_NOTIFIED_VERSION);
+            writeRegString(REG_NOTIFIED_VERSION, tagName);
+            if (notifiedVer != tagName) {
+                try {
+                    showToast3(L"新しいバージョンがあります",
+                               std::wstring(L"v") + APP_VERSION + L" → " + tagName,
+                               L"クリックしてリリースページを開く",
+                               GITHUB_RELEASES_URL);
+                }
+                catch (...) {}
+            }
+        } while (false);
     }
     catch (...) {
-        writeLog("update check: JSON parse failed");
-        winrt::uninit_apartment();
-        return;
+        writeLog("update check: unexpected exception");
     }
-    if (tagName.empty()) {
-        writeLog("update check: tag_name empty");
-        winrt::uninit_apartment();
-        return;
-    }
-
-    // 現在版より新しければグローバル状態を更新
-    if (!isNewerVersion(tagName, APP_VERSION)) {
-        winrt::uninit_apartment();
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_latestVersion = tagName;
-    }
-    g_updateAvailable.store(true);
-    writeLog("update available: " + wideToUtf8(tagName));
-
-    // Toast: 同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
-    std::wstring notifiedVer = readRegString(REG_NOTIFIED_VERSION);
-    writeRegString(REG_NOTIFIED_VERSION, tagName);
-    if (notifiedVer != tagName) {
-        try {
-            showToast3(L"新しいバージョンがあります",
-                       std::wstring(L"v") + APP_VERSION + L" → " + tagName,
-                       L"クリックしてリリースページを開く",
-                       GITHUB_RELEASES_URL);
-        }
-        catch (...) {}
-    }
-
     winrt::uninit_apartment();
 }
 
@@ -3124,7 +3135,12 @@ static void handleTrayLeftClick(HWND hWnd) {
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         if (!g_authInProgress.load()) {
-            std::thread(startInteractiveAuth).detach();
+            try {
+                std::thread(startInteractiveAuth).detach();
+            }
+            catch (const std::system_error& e) {
+                writeLog(std::string("failed to start auth thread: ") + e.what());
+            }
         }
         return;
     }
@@ -3327,7 +3343,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_AUTH_REQUESTED) {
         if (!g_authInProgress.load()) {
-            std::thread(startInteractiveAuth).detach();
+            try {
+                std::thread(startInteractiveAuth).detach();
+            }
+            catch (const std::system_error& e) {
+                writeLog(std::string("failed to start auth thread: ") + e.what());
+            }
         }
         return 0;
     }
@@ -3687,9 +3708,15 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
     // シャットダウン前に通知音スレッドの完了を待機（ダッキング復元を保証）
     // g_shutdownRequested == true なので playWavToWasapi がすみやかに停止するはず
     if (g_soundThread) {
-        WaitForSingleObject(g_soundThread, 5000);
-        CloseHandle(g_soundThread);
-        g_soundThread = nullptr;
+        DWORD r = WaitForSingleObject(g_soundThread, 5000);
+        if (r != WAIT_TIMEOUT) {
+            CloseHandle(g_soundThread);
+            g_soundThread = nullptr;
+        }
+        else {
+            // タイムアウト時はハンドルを閉じない（走行中スレッドが COM/WASAPI を使用中のため）
+            writeLog("notifyThreadFunc: sound thread did not finish within 5s on shutdown");
+        }
     }
 
     winrt::uninit_apartment();
@@ -4051,7 +4078,12 @@ int wmain() {
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）
         if (cfg.updateCheckEnabled) {
-            std::thread(checkForUpdates).detach();
+            try {
+                std::thread(checkForUpdates).detach();
+            }
+            catch (const std::system_error& e) {
+                writeLog(std::string("failed to start update check thread: ") + e.what());
+            }
         }
 
         // 通知スレッド起動
