@@ -1,10 +1,15 @@
 # gcalntfy
 
-Google Calendar の予定を数分前に Windows 通知で知らせる常駐アプリ。
+Google Calendar の予定の開始前や変更を Windows 通知で知らせる軽量常駐アプリ。  
+
+実測で物理メモリ使用量は約 7 MB 程度。
+※実行環境や 48 時間以内の予定数などにより増減します。
 
 ## インストール
 
-[Scoop](https://scoop.sh/) でインストールできる。
+任意フォルダで zip を展開して gcalntfy.exe を実行。
+
+または、[Scoop](https://scoop.sh/) でインストール。
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
@@ -17,7 +22,7 @@ scoop install gcalntfy
 gcalntfy
 ```
 
-起動するとシステムトレイに常駐し、Google Calendar をポーリングして予定を通知する。
+起動するとシステムトレイに常駐し、設定に従って Google Calendar をポーリングして予定を通知する。
 
 ## 動作
 

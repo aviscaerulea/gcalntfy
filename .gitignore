@@ -8,6 +8,7 @@ out/
 
 # チャイム素材（ソース mp3 はコミット対象外）
 intro.mp3
+gcalntfy.opus
 
 # clasp 設定（環境固有）
 .clasp.json

@@ -1141,7 +1141,7 @@ static std::string normalizeToUtcIso(const std::string& dt) {
     if (dt.empty()) return dt;
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
 
-    // 終日イベント: "YYYY-MM-DD" 形式（10文字）
+    // 終日イベント： "YYYY-MM-DD" 形式（10 文字）
     if (dt.size() == 10) {
         if (sscanf_s(dt.c_str(), "%d-%d-%d", &y, &mo, &d) != 3) return dt;
         SYSTEMTIME st = {};
@@ -2068,7 +2068,8 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                 if (chunkSize > readSize)
                     SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
                 if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
-                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0) {
+                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0
+                        || wavFmt.nChannels == 0) {
                     writeLog("loadWavAndNormalize: unsupported format, only 16bit PCM WAV is supported");
                     goto cleanup;
                 }
@@ -2862,7 +2863,7 @@ static void showSchedulePopup(HWND hWnd) {
         auto key   = eventKey(ev);
         auto date  = jst.substr(0, 10);
         bool muted = mutedSnapshot.count(key) != 0;
-        // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィクス不要）
+        // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィックス不要）
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
         todayEvents.push_back({toWide(ev.permalink), key, date, label, muted});
     }
