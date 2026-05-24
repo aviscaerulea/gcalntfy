@@ -2954,6 +2954,7 @@ static void checkForUpdates() {
     DWORD status = 0;
     std::string body = httpGet(GITHUB_API_RELEASES_LATEST, L"", &status);
     if (status != 200 || body.empty()) {
+        writeLog("update check: request failed, status=" + std::to_string(status));
         winrt::uninit_apartment();
         return;
     }
@@ -2964,10 +2965,12 @@ static void checkForUpdates() {
         tagName = json.GetNamedString(L"tag_name");
     }
     catch (...) {
+        writeLog("update check: JSON parse failed");
         winrt::uninit_apartment();
         return;
     }
     if (tagName.empty()) {
+        writeLog("update check: tag_name empty");
         winrt::uninit_apartment();
         return;
     }
