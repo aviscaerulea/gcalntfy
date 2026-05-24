@@ -108,8 +108,10 @@ static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリ
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 
-static constexpr wchar_t GITHUB_URL[]         = L"https://github.com/aviscaerulea/gcalntfy";
-static constexpr wchar_t CALENDAR_TODAY_URL[] = L"https://calendar.google.com/calendar/r/week";
+static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
+static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
+static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/gcalntfy/releases/latest";
+static constexpr wchar_t CALENDAR_TODAY_URL[]         = L"https://calendar.google.com/calendar/r/week";
 
 // イベントキャッシュファイル名（exe 同フォルダに保存）
 static constexpr wchar_t CACHE_FILENAME[]        = L"events.json";
@@ -251,6 +253,9 @@ struct Config {
     bool  loudnessEnabled;      // ノーマライズ有効/無効（デフォルト true）
     float loudnessTarget;       // 目標ラウドネス LUFS（デフォルト -16.0）
     float loudnessPeakCeiling;  // ピーク上限（デフォルト 0.891 = -1 dBFS）
+
+    // [update] 更新チェック設定
+    bool  updateCheckEnabled;   // 起動時の GitHub リリースチェック有効/無効（デフォルト true）
 };
 
 // ノーマライズ済み WAV データキャッシュ（起動時に 1 回だけ構築する）
@@ -273,6 +278,10 @@ static bool                    g_trayBadgeActive  = false;
 // updateTrayTooltip のリエントランシーガード
 // Shell_NotifyIconW が内部でメッセージポンプして WM_TIMER 等を呼ぶことへの対処
 static bool                    g_tooltipUpdating  = false;
+
+// 更新チェック結果（起動時に 1 回書き込まれ、以降は読み取り専用）
+static std::atomic<bool>  g_updateAvailable { false };
+static std::wstring        g_latestVersion;   // g_mtx で保護
 
 // 通知音再生スレッドのハンドル
 //
@@ -1606,6 +1615,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.loudnessTarget      = readConfigFloat("loudness", "target", -16.0f, -60.0f, 0.0f);
     cfg.loudnessPeakCeiling = readConfigFloat("loudness", "peak_ceiling", 0.891f, 0.1f, 1.0f);
 
+    // [update] 更新チェック設定
+    cfg.updateCheckEnabled = readConfigBool("update", "enabled", true);
+
     return cfg;
 }
 
@@ -1744,8 +1756,9 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 
 // レジストリパス（ユーザー設定の永続化先）
 static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
-static constexpr const wchar_t* REG_SOUND_ENABLED    = L"SoundEnabled";
-static constexpr const wchar_t* REG_MUTE_IN_MEETING  = L"MuteInMeeting";
+static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
+static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
+static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
 static constexpr const wchar_t* REG_RUN_KEY_PATH    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -2908,6 +2921,146 @@ static void showSchedulePopup(HWND hWnd) {
     DestroyMenu(hMenu);
 }
 
+// ==================== 更新チェック ====================
+
+// バージョン文字列から数値の MAJOR.MINOR.PATCH を抽出する
+// "v2.7.4" / "2.7.4-dirty" / "2.7.4-5-gHASH" のいずれにも対応する
+static bool parseVersion(const std::wstring& ver, int& major, int& minor, int& patch) {
+    std::wstring s = ver;
+    if (!s.empty() && (s[0] == L'v' || s[0] == L'V')) s = s.substr(1);
+    auto dashPos = s.find(L'-');
+    if (dashPos != std::wstring::npos) s = s.substr(0, dashPos);
+    int a = 0, b = 0, c = 0;
+    if (swscanf_s(s.c_str(), L"%d.%d.%d", &a, &b, &c) != 3) return false;
+    major = a; minor = b; patch = c;
+    return true;
+}
+
+// a が b より新しいバージョンなら true を返す
+static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
+    int aMaj, aMin, aPat, bMaj, bMin, bPat;
+    if (!parseVersion(a, aMaj, aMin, aPat)) return false;
+    if (!parseVersion(b, bMaj, bMin, bPat)) return false;
+    if (aMaj != bMaj) return aMaj > bMaj;
+    if (aMin != bMin) return aMin > bMin;
+    return aPat > bPat;
+}
+
+// GitHub の最新リリースを確認し、新版があれば Toast 通知とグローバル状態を更新する
+// 起動時に detach したスレッドで 1 回だけ実行する
+static void checkForUpdates() {
+    winrt::init_apartment();
+
+    DWORD status = 0;
+    std::string body = httpGet(GITHUB_API_RELEASES_LATEST, L"", &status);
+    if (status != 200 || body.empty()) {
+        winrt::uninit_apartment();
+        return;
+    }
+
+    std::wstring tagName;
+    try {
+        auto json = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+        tagName = json.GetNamedString(L"tag_name");
+    }
+    catch (...) {
+        winrt::uninit_apartment();
+        return;
+    }
+    if (tagName.empty()) {
+        winrt::uninit_apartment();
+        return;
+    }
+
+    // 現在版より新しければグローバル状態を更新
+    if (!isNewerVersion(tagName, APP_VERSION)) {
+        winrt::uninit_apartment();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_latestVersion = tagName;
+    }
+    g_updateAvailable.store(true);
+    writeLog("update available: " + wideToUtf8(tagName));
+
+    // Toast: 同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
+    std::wstring notifiedVer = readRegString(REG_NOTIFIED_VERSION);
+    writeRegString(REG_NOTIFIED_VERSION, tagName);
+    if (notifiedVer != tagName) {
+        try {
+            showToast3(L"新しいバージョンがあります",
+                       std::wstring(L"v") + APP_VERSION + L" → " + tagName,
+                       L"クリックしてリリースページを開く",
+                       GITHUB_RELEASES_URL);
+        }
+        catch (...) {}
+    }
+
+    winrt::uninit_apartment();
+}
+
+// 更新通知メニュー項目のサイズを計算する
+static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
+    std::wstring prefix = std::wstring(L"Gcalntfy v") + APP_VERSION + L" → ";
+    std::wstring latest;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        latest = g_latestVersion;
+    }
+    std::wstring full = prefix + latest;
+    HDC hdc = GetDC(hWnd);
+    if (!hdc) {
+        mis->itemWidth  = 200;
+        mis->itemHeight = 20;
+        return TRUE;
+    }
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    SIZE  sz  = {};
+    GetTextExtentPoint32W(hdc, full.c_str(), static_cast<int>(full.size()), &sz);
+    SelectObject(hdc, old);
+    ReleaseDC(hWnd, hdc);
+    mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
+    mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
+    return TRUE;
+}
+
+// 更新通知メニュー項目を描画する
+// プレフィックス部分を通常色、新バージョン部分を赤色で描く
+static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
+    std::wstring prefix = std::wstring(L"Gcalntfy v") + APP_VERSION + L" → ";
+    std::wstring latest;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        latest = g_latestVersion;
+    }
+    bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    FillRect(dis->hDC, &dis->rcItem,
+        reinterpret_cast<HBRUSH>(
+            static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+
+    RECT textRect = dis->rcItem;
+    textRect.left += 16;
+    SetBkMode(dis->hDC, TRANSPARENT);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
+
+    // プレフィックス部分（通常色）
+    SetTextColor(dis->hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+    SIZE prefixSz = {};
+    GetTextExtentPoint32W(dis->hDC, prefix.c_str(), static_cast<int>(prefix.size()), &prefixSz);
+    RECT prefixRect = textRect;
+    DrawTextW(dis->hDC, prefix.c_str(), -1, &prefixRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+    // 新バージョン部分（選択時はハイライトテキスト色、通常時は赤）
+    RECT newVerRect = textRect;
+    newVerRect.left += prefixSz.cx;
+    SetTextColor(dis->hDC, selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(220, 0, 0));
+    DrawTextW(dis->hDC, latest.c_str(), -1, &newVerRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+    SelectObject(dis->hDC, oldFont);
+    return TRUE;
+}
+
 // トレイアイコン用ウィンドウプロシージャ
 // 右クリックトレイメニューの構築と表示
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
@@ -2924,7 +3077,17 @@ static void showTrayContextMenu(HWND hWnd) {
         updateTrayTooltip(hWnd);
         return;
     }
-    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
+    if (g_updateAvailable.load()) {
+        // 新版あり: オーナードローで "Gcalntfy vX.Y.Z → vNew" を赤文字で表示する
+        MENUITEMINFOW mii = { sizeof(mii) };
+        mii.fMask = MIIM_FTYPE | MIIM_ID;
+        mii.fType = MFT_OWNERDRAW;
+        mii.wID   = IDM_OPEN_GITHUB;
+        InsertMenuItemW(hMenu, 0, TRUE, &mii);
+    }
+    else {
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
+    }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     // 音声通知（親: レジストリ永続化）
@@ -3012,7 +3175,8 @@ static void handleTrayCommand(UINT id) {
         return;
     }
     if (id == IDM_OPEN_GITHUB) {
-        ShellExecuteW(nullptr, L"open", GITHUB_URL, nullptr, nullptr, SW_SHOWNORMAL);
+        const wchar_t* url = g_updateAvailable.load() ? GITHUB_RELEASES_URL : GITHUB_URL;
+        ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
     if (id == IDM_OPEN_CALENDAR_TODAY) {
@@ -3173,12 +3337,16 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_MEASUREITEM) {
-        if (measureScheduleMenuItem(hWnd, reinterpret_cast<MEASUREITEMSTRUCT*>(lParam)))
-            return TRUE;
+        auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (mis->CtlType == ODT_MENU && mis->itemID == IDM_OPEN_GITHUB)
+            return measureVersionMenuItem(hWnd, mis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (measureScheduleMenuItem(hWnd, mis)) return TRUE;
     }
     if (msg == WM_DRAWITEM) {
-        if (drawScheduleMenuItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)))
-            return TRUE;
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlType == ODT_MENU && dis->itemID == IDM_OPEN_GITHUB)
+            return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (drawScheduleMenuItem(dis)) return TRUE;
     }
     // 左クリックポップアップ上の右クリック: 通知抑制をトグルする
     // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
@@ -3877,6 +4045,11 @@ int wmain() {
 
         writeLog("started");
         logSchedule(cfg.schedule);
+
+        // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）
+        if (cfg.updateCheckEnabled) {
+            std::thread(checkForUpdates).detach();
+        }
 
         // 通知スレッド起動
         std::thread notifyThread(notifyThreadFunc, exeDir);
