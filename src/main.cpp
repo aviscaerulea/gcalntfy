@@ -214,6 +214,11 @@ static std::atomic<bool>      g_authRequired{false};
 static std::atomic<bool>      g_authInProgress{false};
 static std::atomic<ULONGLONG> g_lastAuthToastTime{0};
 
+// 対話認証スレッドのハンドル
+// detach せず保持し、シャットダウン時に join して破棄済みグローバルへのアクセスを防ぐ。
+// 起動・再代入・合流はすべて UI（メイン）スレッドで行うため排他は不要
+static std::thread g_authThread;
+
 // 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
 static void showToast(const std::wstring& timeJST, const std::wstring& title,
                       const std::wstring& permalink, bool silent = true);
@@ -303,8 +308,13 @@ static HFONT g_hMenuFont = nullptr;
 // ISimpleAudioVolume を取得したスレッドと別スレッドで Release すると、
 // COM スレッド境界をまたいだプロキシ解放となり潜在リスクがあるため、
 // 取得・復元・解放をすべて同一スレッドに集約する。
+// samples / fmt は g_wavCache の複製。再生スレッドが静的変数を参照すると、シャットダウン時に
+// スレッドが残存した場合（WASAPI ハング等）に静的破棄後の解放済みメモリアクセスとなるため、
+// 音声データの所有権ごとスレッドへ渡して寿命を再生スレッドに閉じ込める。
 struct SoundContext {
-    Config cfg;
+    Config               cfg;
+    std::vector<int16_t> samples;
+    WAVEFORMATEX         fmt;
 };
 
 // ==================== ユーティリティ ====================
@@ -519,11 +529,13 @@ static void logSchedule(const std::vector<int>& schedule) {
 
 // 次のポーリング予定時刻（時・分）を計算する共通ロジック
 // 60/pollsPerHour 分間隔で正時 :00 起点。次の境界が 60 分以上に達したら翌時 00 分へ繰り上げる。
+// 基準時刻は JST（schedule 配列の時間帯選択と同じ基準に揃える。端末ローカル時刻は使わない）。
 // 設定ロード側で [1, 60] にクランプ済みだが、ヘルパー単体での除算ゼロを防ぐためガードする。
 static void calcNextPollTime(int pollsPerHour, int& outHour, int& outMin) {
     if (pollsPerHour <= 0) pollsPerHour = 1;
-    SYSTEMTIME now;
-    GetLocalTime(&now);
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    SYSTEMTIME now = utcToJst(utcNow);
     int intervalMin = 60 / pollsPerHour;
     int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
     int nextHour = now.wHour;
@@ -545,10 +557,11 @@ static std::string nextPollTimeStr(int pollsPerHour) {
 }
 
 // 次のポーリング予定時刻までのスリープ時間（ms）を計算
-// 正時 :00 起点で 60/pollsPerHour 分間隔の次の予定分までの残り時間を返す
+// 正時 :00 起点で 60/pollsPerHour 分間隔の次の予定分までの残り時間を返す（基準時刻は JST）
 static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
-    SYSTEMTIME now;
-    GetLocalTime(&now);
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    SYSTEMTIME now = utcToJst(utcNow);
     int nextHour = 0, nextMin = 0;
     calcNextPollTime(pollsPerHour, nextHour, nextMin);
     // 翌時 00 分への繰り上がりは「現在時の 60 分時点」として扱う
@@ -575,7 +588,7 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
-    WinHttpSetTimeouts(hSession, 0, 15000, 30000, 30000);
+    WinHttpSetTimeouts(hSession, 15000, 15000, 30000, 30000);
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
@@ -628,15 +641,25 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     std::string respBody;
     std::vector<char> buf;
     DWORD avail = 0;
+    bool readFailed = false;
     while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
         if (buf.size() < avail) buf.resize(avail);
         DWORD read = 0;
-        if (WinHttpReadData(hRequest, buf.data(), avail, &read)) respBody.append(buf.data(), read);
+        // 読込失敗時は部分受信を完全受信と誤認しないよう打ち切り、リクエスト全体を失敗扱いにする
+        if (!WinHttpReadData(hRequest, buf.data(), avail, &read)) {
+            readFailed = true;
+            break;
+        }
+        respBody.append(buf.data(), read);
     }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+    if (readFailed) {
+        if (outStatusCode) *outStatusCode = 0;
+        return "";
+    }
     return respBody;
 }
 
@@ -1072,17 +1095,10 @@ static RefreshResult tryRefreshAccessToken() {
 //
 // ユーザアクション（Toast クリック・未認証時のトレイ左クリック）からのみ起動される。
 // ループバックサーバを起動し、ブラウザで Google 認証画面を開いて authorization code を待ち受ける。
-// 二重起動は g_authInProgress で防止する。別スレッドで実行される想定。
+// 二重起動は起動側（launchInteractiveAuth）の CAS で防止する。別スレッドで実行される想定。
 // 成功時: g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
 static void startInteractiveAuth() {
-    // 二重起動防止（CAS）
-    bool expected = false;
-    if (!g_authInProgress.compare_exchange_strong(expected, true)) {
-        writeLog("interactive auth already in progress, skip");
-        return;
-    }
-
-    // 切り離しスレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
+    // 専用スレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
     // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存するため、
     // 失敗時は対話認証を断念して g_authInProgress を解放する（不整合状態で続行しない）。
     bool comInitialized = false;
@@ -1173,15 +1189,20 @@ static std::string normalizeToUtcIso(const std::string& dt) {
     // "+HH:MM" または "-HH:MM" を 10 文字以降で探す
     int tzH = 0, tzM = 0;
     bool negative = false;
+    bool tzFound = false;
     size_t plusPos  = dt.rfind('+');
     size_t minusPos = dt.rfind('-');
     if (plusPos != std::string::npos && plusPos > 10) {
         sscanf_s(dt.c_str() + plusPos + 1, "%d:%d", &tzH, &tzM);
+        tzFound = true;
     }
     else if (minusPos != std::string::npos && minusPos > 10) {
         sscanf_s(dt.c_str() + minusPos + 1, "%d:%d", &tzH, &tzM);
         negative = true;
+        tzFound = true;
     }
+    // オフセット未検出（Z も ±HH:MM も無い）の値を UTC とみなすと時刻がずれるため正規化しない
+    if (!tzFound) return dt;
     // タイムゾーンオフセットの妥当性検証（有効範囲: ±14 時間以内）
     if (tzH > 14 || tzM > 59) return dt;
 
@@ -2077,11 +2098,16 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                     writeLog("loadWavAndNormalize: failed to read fmt chunk");
                     goto cleanup;
                 }
-                if (chunkSize > readSize)
-                    SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
+                if (chunkSize > readSize) {
+                    // 余剰スキップも奇数長チャンクの 1 バイトパディングを含めて偶数境界へ進める
+                    DWORD skipSize = chunkSize - readSize + (chunkSize & 1);
+                    if (skipSize > (DWORD)LONG_MAX) break;
+                    if (SetFilePointer(hFile, (LONG)skipSize, nullptr, FILE_CURRENT) == INVALID_SET_FILE_POINTER)
+                        break;
+                }
                 if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
-                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0
-                        || wavFmt.nChannels == 0) {
+                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nChannels == 0
+                        || wavFmt.nBlockAlign != wavFmt.nChannels * 2) {
                     writeLog("loadWavAndNormalize: unsupported format, only 16bit PCM WAV is supported");
                     goto cleanup;
                 }
@@ -2172,20 +2198,20 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
     phase = std::fmod(phase, 2.0 * PI);
 }
 
-// g_wavCache のノーマライズ済み PCM データを WASAPI 共有モードで再生する
+// ノーマライズ済み PCM データを WASAPI 共有モードで再生する
 //
 // 再生フロー（guardEnabled が true の場合）:
 //   ガードトーン（リードイン） → 通知音（チャイム）→ ガードトーン（リードアウト）
-// g_wavCache.valid == false（sound.wav なし）の場合は何もしない。
+// samples / wavFmt は呼び出し側（SoundContext）が所有する複製を受け取る（静的変数は参照しない）。
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
 // g_shutdownRequested が true になると再生を中断する。
-static bool playWavToWasapi(const Config& cfg) {
-    if (!g_wavCache.valid) return false;
+static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& samples,
+    const WAVEFORMATEX& wavFmt)
+{
+    if (samples.empty()) return false;
 
-    const WAVEFORMATEX& wavFmt     = g_wavCache.fmt;
-    const int16_t*      pcmData    = g_wavCache.samples.data();
-    UINT32              totalFrames = static_cast<UINT32>(g_wavCache.samples.size())
-                                      / wavFmt.nChannels;
+    const int16_t* pcmData     = samples.data();
+    UINT32         totalFrames = static_cast<UINT32>(samples.size()) / wavFmt.nChannels;
 
     bool   ok     = false;
     HANDLE hEvent = nullptr;
@@ -2234,24 +2260,27 @@ static bool playWavToWasapi(const Config& cfg) {
         }
 
         UINT32 bufFrames = 0;
-        client->GetBufferSize(&bufFrames);
+        if (FAILED(client->GetBufferSize(&bufFrames)) || bufFrames == 0) {
+            writeLog("playWavToWasapi: GetBufferSize failed");
+            goto cleanup;
+        }
 
         // ガードトーン供給ループ（冒頭・末尾共用）
+        // デバイス無効化等で GetCurrentPadding・GetBuffer が失敗したら無限スピンを避けて中断する
         auto runToneLoop = [&](UINT32 toneFrames) {
             UINT32 written = 0;
             double phase   = 0.0;
             while (written < toneFrames && !g_shutdownRequested) {
                 WaitForSingleObject(hEvent, 200);
                 UINT32 padding = 0;
-                client->GetCurrentPadding(&padding);
+                if (FAILED(client->GetCurrentPadding(&padding))) break;
                 UINT32 avail  = bufFrames - padding;
                 UINT32 frames = min(avail, toneFrames - written);
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
-                if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                    fillToneBuffer(buf, frames, wavFmt, phase);
-                    render->ReleaseBuffer(frames, 0);
-                }
+                if (FAILED(render->GetBuffer(frames, &buf))) break;
+                fillToneBuffer(buf, frames, wavFmt, phase);
+                render->ReleaseBuffer(frames, 0);
                 written += frames;
             }
         };
@@ -2259,20 +2288,30 @@ static bool playWavToWasapi(const Config& cfg) {
         // 冒頭ガードトーン（BLE ヘッドホン対処：省電力移行防止）
         if (cfg.guardToneMs > 0) {
             UINT32 toneFrames = wavFmt.nSamplesPerSec * cfg.guardToneMs / 1000;
-            client->Start();
+            if (FAILED(client->Start())) {
+                writeLog("playWavToWasapi: Start failed (guard tone)");
+                goto cleanup;
+            }
             runToneLoop(toneFrames);
             client->Stop();
             client->Reset();
         }
 
         // WAV PCM 供給ループ（メモリバッファから読み込み）
+        // デバイス無効化等の API 失敗時は再生中断（無限スピン防止、ダッキング解除を保証）
         UINT32 sentFrames = 0;
         bool   eof        = false;
-        client->Start();
+        if (FAILED(client->Start())) {
+            writeLog("playWavToWasapi: Start failed");
+            goto cleanup;
+        }
         while (!eof && !g_shutdownRequested) {
             WaitForSingleObject(hEvent, 200);
             UINT32 padding = 0;
-            client->GetCurrentPadding(&padding);
+            if (FAILED(client->GetCurrentPadding(&padding))) {
+                writeLog("playWavToWasapi: GetCurrentPadding failed, aborting playback");
+                break;
+            }
             UINT32 avail = bufFrames - padding;
             if (avail == 0) continue;
 
@@ -2290,12 +2329,14 @@ static bool playWavToWasapi(const Config& cfg) {
             }
 
             BYTE* buf = nullptr;
-            if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                memcpy(buf, pcmData + sentFrames * wavFmt.nChannels,
-                       frames * wavFmt.nBlockAlign);
-                render->ReleaseBuffer(frames, 0);
-                sentFrames += frames;
+            if (FAILED(render->GetBuffer(frames, &buf))) {
+                writeLog("playWavToWasapi: GetBuffer failed, aborting playback");
+                break;
             }
+            memcpy(buf, pcmData + sentFrames * wavFmt.nChannels,
+                   frames * wavFmt.nBlockAlign);
+            render->ReleaseBuffer(frames, 0);
+            sentFrames += frames;
         }
 
         // 末尾ガードトーン（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
@@ -2325,7 +2366,7 @@ static DWORD WINAPI soundThread(LPVOID param) {
 
     if (comOk) {
         auto muted = duckAudioSessions(ctx->cfg.duckTargets);
-        playWavToWasapi(ctx->cfg);
+        playWavToWasapi(ctx->cfg, ctx->samples, ctx->fmt);
         if (!muted.empty()) {
             unduckAudioSessions(muted);
             writeLog("unduckAudioSessions: restored");
@@ -2388,7 +2429,8 @@ static void launchSound(const Config& cfg) {
     }
 
     // スレッドで再生（ダッキング開始 → 通知音 → ダッキング解除を soundThread 内で完結）
-    auto* ctx = new SoundContext{ .cfg = cfg };
+    // 音声データは複製して渡し、再生スレッドが静的キャッシュへ依存しないようにする
+    auto* ctx = new SoundContext{ .cfg = cfg, .samples = g_wavCache.samples, .fmt = g_wavCache.fmt };
 
     HANDLE hThread = CreateThread(nullptr, 0, soundThread, ctx, 0, nullptr);
     if (!hThread) {
@@ -2953,9 +2995,16 @@ static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
 }
 
 // GitHub の最新リリースを確認し、新版があれば Toast 通知とグローバル状態を更新する
-// 起動時に detach したスレッドで 1 回だけ実行する
+// 起動時に専用スレッドで 1 回だけ実行する（シャットダウン時に wmain が join する）
 static void checkForUpdates() {
-    winrt::init_apartment();
+    // スレッド関数のため例外脱出は std::terminate に直結する。初期化失敗時は安全に中断する
+    try {
+        winrt::init_apartment();
+    }
+    catch (...) {
+        writeLog("update check: init_apartment failed");
+        return;
+    }
     // 予期しない例外でスレッドが std::terminate しないよう全体を保護する
     try {
         do {
@@ -2990,17 +3039,19 @@ static void checkForUpdates() {
             g_updateAvailable.store(true);
             writeLog("update available: " + wideToUtf8(tagName));
 
-            // Toast: 同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
+            // Toast: 同一版は 1 回のみ（表示に成功した版だけをレジストリへ記録し、失敗時は次回起動で再通知）
             std::wstring notifiedVer = readRegString(REG_NOTIFIED_VERSION);
-            writeRegString(REG_NOTIFIED_VERSION, tagName);
             if (notifiedVer != tagName) {
                 try {
                     showToast3(L"新しいバージョンがあります",
                                std::wstring(L"v") + APP_VERSION + L" → " + tagName,
                                L"クリックしてリリースページを開いてください",
                                GITHUB_RELEASES_URL);
+                    writeRegString(REG_NOTIFIED_VERSION, tagName);
                 }
-                catch (...) {}
+                catch (...) {
+                    writeLog("update check: toast failed");
+                }
             }
         } while (false);
     }
@@ -3125,19 +3176,32 @@ static void showTrayContextMenu(HWND hWnd) {
     updateTrayTooltip(hWnd);
 }
 
+// 対話認証スレッドの起動
+// CAS で二重起動を防ぎ、終了済みの前回スレッドを合流してから新スレッドを開始する。
+// スレッド生成に失敗した場合は実行中フラグを戻して次回の起動を可能にする。
+static void launchInteractiveAuth() {
+    bool expected = false;
+    if (!g_authInProgress.compare_exchange_strong(expected, true)) {
+        writeLog("interactive auth already in progress, skip");
+        return;
+    }
+    // 実行中フラグが false だった時点で前回スレッドは終了済み（join は即座に返る）
+    if (g_authThread.joinable()) g_authThread.join();
+    try {
+        g_authThread = std::thread(startInteractiveAuth);
+    }
+    catch (const std::system_error& e) {
+        writeLog(std::string("failed to start auth thread: ") + e.what());
+        g_authInProgress.store(false);
+    }
+}
+
 // トレイアイコン左クリック時の処理
 // 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
 static void handleTrayLeftClick(HWND hWnd) {
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
-        if (!g_authInProgress.load()) {
-            try {
-                std::thread(startInteractiveAuth).detach();
-            }
-            catch (const std::system_error& e) {
-                writeLog(std::string("failed to start auth thread: ") + e.what());
-            }
-        }
+        launchInteractiveAuth();
         return;
     }
     g_popupShowing.store(true);
@@ -3321,11 +3385,19 @@ static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
         return TRUE;
     }, 0);
     saveMutedEvents(g_exeDir);
+    // 通知スレッドを直接起こして抑制状態を即時反映する（ポーリング成功を待たない）
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_eventsUpdated = true;
+    }
+    g_cv.notify_one();
     g_forcePoll.store(true);
     writeLog(std::string("muted: ") + (nowMuted ? "added " : "removed ") + item.key);
 }
 
-static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// トレイウィンドウのメッセージ処理本体
+// 例外を投げうる C++ 処理を含むため、呼び出しは trayWndProc 経由で保護する
+static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
             showTrayContextMenu(hWnd);
@@ -3338,14 +3410,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_AUTH_REQUESTED) {
-        if (!g_authInProgress.load()) {
-            try {
-                std::thread(startInteractiveAuth).detach();
-            }
-            catch (const std::system_error& e) {
-                writeLog(std::string("failed to start auth thread: ") + e.what());
-            }
-        }
+        launchInteractiveAuth();
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_TOOLTIP_REFRESH) {
@@ -3391,6 +3456,18 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// トレイウィンドウプロシージャ
+// C++ 例外が Win32 メッセージディスパッチ境界を貫通すると未定義動作になるため全体を保護する
+static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    try {
+        return trayWndProcImpl(hWnd, msg, wParam, lParam);
+    }
+    catch (...) {
+        writeLog("trayWndProc: unexpected exception");
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
 }
 
 // 非表示トップレベルウィンドウを作成してトレイメッセージ受信に使用する
@@ -3547,7 +3624,13 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
         launchSound(localConfig);
     }
     for (const auto* ev : group) {
-        showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
+        // Toast 失敗の例外がスレッド関数を貫通すると std::terminate するため捕捉して継続する
+        try {
+            showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
+        }
+        catch (...) {
+            writeLog("fireNotificationGroup: toast failed for " + ev->content);
+        }
         notifiedSet.insert(notifyKey(*ev, targetLeadMs));
     }
 }
@@ -3589,7 +3672,14 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 // notifiedSet のキーは "eventKey@minutes" 形式で、同一イベントの異なるタイミングを区別する。
 // 全イベント × 全通知分数を走査して最小発火時間を求めてから wait_until で待機する。
 static void notifyThreadFunc(const std::wstring& exeDir) {
-    winrt::init_apartment();
+    // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する
+    try {
+        winrt::init_apartment();
+    }
+    catch (...) {
+        writeLog("notifyThreadFunc: init_apartment failed");
+        return;
+    }
 
     std::set<std::string>      notifiedSet;
     std::vector<CalendarEvent> localEvents;
@@ -3757,6 +3847,7 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // 取得したイベントを events に追加する。401 を検出した場合は
 // アクセストークンをクリアしてリフレッシュ後に 1 回だけリトライする。
 // outAnySuccess: 1 件以上取得できれば true。
+// outAllSuccess: 全カレンダーの取得に成功した場合のみ true（部分失敗の検出用）。
 // outAuthFailed: リフレッシュ後も認証エラーで全停止する場合に true。
 //
 // ※ ID プレフィックス付与（"<calId>/<eventId>"）はこの関数内で行う。
@@ -3767,9 +3858,11 @@ static void fetchAllCalendarEvents(
     const std::wstring& queryParams,
     std::vector<CalendarEvent>& events,
     bool& outAnySuccess,
+    bool& outAllSuccess,
     bool& outAuthFailed)
 {
     outAnySuccess = false;
+    outAllSuccess = true;
     outAuthFailed = false;
 
     for (const auto& calId : calendarIds) {
@@ -3797,6 +3890,7 @@ static void fetchAllCalendarEvents(
             auto rr = tryRefreshAccessToken();
             if (rr != RefreshResult::Ok) {
                 if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
+                outAllSuccess = false;
                 outAuthFailed = true;
                 return;
             }
@@ -3805,17 +3899,27 @@ static void fetchAllCalendarEvents(
                 tokenSnapshot = g_accessToken;
             }
             body = httpGet(calUrl, tokenSnapshot, &httpStatus);
+            // リフレッシュ済みトークンでも 401 が続く場合は認証問題として再認証へ誘導する
+            if (httpStatus == 401) {
+                writeLog("poll: still 401 after refresh, auth required");
+                notifyAuthRequired();
+                outAllSuccess = false;
+                outAuthFailed = true;
+                return;
+            }
         }
 
         if (body.empty()) {
             writeLog("poll: calendar " + calId + " failed"
                 + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
+            outAllSuccess = false;
             continue;
         }
 
         auto [calEvents, errorMsg] = parseCalendarEvents(body);
         if (!errorMsg.empty()) {
             writeLog("poll: calendar " + calId + ": " + errorMsg);
+            outAllSuccess = false;
             continue;
         }
 
@@ -3848,27 +3952,27 @@ static void deliverPollResults(
     }
     g_cv.notify_one();
 
-    // 変更検知は当日の予定のみを対象とする
-    // 翌日分を含めると日付変更時にポーリングウィンドウの変化で誤検知する
-    auto isToday = [&](const CalendarEvent& e) {
-        auto jst = utcIsoToJstSt(e.datetime);
+    // 変更検知の突合は取得全件（当日＋翌日）で行う
+    // 当日分に絞ってから突合すると、当日↔翌日の予定移動が偽のキャンセル・追加として誤検出される。
+    // 取得窓の上限（翌日末）は日内で固定であり、日付変更時はベースラインリセットで誤検知を防ぐ。
+    std::vector<EventChange> changes;
+    if (baselineEstablished) {
+        changes = collectEventChanges(prevEvents, events);
+    }
+
+    // 通知発火は当日に関わる変更（変更前または変更後の日時が当日）に限定する
+    auto isTodayIso = [&](const std::string& utcIso) {
+        if (utcIso.empty()) return false;
+        auto jst = utcIsoToJstSt(utcIso);
         return jst && jst->wYear == jstNow.wYear
                    && jst->wMonth == jstNow.wMonth
                    && jst->wDay == jstNow.wDay;
     };
-    std::vector<CalendarEvent> todayPrev, todayNew;
-    for (const auto& e : prevEvents) {
-        if (isToday(e)) todayPrev.push_back(e);
+    std::vector<EventChange> todayChanges;
+    for (const auto& c : changes) {
+        if (isTodayIso(c.oldDatetime) || isTodayIso(c.newDatetime)) todayChanges.push_back(c);
     }
-    for (const auto& e : events) {
-        if (isToday(e)) todayNew.push_back(e);
-    }
-
-    std::vector<EventChange> changes;
-    if (baselineEstablished) {
-        changes = collectEventChanges(todayPrev, todayNew);
-    }
-    notifyEventChanges(changes);
+    notifyEventChanges(todayChanges);
     saveCacheFile(exeDir, events);
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
@@ -3883,11 +3987,19 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは認証失効・接続エラーの Toast 表示経路（showErrorToast / notifyAuthRequired）を
     // 持つため、WinRT 呼び出しに先立ってアパートメントを初期化する。
-    winrt::init_apartment();
+    // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する。
+    try {
+        winrt::init_apartment();
+    }
+    catch (...) {
+        writeLog("pollThreadFunc: init_apartment failed");
+        return;
+    }
 
     int  lastJstDay          = -1;
     bool firstPoll           = true;  // 起動時は schedule に関わらず必ず1回ポーリング
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
+    bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
 
     while (!g_shutdownRequested) {
         try {
@@ -3900,14 +4012,22 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             }
 
             // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
-            bool forceTriggered = g_forcePoll.exchange(false);
+            bool forceTriggered = g_forcePoll.exchange(false) || deferredForce;
+            deferredForce       = false;
             ULONGLONG tickNow   = GetTickCount64();
             ULONGLONG lastTick  = g_lastPollTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
             if ((forceTriggered || stale) && !firstPoll) {
                 if (lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
-                    if (forceTriggered) writeLog("force poll skipped (cooldown)");
+                    // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
+                    // （ここでポーリング本体へ進むとクールダウンが機能しない）
+                    if (forceTriggered) {
+                        writeLog("force poll deferred (cooldown)");
+                        deferredForce = true;
+                        waitInterruptible(static_cast<DWORD>(FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick)));
+                        continue;
+                    }
                 }
                 else {
                     if (forceTriggered) writeLog("force poll triggered");
@@ -3956,10 +4076,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             std::vector<CalendarEvent> events;
             bool anySuccess = false;
+            bool allSuccess = false;
             bool authFailed = false;
             ULONGLONG t0    = GetTickCount64();
 
-            fetchAllCalendarEvents(calendarIds, queryParams, events, anySuccess, authFailed);
+            fetchAllCalendarEvents(calendarIds, queryParams, events, anySuccess, allSuccess, authFailed);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
             if (authFailed) {
@@ -3971,6 +4092,15 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (!anySuccess) {
                 writeLog("HTTP request failed");
                 showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
+                waitInterruptible(RETRY_WAIT_MS);
+                continue;
+            }
+
+            // 部分失敗（一部カレンダーのみ取得失敗）は一時障害として前回状態を維持する
+            // 欠落リストで差分検知・キャッシュ上書き・表示置換を行うと、失敗カレンダーの予定が
+            // 誤キャンセル通知・キャッシュ劣化・一覧からの一時消失として現れるため
+            if (!allSuccess) {
+                writeLog("poll: partial calendar failure, keeping previous state");
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
@@ -4041,6 +4171,12 @@ int wmain() {
         writeLog("warning: failed to create job object");
     }
 
+    // 例外時の後始末（NIC 監視解除・スレッド join）を catch 節でも行えるよう try の外で宣言する
+    std::thread notifyThread;
+    std::thread pollThread;
+    std::thread updateThread;
+    HANDLE hNetNotify = nullptr;
+
     try {
         winrt::init_apartment();
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
@@ -4051,7 +4187,6 @@ int wmain() {
 
         // NIC 変化（Wi-Fi 接続/切断、LAN 抜き差し等）の監視を登録
         // FALSE: 登録時に既存インターフェースの初期通知は不要
-        HANDLE hNetNotify = nullptr;
         if (NotifyIpInterfaceChange(AF_UNSPEC, onNetworkChange, nullptr, FALSE, &hNetNotify) != NO_ERROR) {
             writeLog("NotifyIpInterfaceChange failed: " + std::to_string(GetLastError()));
             hNetNotify = nullptr;
@@ -4072,10 +4207,10 @@ int wmain() {
         writeLog("started");
         logSchedule(cfg.schedule);
 
-        // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）
+        // 更新チェックスレッド起動（起動時に 1 回のみ実行、シャットダウン時に join）
         if (cfg.updateCheckEnabled) {
             try {
-                std::thread(checkForUpdates).detach();
+                updateThread = std::thread(checkForUpdates);
             }
             catch (const std::system_error& e) {
                 writeLog(std::string("failed to start update check thread: ") + e.what());
@@ -4083,7 +4218,7 @@ int wmain() {
         }
 
         // 通知スレッド起動
-        std::thread notifyThread(notifyThreadFunc, exeDir);
+        notifyThread = std::thread(notifyThreadFunc, exeDir);
 
         // 通知抑制リストを復元（過去分のエントリは自動プルーニング）
         loadMutedEvents(exeDir);
@@ -4109,7 +4244,7 @@ int wmain() {
         // ポーリングスレッド起動
         // メインスレッドはメッセージループに専念させるため、Calendar API ポーリング（HTTP I/O）を別スレッドへ分離する。
         // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
-        std::thread pollThread(pollThreadFunc, exeDir, cfg);
+        pollThread = std::thread(pollThreadFunc, exeDir, cfg);
 
         // メッセージループ（純粋）
         // GetMessage は WM_QUIT で 0 を返してループを抜ける。
@@ -4133,6 +4268,13 @@ int wmain() {
         pollThread.join();
         notifyThread.join();
 
+        // 対話認証スレッドが残っていれば合流（認証コード待ちはシャットダウン要求を 1 秒以内に検知して脱出する）
+        if (g_authThread.joinable()) g_authThread.join();
+
+        // 更新チェックスレッドが残っていれば合流（通常は起動後数秒で完了済み。
+        // 最悪ケースは GitHub への HTTP タイムアウト待ちで終了が数十秒遅れる）
+        if (updateThread.joinable()) updateThread.join();
+
         // ループ終了後のクリーンアップ
         WTSUnRegisterSessionNotification(g_hWnd);
         removeTrayIcon(g_hWnd);
@@ -4142,6 +4284,15 @@ int wmain() {
     }
     catch (...) {
         writeLog("unexpected initialization error");
+        // joinable なスレッドを残したまま破棄すると std::terminate になるため、
+        // 停止要求を立ててから合流させ、NIC 監視コールバックも解除してから戻る
+        g_shutdownRequested = true;
+        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
+        g_cv.notify_one();
+        if (pollThread.joinable()) pollThread.join();
+        if (notifyThread.joinable()) notifyThread.join();
+        if (g_authThread.joinable()) g_authThread.join();
+        if (updateThread.joinable()) updateThread.join();
         return 2;
     }
 
