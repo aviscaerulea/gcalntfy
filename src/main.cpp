@@ -2734,10 +2734,10 @@ static HICON createBadgedIcon() {
     DrawIconEx(hdcMem, 0, 0, hBase, cx, cy, 0, nullptr, DI_NORMAL);
     DestroyIcon(hBase);
 
-    // バッジ円のパラメータ（アイコンを十字 4 等分した右下領域にマージン 1px で収める）
-    int badgeSize = (std::max)(cx / 2 - 2, 3);
-    int ox   = cx / 2;
-    int oy   = cy / 2 + 1;
+    // バッジ円のパラメータ（アイコンを十字 4 等分した右下領域に収め、右端から 1px 内側へ寄せる）
+    int badgeSize = (std::max)(cx / 2 - 1, 3);
+    int ox   = cx / 2 - 1;
+    int oy   = cy / 2;
     float midX = ox + badgeSize / 2.0f;
     float midY = oy + badgeSize / 2.0f;
     float r    = badgeSize / 2.0f;
@@ -2751,8 +2751,22 @@ static HICON createBadgedIcon() {
             float d     = sqrtf((x - midX) * (x - midX) + (y - midY) * (y - midY));
             float alpha = (d <= r - 0.5f) ? 1.0f : (d <= r + 0.5f) ? (r + 0.5f - d) : 0.0f;
             if (alpha <= 0.0f) continue;
-            UINT32 a = static_cast<UINT32>(alpha * 255.0f + 0.5f);
-            pixels[y * cx + x] = (a << 24) | 0x00FF0000u;
+            // バッジ色を下地アイコンへ source-over 合成
+            // 縁を半透明の赤で上書きせず下地へ重ね、暗い縁取りを防ぐ
+            const float sr = 1.0f, sg = 42.0f / 255.0f, sb = 42.0f / 255.0f;  // 明るい赤
+            UINT32 dst = pixels[y * cx + x];
+            float da = ((dst >> 24) & 0xFFu) / 255.0f;
+            float dr = ((dst >> 16) & 0xFFu) / 255.0f;
+            float dg = ((dst >> 8)  & 0xFFu) / 255.0f;
+            float db = ( dst        & 0xFFu) / 255.0f;
+            float oa = alpha + da * (1.0f - alpha);
+            if (oa <= 0.0f) continue;
+            float inv = (1.0f - alpha) * da;
+            UINT32 R = static_cast<UINT32>((sr * alpha + dr * inv) / oa * 255.0f + 0.5f);
+            UINT32 G = static_cast<UINT32>((sg * alpha + dg * inv) / oa * 255.0f + 0.5f);
+            UINT32 B = static_cast<UINT32>((sb * alpha + db * inv) / oa * 255.0f + 0.5f);
+            UINT32 A = static_cast<UINT32>(oa * 255.0f + 0.5f);
+            pixels[y * cx + x] = (A << 24) | (R << 16) | (G << 8) | B;
         }
     }
 
