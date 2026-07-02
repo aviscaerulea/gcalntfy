@@ -646,7 +646,14 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     std::vector<char> buf;
     DWORD avail = 0;
     bool readFailed = false;
-    while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+    for (;;) {
+        // 戻り値 FALSE（呼び出し失敗）と avail == 0（正常 EOF）を区別する。区別しないと
+        // 通信が途中で切れた応答を正常受信と誤認して返してしまう
+        if (!WinHttpQueryDataAvailable(hRequest, &avail)) {
+            readFailed = true;
+            break;
+        }
+        if (avail == 0) break;
         if (buf.size() < avail) buf.resize(avail);
         DWORD read = 0;
         // 読込失敗時は部分受信を完全受信と誤認しないよう打ち切り、リクエスト全体を失敗扱いにする
