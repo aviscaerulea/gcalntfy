@@ -3873,7 +3873,9 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // アクセストークンをクリアしてリフレッシュ後に 1 回だけリトライする。
 // outAnySuccess: 1 件以上取得できれば true。
 // outAllSuccess: 全カレンダーの取得に成功した場合のみ true（部分失敗の検出用）。
-// outAuthFailed: リフレッシュ後も認証エラーで全停止する場合に true。
+// outAuthFailed: 全カレンダーがリフレッシュ失敗または 401 継続に終わった場合のみ true。
+// 一部カレンダーのみの 401 は該当カレンダーをスキップする。共有解除等の個別権限問題を
+// トークン全体の失効と混同すると、正常なカレンダーまで巻き込んで通知を止めてしまうためだ。
 //
 // ※ ID プレフィックス付与（"<calId>/<eventId>"）はこの関数内で行う。
 // カレンダー ID をまたいだ ID 衝突防止のため、events 取得直後にカレンダー ID を
@@ -3889,6 +3891,10 @@ static void fetchAllCalendarEvents(
     outAnySuccess = false;
     outAllSuccess = true;
     outAuthFailed = false;
+
+    // リフレッシュ後も 401 が続いたカレンダー数。全件がこの状態なら
+    // トークン全体の失効とみなして outAuthFailed を立てる
+    size_t stillUnauthorizedCount = 0;
 
     for (const auto& calId : calendarIds) {
         std::wstring calUrl = L"https://";
@@ -3914,23 +3920,27 @@ static void fetchAllCalendarEvents(
             }
             auto rr = tryRefreshAccessToken();
             if (rr != RefreshResult::Ok) {
+                // リフレッシュ自体の失敗も、他のカレンダーで既に取得済みのデータを
+                // 巻き込んで破棄しないよう、このカレンダーのみスキップして次へ進める。
+                // 全カレンダーがこの状態に陥った場合のみループ後に認証問題として扱う
                 if (rr == RefreshResult::AuthRequired) notifyAuthRequired();
                 outAllSuccess = false;
-                outAuthFailed = true;
-                return;
+                stillUnauthorizedCount++;
+                continue;
             }
             {
                 std::lock_guard<std::mutex> lk(g_tokenMtx);
                 tokenSnapshot = g_accessToken;
             }
             body = httpGet(calUrl, tokenSnapshot, &httpStatus);
-            // リフレッシュ済みトークンでも 401 が続く場合は認証問題として再認証へ誘導する
+            // リフレッシュ済みトークンでも 401 が続く場合、このカレンダー個別の
+            // 権限問題（共有解除等）の可能性があるためスキップに留める。
+            // 全カレンダーがこの状態に陥った場合のみループ後に認証問題として扱う
             if (httpStatus == 401) {
-                writeLog("poll: still 401 after refresh, auth required");
-                notifyAuthRequired();
+                writeLog("poll: calendar " + calId + " still 401 after refresh, skipping");
                 outAllSuccess = false;
-                outAuthFailed = true;
-                return;
+                stillUnauthorizedCount++;
+                continue;
             }
         }
 
@@ -3954,6 +3964,14 @@ static void fetchAllCalendarEvents(
         }
         events.insert(events.end(), calEvents.begin(), calEvents.end());
         outAnySuccess = true;
+    }
+
+    // 全カレンダーがリフレッシュ後も 401 だった場合のみ、トークン全体の
+    // 失効とみなして認証問題として通知する
+    if (!calendarIds.empty() && stillUnauthorizedCount == calendarIds.size()) {
+        writeLog("poll: all calendars still 401 after refresh, auth required");
+        notifyAuthRequired();
+        outAuthFailed = true;
     }
 }
 
