@@ -1251,10 +1251,24 @@ static ParseResult parseCalendarEvents(const std::string& json) {
         for (auto item : arr) {
             auto ev = item.GetObject();
 
-            // イベントタイプフィルタ（outOfOffice / workingLocation / focusTime を除外）
+            // イベントタイプフィルタ（outOfOffice / workingLocation を除外、focusTime は個別判定）
+            //
+            // eventType="focusTime" は Calendar UI の「集中タイム（サイレント モード）」予定と、
+            // Google Tasks から Calendar に同期されたタスク（繰り返さないもののみ。繰り返しタスクは
+            // Events.List に一切現れない）の双方で共通して返る。（実機検証済み 2026-07-07）
+            // focusTimeProperties は両者に同一内容で付与されるため区別に使えない。
+            // タスク由来のイベントのみ description に Google 生成の固定案内文が入り、その中に
+            // "tasks.google.com/task/" という URL が含まれる（言語非依存の判別材料。UI 言語が
+            // 変わっても URL のホスト名は変わらないため）。集中タイム側には description 自体が
+            // 存在しない。この部分文字列の有無でタスク由来かどうかを判定し、タスクのみ通過させる。
             auto evType = winrt::to_string(ev.GetNamedString(L"eventType", L"default"));
-            if (evType == "outOfOffice" || evType == "workingLocation" || evType == "focusTime")
+            if (evType == "outOfOffice" || evType == "workingLocation")
                 continue;
+            if (evType == "focusTime") {
+                auto description = winrt::to_string(ev.GetNamedString(L"description", L""));
+                if (description.find("tasks.google.com/task/") == std::string::npos)
+                    continue;
+            }
 
             // キャンセル済みを除外
             if (winrt::to_string(ev.GetNamedString(L"status", L"")) == "cancelled") continue;
@@ -3859,8 +3873,10 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
     auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
     auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
 
+    // description は focusTime イベントがタスク由来か集中タイムかの判別に使う。
+    // （parseCalendarEvents 参照。tasks.google.com/task/ の URL 有無で判定）
     std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
-    queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders)";
+    queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders,description)";
     queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
     queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
     return queryParams;
