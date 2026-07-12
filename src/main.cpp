@@ -144,6 +144,11 @@ static constexpr int AUTH_CODE_TIMEOUT_SEC = 120;
 // エラー Toast の最小間隔（30 分）
 static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 
+// 部分失敗（一部カレンダーのみ取得失敗）の連続回数がこの値に達したらエラー Toast で警告する。
+// カレンダー削除や設定誤りなど自然回復しない原因で予定更新の停止が沈黙したまま
+// 固定化するのを防ぐ。RETRY_WAIT_MS 間隔の連続失敗約 5 分に相当
+static constexpr int PARTIAL_FAILURE_TOAST_THRESHOLD = 5;
+
 // 認証必要 Toast の最小間隔（30 分）
 static constexpr ULONGLONG AUTH_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 
@@ -4061,9 +4066,10 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     }
 
     int  lastJstDay          = -1;
-    bool firstPoll           = true;  // 起動時は schedule に関わらず必ず1回ポーリング
+    bool firstPoll           = true;  // 起動時は schedule に関わらず必ず 1 回ポーリング
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
     bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
+    int  partialFailureStreak = 0;    // 部分失敗の連続回数（全カレンダー成功でリセット）
 
     while (!g_shutdownRequested) {
         try {
@@ -4163,8 +4169,16 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 部分失敗（一部カレンダーのみ取得失敗）は一時障害として前回状態を維持する
             // 欠落リストで差分検知・キャッシュ上書き・表示置換を行うと、失敗カレンダーの予定が
             // 誤キャンセル通知・キャッシュ劣化・一覧からの一時消失として現れるため
+            // ただし失敗が閾値を超えて続く場合は恒常的な原因（カレンダー削除・設定誤り等）の
+            // 可能性が高く、更新停止が沈黙したまま固定化しないよう Toast で警告する。
             if (!allSuccess) {
-                writeLog("poll: partial calendar failure, keeping previous state");
+                partialFailureStreak++;
+                writeLog("poll: partial calendar failure, keeping previous state (streak "
+                    + std::to_string(partialFailureStreak) + ")");
+                if (partialFailureStreak >= PARTIAL_FAILURE_TOAST_THRESHOLD) {
+                    showErrorToast(L"カレンダー取得エラー",
+                        L"一部カレンダーの取得に失敗し続けているため、予定の更新を停止しています");
+                }
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
@@ -4174,6 +4188,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 return a.datetime < b.datetime;
             });
 
+            partialFailureStreak = 0;
             g_lastErrorToastTime.store(0);
             writeLog("poll: " + std::to_string(events.size()) + " events ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
