@@ -4,7 +4,7 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
- * schedule は 0 時〜 23 時の 24 要素配列（回/時、最低 1）。
+ * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
  * 終了コード:
@@ -118,11 +118,11 @@ static constexpr wchar_t CACHE_FILENAME[]        = L"events.json";
 // 通知抑制リストキャッシュファイル名（exe 同フォルダに保存）
 static constexpr wchar_t MUTED_CACHE_FILENAME[]  = L"muted_events.json";
 
-// 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大50件）
+// 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大 50 件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
 static constexpr UINT IDM_EVENT_MAX  = 41050;
 
-// ツールチップ定期更新タイマー（1分間隔）
+// ツールチップ定期更新タイマー（1 分間隔）
 static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
@@ -235,7 +235,7 @@ static void notifyAuthRequired();
 
 struct CalendarEvent {
     std::string      id;              // Google Calendar イベント id（通知重複防止キー）
-    std::string      datetime;
+    std::string      datetime;        // UTC ISO 8601（辞書順で時系列比較可能な形式）
     std::string      content;
     std::string      permalink;
     std::vector<int> reminderMinutes; // イベント個別の追加通知分数（popup のみ。空=追加通知なし）
@@ -249,7 +249,7 @@ struct ParseResult {
 
 // loadConfig の戻り値
 struct Config {
-    std::vector<int>          schedule;          // 24 要素（0 時〜 23 時の 1 時間あたりポーリング回数、最低 1）
+    std::vector<int>          schedule;          // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
@@ -274,7 +274,7 @@ struct WavCache {
 };
 static WavCache g_wavCache;
 
-// メインスレッド→通知スレッド: 予定リスト・設定の受け渡し（g_mtx で保護）
+// メインスレッド→通知スレッド：予定リスト・設定の受け渡し（g_mtx で保護）
 static std::mutex              g_mtx;
 static std::condition_variable g_cv;
 static std::vector<CalendarEvent> g_pendingEvents;
@@ -437,7 +437,7 @@ static std::string systemTimeToIso(const SYSTEMTIME& st) {
 }
 
 // UTC ISO 8601 文字列を JST ISO 8601 文字列に変換する
-// 入力: "2026-03-07T10:00:00.000Z" → 出力: "2026-03-07T19:00:00"
+// 入力："2026-03-07T10:00:00.000Z" → 出力："2026-03-07T19:00:00"
 static std::string utcIsoToJst(const std::string& utcIso) {
     SYSTEMTIME st = {};
     if (!parseIsoToSystemTime(utcIso, st)) return utcIso;
@@ -523,7 +523,7 @@ static void writeLog(const std::string& msg) {
     CloseHandle(hFile);
 }
 
-// schedule 配列と1日の概算ポーリング回数をログ出力する
+// schedule 配列と 1 日の概算ポーリング回数をログ出力する
 static void logSchedule(const std::vector<int>& schedule) {
     int total = 0;
     std::string s = "schedule: [";
@@ -778,7 +778,7 @@ static std::string urlEncode(const std::string& s) {
 // ==================== OAuth 2.0 フロー ====================
 
 // ループバック HTTP サーバをランダムポートで起動する
-// 戻り値: 実際のポート番号（失敗時 0）
+// 戻り値：実際のポート番号（失敗時 0）
 static int startLoopbackServer(SOCKET& serverSocket) {
     WSADATA wsa = {};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
@@ -809,6 +809,10 @@ static int startLoopbackServer(SOCKET& serverSocket) {
 }
 
 // OAuth 認証 URL を構築してブラウザを開く
+//
+// access_type=offline と prompt=consent を毎回付与する。Google の OAuth は
+// 同意画面をスキップした認可では refresh_token を返さないため、これらを外すと
+// 2 回目以降の認可で refresh_token が取得できなくなる。
 static void openBrowserForAuth(int redirectPort, const std::string& codeVerifier,
     const std::string& state)
 {
@@ -896,7 +900,7 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
 
     std::string req;
     // HTTP リクエスト読み出しループ
-    // recv の戻り値: 正値=受信バイト数、0=ピア close、SOCKET_ERROR(-1)=エラー
+    // recv の戻り値：正値=受信バイト数、0=ピア close、SOCKET_ERROR(-1)=エラー
     // ループ離脱後、"\r\n\r\n" が未受信なら不完全リクエスト検知で弾かれる（後段を参照）。
     char chunk[1024];
     while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
@@ -989,7 +993,7 @@ static bool applyTokenResponse(const winrt::Windows::Data::Json::JsonObject& obj
 }
 
 // 認証コードをアクセストークン・リフレッシュトークンに交換する
-// 成功時: g_accessToken / g_tokenExpiry を更新し、refresh_token をレジストリに保存
+// 成功時：g_accessToken / g_tokenExpiry を更新し、refresh_token をレジストリに保存
 static bool exchangeCodeForTokens(const std::string& authCode,
     int redirectPort, const std::string& codeVerifier)
 {
@@ -1043,7 +1047,7 @@ enum class RefreshResult { Ok, NetworkError, AuthRequired };
 
 // リフレッシュトークンでアクセストークンを更新する
 //
-// 戻り値: Ok / NetworkError / AuthRequired（呼び出し側で使い分ける）
+// 戻り値：Ok / NetworkError / AuthRequired（呼び出し側で使い分ける）
 static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
     std::string body =
         "grant_type=refresh_token"
@@ -1112,7 +1116,7 @@ static RefreshResult tryRefreshAccessToken() {
 // ユーザアクション（Toast クリック・未認証時のトレイ左クリック）からのみ起動される。
 // ループバックサーバを起動し、ブラウザで Google 認証画面を開いて authorization code を待ち受ける。
 // 二重起動は起動側（launchInteractiveAuth）の CAS で防止する。別スレッドで実行される想定。
-// 成功時: g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
+// 成功時：g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
 static void startInteractiveAuth() {
     // 専用スレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
     // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存するため、
@@ -1192,7 +1196,7 @@ static std::string normalizeToUtcIso(const std::string& dt) {
         return buf;
     }
 
-    // 時刻あり: "YYYY-MM-DDTHH:MM:SS..." 形式
+    // 時刻あり："YYYY-MM-DDTHH:MM:SS..." 形式
     if (sscanf_s(dt.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) return dt;
 
     // "Z" は UTC
@@ -1219,7 +1223,7 @@ static std::string normalizeToUtcIso(const std::string& dt) {
     }
     // オフセット未検出（Z も ±HH:MM も無い）の値を UTC とみなすと時刻がずれるため正規化しない
     if (!tzFound) return dt;
-    // タイムゾーンオフセットの妥当性検証（有効範囲: ±14 時間以内）
+    // タイムゾーンオフセットの妥当性検証（有効範囲：±14 時間以内）
     if (tzH > 14 || tzM > 59) return dt;
 
     SYSTEMTIME st = {};
@@ -1458,7 +1462,7 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
             e.datetime  = winrt::to_string(obj.GetNamedString(L"datetime",  L""));
             e.content   = winrt::to_string(obj.GetNamedString(L"content",   L""));
             e.permalink = winrt::to_string(obj.GetNamedString(L"permalink", L""));
-            // reminderMinutes の復元（旧キャッシュ互換: キーなし → 空ベクタ）
+            // reminderMinutes の復元（旧キャッシュ互換：キーなし → 空ベクタ）
             if (obj.HasKey(L"reminderMinutes")) {
                 for (auto mv : obj.GetNamedArray(L"reminderMinutes"))
                     e.reminderMinutes.push_back(static_cast<int>(mv.GetNumber()));
@@ -1921,7 +1925,7 @@ static bool isRegistryDeviceInUse(const wchar_t* deviceType) {
     basePath += deviceType;
 
     auto checkSubKeys = [](const std::wstring& keyPath, bool skipNonPackaged) -> bool {
-        // RAII ガード: 例外（std::bad_alloc 等）でもハンドルを確実に閉じる
+        // RAII ガード：例外（std::bad_alloc 等）でもハンドルを確実に閉じる
         struct Guard { HKEY h = nullptr; ~Guard() { if (h) RegCloseKey(h); } };
 
         Guard kg;
@@ -2413,10 +2417,10 @@ static DWORD WINAPI soundThread(LPVOID param) {
 
 // WASAPI で通知音（16bit PCM WAV）を再生する
 //
-// 再生フロー（guard.enabled が true の場合）:
+// 再生フロー（cfg.guardToneMs > 0 の場合）:
 //   ガードトーン（リードイン）→ 通知音（チャイム）→ ガードトーン（リードアウト）
 // g_wavCache.valid == false の場合は音声を再生せずに終了する（Toast 通知は呼び出し側で別途表示）。
-// ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
+// ダッキング：cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
 static void launchSound(const Config& cfg) {
     if (!g_wavCache.valid) {
         writeLog("launchSound: sound.wav not loaded, skipping sound");
@@ -2614,7 +2618,7 @@ static void showErrorToast(const std::wstring& title, const std::wstring& body)
 // XML に launch="auth" を付与し、Toast 本体クリックで Activated イベントが発火するようにする。
 // Activated ハンドラから WM_AUTH_REQUESTED を WndProc に送り、UI スレッド経由で startInteractiveAuth を起動する。
 //
-// ライフタイム対策: ToastNotification がスコープを抜けるとイベントが発火しないため、
+// ライフタイム対策：ToastNotification がスコープを抜けるとイベントが発火しないため、
 // プロセス寿命の static vector に保持して延命する（直近 4 件まで保持）。
 static void showAuthRequiredToast() {
     static std::mutex                                                   tokensMtx;
@@ -3183,7 +3187,7 @@ static void showTrayContextMenu(HWND hWnd) {
         return;
     }
     if (g_updateAvailable.load()) {
-        // 新版あり: オーナードローで "Gcalntfy vX.Y.Z → vNew" を赤文字で表示する
+        // 新版あり：オーナードローで "Gcalntfy vX.Y.Z → vNew" を赤文字で表示する
         MENUITEMINFOW mii = { sizeof(mii) };
         mii.fMask = MIIM_FTYPE | MIIM_ID;
         mii.fType = MFT_OWNERDRAW;
@@ -3195,11 +3199,11 @@ static void showTrayContextMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    // 音声通知（親: レジストリ永続化）
+    // 音声通知（親：レジストリ永続化）
     AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
         IDM_SOUND_ENABLED, L"通知音を鳴らす");
 
-    // 子項目: 親が OFF なら非活性
+    // 子項目：親が OFF なら非活性
     UINT childFlags = g_soundEnabled ? 0u : (MF_DISABLED | MF_GRAYED);
     AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
@@ -3328,7 +3332,7 @@ static void handleTrayCommand(UINT id) {
 }
 
 // 左クリックポップアップの owner-draw 項目サイズ計算
-// 戻り値: TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
+// 戻り値：TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
 static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     if (mis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(mis->itemData);
@@ -3477,7 +3481,7 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
         if (drawScheduleMenuItem(dis)) return TRUE;
     }
-    // 左クリックポップアップ上の右クリック: 通知抑制をトグルする
+    // 左クリックポップアップ上の右クリック：通知抑制をトグルする
     // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
     if (msg == WM_MENURBUTTONUP) {
         toggleScheduleItemMute(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
@@ -3487,7 +3491,7 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         PostQuitMessage(0);
         return 0;
     }
-    // スリープ復帰・ロック解除: 即時ポーリングをトリガー
+    // スリープ復帰・ロック解除：即時ポーリングをトリガー
     if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
         (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
         g_forcePoll.store(true);
@@ -3535,7 +3539,7 @@ enum class EventChangeType { TimeChanged, Cancelled, Added };
 // 検出した変更 1 件分
 struct EventChange {
     EventChangeType type;
-    std::string     oldDatetime;  // TimeChanged: 旧日時、Cancelled: 通知表示用日時
+    std::string     oldDatetime;  // TimeChanged：旧日時、Cancelled：通知表示用日時
     std::string     newDatetime;  // TimeChanged / Added 時に使用（Cancelled 時は空）
     std::string     content;      // イベント名
     std::string     permalink;    // Calendar URL（空でもよい）
@@ -3629,7 +3633,7 @@ static inline std::string notifyKey(const CalendarEvent& e, long long leadMsVal)
     return eventKey(e) + "@" + std::to_string(leadMsVal / 60000);
 }
 
-// notifiedSet の自然失効: 新リストに含まれないキーを削除する
+// notifiedSet の自然失効：新リストに含まれないキーを削除する
 //
 // notifiedSet のキーは "eventKey@minutes" 形式。
 // イベントが削除・変更されたとき、対応するすべての "@minutes" エントリを失効させる。
@@ -3647,7 +3651,7 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
     }
 }
 
-// 通知発火: Toast 表示と音声再生を実行し、notifiedSet を更新する
+// 通知発火：Toast 表示と音声再生を実行し、notifiedSet を更新する
 // 音声スキップ判定（音声 OFF・会議中）はここで行い、Toast はグループ全件に出す。
 static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group,
     const std::string& targetDatetime, long long targetLeadMs,
@@ -3657,7 +3661,7 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
     auto jstTime  = wideToUtf8(jstTimeW);
     writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s), "
         + std::to_string(targetLeadMs / 60000) + "min before)");
-    // 音声スキップ判定: 音声通知OFF > マイク/カメラ使用中ミュート > 通常再生
+    // 音声スキップ判定：音声通知 OFF > マイク/カメラ使用中ミュート > 通常再生
     if (!g_soundEnabled) {
         writeLog("sound skipped (sound disabled)");
     }
@@ -3679,7 +3683,7 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
     }
 }
 
-// 発火対象を特定する: 通知タイミングが到来しかつ未通知のイベントから最初の (datetime, leadMs) を返す
+// 発火対象を特定する：通知タイミングが到来しかつ未通知のイベントから最初の (datetime, leadMs) を返す
 // 見つからなければ targetDatetime を空のまま返す。
 static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
     const std::string& nowUtc, const std::set<std::string>& notifiedSet,
@@ -3708,7 +3712,7 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
     }
 }
 
-// 通知スレッド: メインスレッドから予定リストを受け取り、通知を実行する
+// 通知スレッド：メインスレッドから予定リストを受け取り、通知を実行する
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
@@ -3756,7 +3760,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
                 if (diffMs <= 0) {
-                    // 開始済みイベント: 全通知タイミングを通知済みとしてマーク
+                    // 開始済みイベント：全通知タイミングを通知済みとしてマーク
                     notifiedSet.insert(notifyKey(e, leadMs));
                     for (int m : e.reminderMinutes)
                         notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
@@ -4110,7 +4114,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             GetSystemTime(&utcNow);
             auto jstNow = utcToJst(utcNow);
 
-            // 日付変更: 強制ポーリングと変更検知ベースラインをリセットする
+            // 日付変更：強制ポーリングと変更検知ベースラインをリセットする
             // notifiedSet は通知スレッドが自然失効で管理する
             if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                 lastJstDay          = static_cast<int>(jstNow.wDay);

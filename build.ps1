@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $Version = $Version -replace '^v', ''
 
-# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シム の優先順）
+# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シムの優先順）
 if ($env:VCPKG_INSTALLATION_ROOT) {
     $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
 }

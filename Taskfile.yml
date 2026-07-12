@@ -46,7 +46,7 @@ tasks:
       - task: copy-assets
 
   rebuild:
-    desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
+    desc: 実行中のバイナリの停止・クリーンビルド・再起動
     cmds:
       - task: clean
       - task: build
