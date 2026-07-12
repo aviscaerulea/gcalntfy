@@ -2247,6 +2247,15 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
     const int16_t* pcmData     = samples.data();
     UINT32         totalFrames = static_cast<UINT32>(samples.size()) / wavFmt.nChannels;
 
+    // 再生全体の打ち切り期限
+    // デバイスがフレームを消費しなくなる異常（padding が減らないまま停滞）では、
+    // 各供給ループが 200ms 待機の avail==0 continue で永久スピンし、スレッドが
+    // プロセス終了まで残存する。想定再生時間（ガードトーン 2 回 + 本体）に
+    // 10 秒の余裕を加えた時刻を超えたら異常として中断する。
+    const ULONGLONG playDeadline = GetTickCount64()
+        + totalFrames * 1000ULL / wavFmt.nSamplesPerSec
+        + 2ULL * cfg.guardToneMs + 10000;
+
     bool   ok     = false;
     HANDLE hEvent = nullptr;
 
@@ -2305,6 +2314,10 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
             UINT32 written = 0;
             double phase   = 0.0;
             while (written < toneFrames && !g_shutdownRequested) {
+                if (GetTickCount64() >= playDeadline) {
+                    writeLog("playWavToWasapi: playback deadline exceeded (guard tone), aborting");
+                    break;
+                }
                 WaitForSingleObject(hEvent, 200);
                 UINT32 padding = 0;
                 if (FAILED(client->GetCurrentPadding(&padding))) break;
@@ -2340,6 +2353,10 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
             goto cleanup;
         }
         while (!eof && !g_shutdownRequested) {
+            if (GetTickCount64() >= playDeadline) {
+                writeLog("playWavToWasapi: playback deadline exceeded, aborting playback");
+                break;
+            }
             WaitForSingleObject(hEvent, 200);
             UINT32 padding = 0;
             if (FAILED(client->GetCurrentPadding(&padding))) {
