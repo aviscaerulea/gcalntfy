@@ -2754,8 +2754,15 @@ static HICON createBadgedIcon() {
     int cy = GetSystemMetrics(SM_CYSMICON);
 
     // 32bpp BGRA の DIBSection を作成（pixels ポインタで直接アクセスできる）
+    // GDI 枯渇時は DC 取得が NULL を返すため、後続へ渡す前に検査して中断する
+    // （呼び出し側はベースアイコンへフォールバックする）
     HDC hdcScreen = GetDC(nullptr);
-    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
+    if (!hdcScreen) return nullptr;
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    if (!hdcMem) {
+        ReleaseDC(nullptr, hdcScreen);
+        return nullptr;
+    }
     BITMAPINFO bmi              = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth       = cx;
@@ -2824,8 +2831,17 @@ static HICON createBadgedIcon() {
     SelectObject(hdcMem, hOld);
 
     // モノクロマスク（黒 = 不透明）を作成
-    HBITMAP hbmMask  = CreateBitmap(cx, cy, 1, 1, nullptr);
-    HDC hdcMono      = CreateCompatibleDC(hdcScreen);
+    // GDI 枯渇時はビットマップ・DC の生成が NULL を返すため、検査して中断する
+    HBITMAP hbmMask = CreateBitmap(cx, cy, 1, 1, nullptr);
+    HDC     hdcMono = hbmMask ? CreateCompatibleDC(hdcScreen) : nullptr;
+    if (!hbmMask || !hdcMono) {
+        if (hdcMono) DeleteDC(hdcMono);
+        if (hbmMask) DeleteObject(hbmMask);
+        DeleteDC(hdcMem);
+        DeleteObject(hbm);
+        ReleaseDC(nullptr, hdcScreen);
+        return nullptr;
+    }
     HBITMAP hOldMono = (HBITMAP)SelectObject(hdcMono, hbmMask);
     PatBlt(hdcMono, 0, 0, cx, cy, BLACKNESS);
     SelectObject(hdcMono, hOldMono);
