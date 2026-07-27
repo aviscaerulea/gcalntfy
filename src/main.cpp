@@ -107,6 +107,7 @@ static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
+static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定の即時再取得（今すぐ更新）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
@@ -126,7 +127,7 @@ static constexpr UINT IDM_EVENT_MAX  = 41050;
 static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
-// 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
+// 自動契機の即時ポーリング抑制間隔（この時間内の要求は先送りし、トレイメニュー「今すぐ更新」の明示要求には適用しない）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
@@ -146,7 +147,8 @@ static constexpr ULONGLONG ERROR_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 
 // 部分失敗（一部カレンダーのみ取得失敗）の連続回数がこの値に達したらエラー Toast で警告する。
 // カレンダー削除や設定誤りなど自然回復しない原因で予定更新の停止が沈黙したまま
-// 固定化するのを防ぐ。RETRY_WAIT_MS 間隔の連続失敗約 5 分に相当
+// 固定化するのを防ぐ。自動再試行のみなら RETRY_WAIT_MS 間隔の連続失敗約 5 分に相当するが、
+// トレイメニュー「今すぐ更新」の手動再試行が挟まるとより短時間で達しうる
 static constexpr int PARTIAL_FAILURE_TOAST_THRESHOLD = 5;
 
 // 認証必要 Toast の最小間隔（30 分）
@@ -191,8 +193,13 @@ static HWND g_hWnd = nullptr;
 // トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
 static std::atomic<bool> g_popupShowing{false};
 
-// スリープ復帰・ロック解除時の即時ポーリングフラグ
+// スリープ復帰・ロック解除・ネットワーク復帰など自動契機の即時ポーリングフラグ
+// （FORCE_POLL_COOLDOWN_MS のクールダウン対象）
 static std::atomic<bool> g_forcePoll{false};
+
+// トレイメニュー「今すぐ更新」による即時ポーリング要求フラグ
+// ユーザの明示操作のため g_forcePoll と異なりクールダウンを適用せず即時に取得する
+static std::atomic<bool> g_pollNowRequested{false};
 
 // 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
 static std::atomic<ULONGLONG> g_lastPollTick{0};
@@ -2709,11 +2716,11 @@ static void notifyAuthRequired() {
 // バックグラウンドスレッド用の中断可能 Sleep
 //
 // メッセージは処理しない（呼び出し元がメインスレッドではないため）。
-// g_shutdownRequested または g_forcePoll が true になった時点で即座にリターンする。
+// g_shutdownRequested・g_forcePoll・g_pollNowRequested のいずれかが true になった時点で即座にリターンする。
 // 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
 static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested && !g_forcePoll.load()) {
+    while (!g_shutdownRequested && !g_forcePoll.load() && !g_pollNowRequested.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -3232,6 +3239,11 @@ static void showTrayContextMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
+    // カレンダー予定の即時再取得。未認証・認証フロー中は取得できないため非活性にする
+    UINT pollNowFlags = (g_authRequired.load() || g_authInProgress.load()) ? (MF_DISABLED | MF_GRAYED) : 0u;
+    AppendMenuW(hMenu, MF_STRING | pollNowFlags, IDM_POLL_NOW, L"今すぐ更新");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
     // 音声通知（親：レジストリ永続化）
     AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
         IDM_SOUND_ENABLED, L"通知音を鳴らす");
@@ -3332,6 +3344,12 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_STARTUP) {
         if (isStartupRegistered()) unregisterStartup();
         else                       registerStartup();
+        return;
+    }
+    if (id == IDM_POLL_NOW) {
+        // 非活性化と同条件の再確認（メニュー表示中に認証状態が変わった場合の保険）
+        if (g_authRequired.load() || g_authInProgress.load()) return;
+        g_pollNowRequested.store(true);
         return;
     }
     if (id == IDM_OPEN_GITHUB) {
@@ -4114,19 +4132,24 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // これにより g_accessToken / g_tokenExpiry の data race と
             // notifyAuthRequired の TOCTOU を回避する。
             if (g_authInProgress.load()) {
-                waitInterruptible(RETRY_WAIT_MS);
+                // 認証完了（成功・失敗とも）かシャットダウンまで待つ。waitInterruptible は
+                // 即時ポーリング要求フラグで即時リターンするため、要求が保留中だと busy loop になり
+                // ここでは使えない。要求は破棄せず保持し、認証完了後のループ再評価で消費する
+                while (g_authInProgress.load() && !g_shutdownRequested) Sleep(100);
                 continue;
             }
 
-            // 即時ポーリング判定（forcePoll フラグ or 1 時間以上未ポーリング）
-            bool forceTriggered = g_forcePoll.exchange(false) || deferredForce;
+            // 即時ポーリング判定（forcePoll・pollNow フラグ or 1 時間以上未ポーリング）
+            // pollNow（トレイメニュー「今すぐ更新」）はユーザの明示操作のためクールダウンを適用しない
+            bool pollNow        = g_pollNowRequested.exchange(false);
+            bool forceTriggered = g_forcePoll.exchange(false) || deferredForce || pollNow;
             deferredForce       = false;
             ULONGLONG tickNow   = GetTickCount64();
             ULONGLONG lastTick  = g_lastPollTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
             if ((forceTriggered || stale) && !firstPoll) {
-                if (lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
+                if (!pollNow && lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
                     // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
                     // （ここでポーリング本体へ進むとクールダウンが機能しない）
                     if (forceTriggered) {
@@ -4137,7 +4160,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                     }
                 }
                 else {
-                    if (forceTriggered) writeLog("force poll triggered");
+                    if (pollNow)             writeLog("poll now triggered (tray menu)");
+                    else if (forceTriggered) writeLog("force poll triggered");
                     if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
                     firstPoll = true;
                 }
