@@ -158,6 +158,10 @@ static constexpr ULONGLONG AUTH_TOAST_COOLDOWN_MS = 30uLL * 60 * 1000;
 // 前回ポーリングからこの時間が経過したら即時ポーリング（1 時間）
 static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 
+// 変更検知で開始済み予定を通知対象外とするまでの猶予（100 ナノ秒単位、1 時間）
+// 開始からこの時間以内は進行中の可能性が高く、急な追加・日時変更の告知価値があるため通知する
+static constexpr long long CHANGE_NOTIFY_GRACE_HNS = 60LL * 60 * 10'000'000;
+
 // 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
 static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"本日の以降予定：なし";
 
@@ -2963,7 +2967,8 @@ static void removeTrayIcon(HWND hWnd) {
 // イベントの同定キーを生成する
 // Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
 // 通知抑制リストのキーとして使うほか、通知済み判定キー（notifyBaseKey が開始日時を連結して
-// 生成する）の構成要素になる。id ベースのため、タイトル編集や日時変更でキーは変わらない。
+// 生成する）の構成要素になる。id が取得できている限り、タイトル編集や日時変更でキーは
+// 変わらない。（フォールバック時は日時とタイトルがキーそのものになるため、この限りではない）
 static inline std::string eventKey(const CalendarEvent& e) {
     return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
@@ -3661,8 +3666,14 @@ struct EventChange {
 // イベントリストの変更を検出する
 //
 // oldEvents と newEvents を id で突合し、日時変更・追加・キャンセルを検出する。
-// Added 検知はポーリングウィンドウへの新規進入を検知するものであり、ユーザが Calendar
-// に実際に追加した予定との区別は行わない（firstPoll スキップで起動直後の誤検知を抑制）。
+// 開始から猶予時間（定数で定義、1 時間）を過ぎた予定のみに関わる変更は通知価値が低いため
+// 検出対象外とする。猶予内の開始済みは進行中の可能性が高く、急な招待として通知する。
+// 除外の適用は次のとおり。追加は猶予超過なら除外する。日時変更は変更前後とも猶予超過なら
+// 除外する。キャンセルは猶予超過の消失を除外する。
+// 終日予定は JST 0 時開始に正規化され当日分が常に開始済み扱いになるため、変更後が終日の
+// 追加・日時変更は除外せず通知する。（キャンセルの除外は終日予定にも適用される）
+// Added 検知は取得窓への新規進入を検知するものであり、ユーザが Calendar
+// に実際に追加した予定との区別は行わない。（firstPoll スキップで起動直後の誤検知を抑制）
 // id が空のイベントは比較対象から除外する。
 // oldEvents が空の場合は空のベクタを返す（変更検知の開始前状態）。
 static std::vector<EventChange> collectEventChanges(
@@ -3676,6 +3687,10 @@ static std::vector<EventChange> collectEventChanges(
         if (!e.id.empty()) oldMap[e.id] = &e;
     }
 
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    // 猶予を差し引いた開始済み判定の境界（これ以前の開始は「猶予を過ぎた開始済み」）
+    auto staleUtc = systemTimeToIso(shiftSystemTime(utcNow, -CHANGE_NOTIFY_GRACE_HNS)) + ".000Z";
     std::unordered_set<std::string> newIds;
     std::vector<EventChange> changes;
 
@@ -3684,22 +3699,28 @@ static std::vector<EventChange> collectEventChanges(
         newIds.insert(e.id);
         auto it = oldMap.find(e.id);
         if (it == oldMap.end()) {
+            // 猶予を過ぎた開始済み予定の新規出現（過ぎた時間帯への後追い登録・欠席取消等）は
+            // 通知しない。変更後が終日の予定は当日分が常に開始済み扱いになるため除外しない。
+            if (!e.allDay && e.datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::Added,
                                {}, e.datetime,
                                e.content, e.permalink});
         }
         else if (it->second->datetime != e.datetime) {
+            // 変更前後とも猶予を過ぎた開始済みの日時変更は通知しない。どちらかが未来か猶予内なら
+            // 今後の行動に関わるため通知する。変更後が終日の予定は除外しない。
+            // （開始済み予定の未来への後ろ倒しは「変更後が未来」に該当し通知される）
+            if (!e.allDay && it->second->datetime <= staleUtc && e.datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::TimeChanged,
                                it->second->datetime, e.datetime,
                                e.content, e.permalink});
         }
     }
 
-    auto nowUtc = getCurrentUtcISO();
     for (const auto& [id, old] : oldMap) {
         if (newIds.find(id) == newIds.end()) {
-            // 開始済みイベントの消失（過去予定の削除等）は通知価値がないためスキップ
-            if (old->datetime <= nowUtc) continue;
+            // 猶予を過ぎた開始済みイベントの消失（過去予定の削除等）は通知価値がないためスキップ
+            if (old->datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::Cancelled,
                                old->datetime, {},
                                old->content, old->permalink});
@@ -3882,13 +3903,9 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
-                if (diffMs <= 0) {
-                    // 開始済みイベント：全通知タイミングを通知済みとしてマーク
-                    notifiedSet.insert(notifyKey(e, leadMs));
-                    for (int m : e.reminderMinutes)
-                        notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
-                    continue;
-                }
+                // 開始済みイベントは通知対象外。（発火経路はすべて開始前の予定のみを扱うため、
+                // 通知済みマークの先回り登録も不要）
+                if (diffMs <= 0) continue;
                 // 通知抑制中のイベントは minFireMs 計算から除外する
                 if (mutedKeys.count(eventKey(e))) continue;
                 // notify_minutes（ベースライン）+ reminders のすべてのタイミングをチェック
@@ -4010,7 +4027,7 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
     // description は focusTime イベントがタスク由来か集中タイムかの判別に使う。
     // （parseCalendarEvents 参照。tasks.google.com/task/ の URL 有無で判定）
     // maxResults は 250（API のデフォルト値）とする。取得窓が当日 0 時起点になり過去予定も
-    // 枠を消費するため、既定の 50 のままでは以降の予定が押し出されて通知が漏れる
+    // 枠を消費するため、従来の 50 のままでは以降の予定が押し出されて通知が漏れる
     std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=250";
     queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders,description)";
     queryParams += L"&timeMin=" + toWide(urlEncode(startUtc));
