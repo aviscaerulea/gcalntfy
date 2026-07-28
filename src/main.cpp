@@ -206,7 +206,8 @@ static std::atomic<bool> g_popupShowing{false};
 static std::atomic<bool> g_forcePoll{false};
 
 // トレイメニュー「今すぐ更新」による即時ポーリング要求フラグ
-// ユーザの明示操作のため g_forcePoll と異なりクールダウンを適用せず即時に取得する
+// ユーザの明示操作のため g_forcePoll と異なりクールダウンを適用せず即時に取得する。
+// 要求を消費したポーリングは、完了時点が分かるよう成否を Toast で応答する
 static std::atomic<bool> g_pollNowRequested{false};
 
 // 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
@@ -2636,24 +2637,36 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
     dispatchToastXml(std::move(xml), permalink);
 }
 
-// エラー Toast 表示（クールダウン制御付き）
+// 例外を吸収する 2 行 Toast 表示
 //
-// 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
-// showToast の第 1 引数（時刻欄）にエラー種別を流用して表示する。
-static void showErrorToast(const std::wstring& title, const std::wstring& body)
+// バックグラウンドスレッドからの通知用。WinRT 例外がスレッド関数を脱出すると
+// ポーリングループの中断や std::terminate を招くため、ここで捕捉してログに残す。
+// showToast の第 1 引数（時刻欄）に見出しを流用し、ボタンは付けない。
+static void showToastSafe(const std::wstring& title, const std::wstring& body)
 {
-    ULONGLONG now = GetTickCount64();
-    if (now - g_lastErrorToastTime.load() < ERROR_TOAST_COOLDOWN_MS) return;
-    g_lastErrorToastTime.store(now);
     try {
         showToast(title, body, L"");
     }
     catch (winrt::hresult_error const& e) {
-        writeLog("showErrorToast failed: " + winrt::to_string(e.message()));
+        writeLog("showToastSafe failed: " + winrt::to_string(e.message()));
     }
     catch (...) {
-        writeLog("showErrorToast failed: unknown exception");
+        writeLog("showToastSafe failed: unknown exception");
     }
+}
+
+// エラー Toast 表示（クールダウン制御付き）
+//
+// 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
+// force=true は抑制を無視して必ず表示する。（ユーザ操作への応答など、沈黙すると
+// 操作の結果が分からなくなる用途に限って使う）
+// 抑制の起点は表示した時刻で更新する。（force での表示も起点になる）
+static void showErrorToast(const std::wstring& title, const std::wstring& body, bool force = false)
+{
+    ULONGLONG now = GetTickCount64();
+    if (!force && now - g_lastErrorToastTime.load() < ERROR_TOAST_COOLDOWN_MS) return;
+    g_lastErrorToastTime.store(now);
+    showToastSafe(title, body);
 }
 
 // 認証必要 Toast を表示する
@@ -2911,6 +2924,31 @@ static void clearTrayTooltip(HWND hWnd) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// 当日の以降予定件数を数える
+//
+// 現在の JST 時刻以降に開始する当日イベントを数える。終日予定は JST 00:00 開始へ
+// 正規化されるため、当日分は常に対象外になる。
+// ツールチップと「今すぐ更新」の完了通知で同じ意味の件数を示すために共用する。
+static int countUpcomingTodayEvents(const std::vector<CalendarEvent>& events) {
+    SYSTEMTIME utcNow;
+    GetSystemTime(&utcNow);
+    std::string nowJst = systemTimeToIso(utcToJst(utcNow));
+    std::string today  = nowJst.substr(0, 10);
+    int count = 0;
+    for (const auto& ev : events) {
+        auto jst = utcIsoToJst(ev.datetime);
+        if (jst.substr(0, 10) == today && jst >= nowJst) ++count;
+    }
+    return count;
+}
+
+// 当日の以降予定件数の表示文言を組み立てる
+// 0 件は NO_UPCOMING_EVENTS の文言に落とす。（ツールチップと完了通知で表記を揃える）
+static std::wstring upcomingCountText(int count) {
+    if (count <= 0) return NO_UPCOMING_EVENTS;
+    return L"本日の以降予定：" + std::to_wstring(count) + L" 件";
+}
+
 // トレイアイコンのツールチップを更新する
 // 現在JST時刻以降の当日イベント件数を「本日の以降予定：N 件」として表示する。
 // ポップアップメニュー表示中は更新しない
@@ -2935,22 +2973,10 @@ static void updateTrayTooltip(HWND hWnd) {
         std::lock_guard<std::mutex> lk(g_mtx);
         events = g_pendingEvents;
     }
-    SYSTEMTIME utcNow;
-    GetSystemTime(&utcNow);
-    auto jstNow = utcToJst(utcNow);
-    std::string nowJst = systemTimeToIso(jstNow);
-    std::string today  = nowJst.substr(0, 10);
-    int count = 0;
-    for (const auto& ev : events) {
-        auto jst = utcIsoToJst(ev.datetime);
-        if (jst.substr(0, 10) == today && jst >= nowJst) ++count;
-    }
+    int count = countUpcomingTodayEvents(events);
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
-    if (count > 0)
-        swprintf_s(nid.szTip, _countof(nid.szTip), L"本日の以降予定：%d 件", count);
-    else
-        wcscpy_s(nid.szTip, NO_UPCOMING_EVENTS);
+    wcscpy_s(nid.szTip, upcomingCountText(count).c_str());
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     updateTrayIcon(hWnd, count > 0);
     g_tooltipUpdating = false;
@@ -3191,7 +3217,7 @@ static void checkForUpdates() {
 
 // 更新通知メニュー項目のサイズを計算する
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    std::wstring prefix = std::wstring(L"Gcalntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"gcalntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -3217,7 +3243,7 @@ static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 // 更新通知メニュー項目を描画する
 // プレフィックス部分を通常色、新バージョン部分を赤色で描く
 static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
-    std::wstring prefix = std::wstring(L"Gcalntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"gcalntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -3267,7 +3293,7 @@ static void showTrayContextMenu(HWND hWnd) {
         return;
     }
     if (g_updateAvailable.load()) {
-        // 新版あり：オーナードローで "Gcalntfy vX.Y.Z → vNew" を赤文字で表示する
+        // 新版あり：オーナードローで "gcalntfy vX.Y.Z → vNew" を赤文字で表示する
         MENUITEMINFOW mii = { sizeof(mii) };
         mii.fMask = MIIM_FTYPE | MIIM_ID;
         mii.fType = MFT_OWNERDRAW;
@@ -3275,7 +3301,7 @@ static void showTrayContextMenu(HWND hWnd) {
         InsertMenuItemW(hMenu, 0, TRUE, &mii);
     }
     else {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Gcalntfy v" APP_VERSION);
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"gcalntfy v" APP_VERSION);
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -4194,6 +4220,18 @@ static void deliverPollResults(
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
 
+// 「今すぐ更新」への失敗応答を返す
+//
+// pending が false なら何もしない。true なら失敗理由を 1 枚の Toast で伝えて応答済みにする。
+// ユーザ操作への応答は沈黙させられないため、エラー Toast のクールダウン抑制を無視する。
+// 戻り値：応答を表示したか。（true なら呼び出し元は同内容の汎用エラー通知を省く）
+static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
+    if (!pending) return false;
+    pending = false;
+    showErrorToast(L"更新できませんでした", reason, true);
+    return true;
+}
+
 // ポーリングスレッド本体
 //
 // メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
@@ -4219,6 +4257,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
     int  partialFailureStreak = 0;    // 部分失敗の連続回数（全カレンダー成功でリセット）
 
+    // 「今すぐ更新」の応答（完了・失敗の Toast）が未送信か
+    // 要求を消費した回のポーリングは、成功・失敗のいずれかで必ず 1 枚応答して false に戻す。
+    // 打ち切り経路が既に出す通知（認証要求など）は抑制されうるため、応答の代わりにはしない
+    bool pollNowPending = false;
+
     while (!g_shutdownRequested) {
         try {
             // 対話的認証フロー実行中はトークン操作を一切行わない。
@@ -4235,6 +4278,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 即時ポーリング判定（forcePoll・pollNow フラグ or 1 時間以上未ポーリング）
             // pollNow（トレイメニュー「今すぐ更新」）はユーザの明示操作のためクールダウンを適用しない
             bool pollNow        = g_pollNowRequested.exchange(false);
+            if (pollNow) pollNowPending = true;
             bool forceTriggered = g_forcePoll.exchange(false) || deferredForce || pollNow;
             deferredForce       = false;
             ULONGLONG tickNow   = GetTickCount64();
@@ -4280,11 +4324,17 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 if (rr == RefreshResult::NetworkError) {
                     // ネットワーク不通は接続エラー扱い。認証 Toast は出さない。
                     // 後段の Calendar API 呼び出しでも失敗するため、そちらの「接続エラー」Toast に任せる。
+                    // ただし「今すぐ更新」の応答待ちはここで打ち切られ後段に届かないため、個別に応答する
+                    answerPollNowFailure(pollNowPending, L"ネットワークに接続できません");
                     waitInterruptible(RETRY_WAIT_MS);
                     continue;
                 }
                 if (rr == RefreshResult::AuthRequired) {
                     notifyAuthRequired();  // Toast 表示（クールダウンつき）。ブラウザは開かない。
+                    // 認証要求 Toast はクールダウンや認証フロー実行中で抑制されうるため、
+                    // 「今すぐ更新」への応答はこれに委ねず別に返す。
+                    // 2 枚並ぶのはトークン失効の直後に手動更新した場合に限られる
+                    answerPollNowFailure(pollNowPending, L"Google 認証が必要です");
                     waitInterruptible(RETRY_WAIT_MS);
                     continue;
                 }
@@ -4309,13 +4359,19 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             if (authFailed) {
                 // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
+                // 認証 Toast は抑制されうるため、「今すぐ更新」への応答は別に返す
+                answerPollNowFailure(pollNowPending, L"Google 認証が必要です");
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
 
             if (!anySuccess) {
                 writeLog("HTTP request failed");
-                showErrorToast(L"接続エラー", L"Google Calendar API に接続できません");
+                const wchar_t* reason = L"Google Calendar API に接続できません";
+                // 手動更新への応答が済んだ場合、同内容の接続エラー Toast は重ねない
+                if (!answerPollNowFailure(pollNowPending, reason)) {
+                    showErrorToast(L"接続エラー", reason);
+                }
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
@@ -4325,11 +4381,17 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 誤キャンセル通知・キャッシュ劣化・一覧からの一時消失として現れるため
             // ただし失敗が閾値を超えて続く場合は恒常的な原因（カレンダー削除・設定誤り等）の
             // 可能性が高く、更新停止が沈黙したまま固定化しないよう Toast で警告する。
+            // 手動更新は 1 回目の失敗でも応答を返す。（更新されなかった事実が閾値まで伝わらないため）
+            // 応答済みなら閾値超過の警告は省き、代わりに応答の文言で恒常障害を伝える。
             if (!allSuccess) {
                 partialFailureStreak++;
                 writeLog("poll: partial calendar failure, keeping previous state (streak "
                     + std::to_string(partialFailureStreak) + ")");
-                if (partialFailureStreak >= PARTIAL_FAILURE_TOAST_THRESHOLD) {
+                bool streakExceeded = partialFailureStreak >= PARTIAL_FAILURE_TOAST_THRESHOLD;
+                bool answered = answerPollNowFailure(pollNowPending, streakExceeded
+                    ? L"一部カレンダーの取得に失敗し続けているため、予定を更新できません"
+                    : L"一部のカレンダーを取得できなかったため、前回の予定を維持しています");
+                if (!answered && streakExceeded) {
                     showErrorToast(L"カレンダー取得エラー",
                         L"一部カレンダーの取得に失敗し続けているため、予定の更新を停止しています");
                 }
@@ -4350,6 +4412,12 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // ポーリング結果を通知スレッドへ渡す
             deliverPollResults(exeDir, events, jstNow, baselineEstablished);
 
+            // 「今すぐ更新」への完了応答（再取得が終わった時点と反映結果を伝える）
+            if (pollNowPending) {
+                pollNowPending = false;
+                showToastSafe(L"更新完了", upcomingCountText(countUpcomingTodayEvents(events)));
+            }
+
             firstPoll           = false;
             baselineEstablished = true;
             g_lastPollTick.store(GetTickCount64());
@@ -4357,6 +4425,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
         }
         catch (...) {
             writeLog("unexpected error in polling loop");
+            answerPollNowFailure(pollNowPending, L"予期しないエラーが発生しました");
             waitInterruptible(RETRY_WAIT_MS);
         }
     }
