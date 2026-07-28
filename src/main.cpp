@@ -108,6 +108,7 @@ static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリ
 static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定の即時再取得（今すぐ更新）
+static constexpr UINT IDM_SHOW_PAST           = 40012; // 予定一覧の過去予定表示トグル
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
@@ -187,6 +188,9 @@ static std::atomic<bool> g_soundEnabled{true};
 // マイク/カメラ使用中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{true};
 
+// 予定一覧に当日の過去予定を表示するかのフラグ（レジストリで永続化、トレイメニューでトグル）
+static std::atomic<bool> g_showPastEvents{true};
+
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
@@ -246,6 +250,7 @@ struct CalendarEvent {
     std::string      content;
     std::string      permalink;
     std::vector<int> reminderMinutes; // イベント個別の追加通知分数（popup のみ。空=追加通知なし）
+    bool             allDay = false;  // 終日予定（開始が日付のみ）。予定一覧の表示対象から除外する
 };
 
 // parseCalendarEvents の戻り値
@@ -1307,14 +1312,17 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             e.id = winrt::to_string(ev.GetNamedString(L"id", L""));
 
             // 開始日時の UTC 正規化（dateTime または date）
+            // date のみの予定は終日予定として JST 00:00 に正規化されるため allDay フラグで区別する
             if (ev.HasKey(L"start")) {
                 auto startObj = ev.GetNamedObject(L"start");
                 if (startObj.HasKey(L"dateTime"))
                     e.datetime = normalizeToUtcIso(
                         winrt::to_string(startObj.GetNamedString(L"dateTime", L"")));
-                else if (startObj.HasKey(L"date"))
+                else if (startObj.HasKey(L"date")) {
                     e.datetime = normalizeToUtcIso(
                         winrt::to_string(startObj.GetNamedString(L"date", L"")));
+                    e.allDay = true;
+                }
             }
 
             e.content   = winrt::to_string(ev.GetNamedString(L"summary",  L""));
@@ -1411,6 +1419,7 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
             JsonArray remArr;
             for (int m : e.reminderMinutes) remArr.Append(JsonValue::CreateNumberValue(m));
             obj.Insert(L"reminderMinutes", remArr);
+            obj.Insert(L"allDay", JsonValue::CreateBooleanValue(e.allDay));
             arr.Append(obj);
         }
         auto json = winrt::to_string(arr.Stringify());
@@ -1423,7 +1432,8 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
 
 // イベントキャッシュの読み込み
 // 起動時に呼び出し、キャッシュファイルからイベントリストを復元する。
-// 全イベントの datetime が現在 UTC 時刻より前の場合は空ベクタを返す（古いデータの破棄）。
+// 全イベントが JST 当日より前の日付なら空ベクタを返し、前日以前の古いデータを破棄する。
+// 当日の開始済み予定は予定一覧のグレー表示に使うため破棄しない。
 // ファイル未存在・パースエラー時も空ベクタを返す。
 static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
@@ -1474,15 +1484,19 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
                 for (auto mv : obj.GetNamedArray(L"reminderMinutes"))
                     e.reminderMinutes.push_back(static_cast<int>(mv.GetNumber()));
             }
+            // allDay の復元（旧キャッシュ互換：キーなし → false）
+            e.allDay = obj.GetNamedBoolean(L"allDay", false);
             if (!e.datetime.empty() && !e.content.empty()) events.push_back(std::move(e));
         }
 
-        // 全イベントが過去なら破棄（ISO 8601 UTC 文字列の辞書順で比較可能）
-        auto nowUtc = getCurrentUtcISO();
-        bool allPast = !events.empty() && std::all_of(events.begin(), events.end(),
-            [&](const CalendarEvent& e) { return e.datetime <= nowUtc; });
-        if (allPast) {
-            writeLog("cache: all events are past, discarding");
+        // 全イベントが JST 当日より前の日付なら破棄（当日の開始済み予定は一覧表示に使うため保持）
+        SYSTEMTIME utcNow;
+        GetSystemTime(&utcNow);
+        std::string today = systemTimeToIso(utcToJst(utcNow)).substr(0, 10);
+        bool allStale = !events.empty() && std::all_of(events.begin(), events.end(),
+            [&](const CalendarEvent& e) { return utcIsoToJst(e.datetime).substr(0, 10) < today; });
+        if (allStale) {
+            writeLog("cache: all events are before today, discarding");
             return {};
         }
 
@@ -1816,6 +1830,7 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
+static constexpr const wchar_t* REG_SHOW_PAST_EVENTS  = L"ShowPastEvents";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2945,9 +2960,10 @@ static void removeTrayIcon(HWND hWnd) {
 }
 
 
-// イベントの通知済み判定キーを生成する
+// イベントの同定キーを生成する
 // Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
-// id ベースにすることで、ユーザがイベントタイトルを編集しても重複通知を防止できる。
+// 通知抑制リストのキーとして使うほか、通知済み判定キー（notifyBaseKey が開始日時を連結して
+// 生成する）の構成要素になる。id ベースのため、タイトル編集や日時変更でキーは変わらない。
 static inline std::string eventKey(const CalendarEvent& e) {
     return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
@@ -2967,6 +2983,7 @@ struct ScheduleItem {
     std::string  date;   // JST YYYY-MM-DD：抑制リスト保存用
     std::wstring label;  // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
     bool         muted;  // 抑制中フラグ（右クリックトグル時にもその場で更新する）
+    bool         past;   // 開始時刻を過ぎた予定（グレー表示。クリック遷移と抑制トグルは通常どおり）
 };
 static std::vector<ScheduleItem> g_scheduleItems;
 
@@ -2987,7 +3004,9 @@ static void forceForeground(HWND hWnd) {
 }
 
 // 左クリック時の予定一覧ポップアップ表示
-// g_pendingEvents から現在時刻以降の当日（JST）イベントを抽出してメニューに表示する。
+// g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出してメニューに表示する。
+// 過去分はグレー表示で残し、当日の過去予定への導線とする。（トレイメニューの過去予定表示設定が OFF なら除外）
+// 終日予定は表示しない。
 // 左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
 static void showSchedulePopup(HWND hWnd) {
     std::vector<CalendarEvent> events;
@@ -3005,16 +3024,24 @@ static void showSchedulePopup(HWND hWnd) {
     std::string today  = nowJst.substr(0, 10);
 
     std::vector<ScheduleItem> todayEvents;
+    size_t upcomingCount = 0;
+    const bool showPast = g_showPastEvents.load();
     for (const auto& ev : events) {
+        // 終日予定は JST 00:00 開始に正規化されており「過ぎた予定」として常時グレー表示に
+        // なってしまうため、従来どおり一覧に出さない
+        if (ev.allDay) continue;
         auto jst = utcIsoToJst(ev.datetime);
         if (jst.substr(0, 10) != today) continue;
-        if (jst < nowJst) continue;
+        bool past = jst < nowJst;
+        // 過去予定の表示はトレイメニューのトグル設定に従う。（OFF なら除外して従来表示に戻す）
+        if (past && !showPast) continue;
+        if (!past) ++upcomingCount;
         auto key   = eventKey(ev);
         auto date  = jst.substr(0, 10);
         bool muted = mutedSnapshot.count(key) != 0;
         // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィックス不要）
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
-        todayEvents.push_back({toWide(ev.permalink), key, date, label, muted});
+        todayEvents.push_back({toWide(ev.permalink), key, date, label, muted, past});
     }
 
     g_scheduleItems.clear();
@@ -3027,9 +3054,16 @@ static void showSchedulePopup(HWND hWnd) {
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, NO_UPCOMING_EVENTS);
     }
     else {
+        // 表示上限の超過時は古い過去予定から省き、以降の予定を優先して残す。
+        // （todayEvents は開始時刻昇順のため、過去分は先頭に連続して並ぶ）
+        constexpr size_t cap = IDM_EVENT_MAX - IDM_EVENT_BASE;
+        size_t begin = 0;
+        if (todayEvents.size() > cap)
+            begin = (std::min)(todayEvents.size() - upcomingCount, todayEvents.size() - cap);
         UINT idx = 0;
-        for (const auto& te : todayEvents) {
-            if (idx >= (IDM_EVENT_MAX - IDM_EVENT_BASE)) break;
+        for (size_t i = begin; i < todayEvents.size(); ++i) {
+            const auto& te = todayEvents[i];
+            if (idx >= cap) break;
             // MFT_OWNERDRAW で WM_MEASUREITEM / WM_DRAWITEM に描画を委譲する。
             // dwItemData にインデックスを渡し、描画時に g_scheduleItems から参照する。
             MENUITEMINFOW mii = { sizeof(mii) };
@@ -3042,7 +3076,8 @@ static void showSchedulePopup(HWND hWnd) {
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"本日の以降予定：" + std::to_wstring(g_scheduleItems.size())
+        // 件数は今後の予定のみを数える（ツールチップの「本日の以降予定」と同じ意味を維持）
+        std::wstring footer = L"本日の以降予定：" + std::to_wstring(upcomingCount)
                 + (todayEvents.size() > g_scheduleItems.size() ? L" 件（超過分省略）" : L" 件")
                 + L"（右クリックで通知抑制）";
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, footer.c_str());
@@ -3257,6 +3292,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
         IDM_STARTUP, L"スタートアップ登録");
 
+    // 予定一覧の過去予定表示トグル（レジストリ永続化）
+    AppendMenuW(hMenu, MF_STRING | (g_showPastEvents ? MF_CHECKED : MF_UNCHECKED),
+        IDM_SHOW_PAST, L"過去の予定を表示");
+
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
@@ -3346,6 +3385,11 @@ static void handleTrayCommand(UINT id) {
         else                       registerStartup();
         return;
     }
+    if (id == IDM_SHOW_PAST) {
+        g_showPastEvents.store(!g_showPastEvents.load());
+        writeRegDword(REG_SHOW_PAST_EVENTS, g_showPastEvents.load() ? 1u : 0u);
+        return;
+    }
     if (id == IDM_POLL_NOW) {
         // 非活性化と同条件の再確認（メニュー表示中に認証状態が変わった場合の保険）
         if (g_authRequired.load() || g_authInProgress.load()) return;
@@ -3403,8 +3447,9 @@ static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 }
 
 // 左クリックポップアップの owner-draw 項目描画
-// ODS_SELECTED に応じた背景色・テキスト色を切り替え、muted フラグが立つ項目には
-// DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// ODS_SELECTED に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は非選択時に
+// グレー文字で描画する。muted フラグが立つ項目には DrawTextW 後に 2 px の取消線を
+// 手動で重ね描画する。（取消線の色は文字色に追従する）
 static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
     if (dis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(dis->itemData);
@@ -3419,7 +3464,24 @@ static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
     RECT textRect  = dis->rcItem;
     textRect.left += 16;
     SetBkMode(dis->hDC, TRANSPARENT);
-    COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+    // 過去予定は非選択時のみグレー化する。（選択中はハイライト背景での視認性を優先）
+    // グレーは COLOR_GRAYTEXT のままでは濃いため、メニュー背景色を 1/3 混ぜて一段薄くする。
+    // 固定 RGB でなくシステム配色から導出するので、ハイコントラスト等の配色変更にも追従する。
+    // （GetSysColor はライト・ダークモード切替には追従せず、常にライト系の値を返す）
+    COLORREF textColor;
+    if (selected) {
+        textColor = GetSysColor(COLOR_HIGHLIGHTTEXT);
+    }
+    else if (item.past) {
+        COLORREF fg = GetSysColor(COLOR_GRAYTEXT);
+        COLORREF bg = GetSysColor(COLOR_MENU);
+        textColor = RGB((GetRValue(fg) * 2 + GetRValue(bg)) / 3,
+                        (GetGValue(fg) * 2 + GetGValue(bg)) / 3,
+                        (GetBValue(fg) * 2 + GetBValue(bg)) / 3);
+    }
+    else {
+        textColor = GetSysColor(COLOR_MENUTEXT);
+    }
     SetTextColor(dis->hDC, textColor);
     HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
     DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
@@ -3636,7 +3698,7 @@ static std::vector<EventChange> collectEventChanges(
     auto nowUtc = getCurrentUtcISO();
     for (const auto& [id, old] : oldMap) {
         if (newIds.find(id) == newIds.end()) {
-            // 開始済みのイベントはポーリングウィンドウから自然消失しただけなのでスキップ
+            // 開始済みイベントの消失（過去予定の削除等）は通知価値がないためスキップ
             if (old->datetime <= nowUtc) continue;
             changes.push_back({EventChangeType::Cancelled,
                                old->datetime, {},
@@ -3678,24 +3740,33 @@ static void notifyEventChanges(const std::vector<EventChange>& changes)
 
 // ==================== 通知スレッド ====================
 
+// 通知済みセットのベースキー（"eventKey|開始日時"）を生成する
+// 開始日時を含めるのは、予定の日時変更でキーを変えて通知済み記録を無効化し、変更後の
+// 時刻で直前通知を発火させるため。取得窓が当日 0 時起点になり、終了済み予定も当日中は
+// リストに残り続ける。このためリスト消失による記録の自然失効は期待できない。
+static inline std::string notifyBaseKey(const CalendarEvent& e) {
+    return eventKey(e) + "|" + e.datetime;
+}
+
 // 通知済みセット用キーを生成する
-// leadMsVal はミリ秒単位。eventKey に "@分数" サフィックスを付けた形式で返す
+// leadMsVal はミリ秒単位。notifyBaseKey に "@分数" サフィックスを付けた形式で返す
 static inline std::string notifyKey(const CalendarEvent& e, long long leadMsVal) {
-    return eventKey(e) + "@" + std::to_string(leadMsVal / 60000);
+    return notifyBaseKey(e) + "@" + std::to_string(leadMsVal / 60000);
 }
 
 // notifiedSet の自然失効：新リストに含まれないキーを削除する
 //
-// notifiedSet のキーは "eventKey@minutes" 形式。
-// イベントが削除・変更されたとき、対応するすべての "@minutes" エントリを失効させる。
+// notifiedSet のキーは "eventKey|開始日時@minutes" 形式。（notifyKey 参照）
+// イベントが削除・日時変更されたとき、対応するすべての "@minutes" エントリを失効させる。
 static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
                              const std::vector<CalendarEvent>& events)
 {
     std::set<std::string> validBaseKeys;
-    for (const auto& e : events) validBaseKeys.insert(eventKey(e));
+    for (const auto& e : events) validBaseKeys.insert(notifyBaseKey(e));
 
     for (auto it = notifiedSet.begin(); it != notifiedSet.end(); ) {
-        // "@minutes" サフィックスを除いたベースキーで照合する
+        // "@minutes" サフィックスを除いたベースキーで照合する。ベースキー側にはカレンダー ID や
+        // タイトル由来の '@' が混入しうるが、サフィックスが必ず末尾に付くため rfind で境界を誤らない
         auto sep = it->rfind('@');
         auto base = (sep != std::string::npos) ? it->substr(0, sep) : *it;
         it = validBaseKeys.count(base) ? std::next(it) : notifiedSet.erase(it);
@@ -3768,7 +3839,8 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
 // 設定されていれば、そのタイミングでも追加通知する（重複分数は 1 回のみ通知）。
-// notifiedSet のキーは "eventKey@minutes" 形式で、同一イベントの異なるタイミングを区別する。
+// notifiedSet のキーは "eventKey|開始日時@minutes" 形式で、同一イベントの異なるタイミングを
+// 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
 // 全イベント × 全通知分数を走査して最小発火時間を求めてから wait_until で待機する。
 static void notifyThreadFunc(const std::wstring& exeDir) {
     // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する
@@ -3806,7 +3878,7 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             long long leadMs = localConfig.notifyLeadMs;
 
             // 全イベント × 全通知分数を走査して最小発火待機時間を計算
-            // notifiedSet キーは "eventKey@minutes" 形式
+            // notifiedSet キーは "eventKey|開始日時@minutes" 形式
             long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
@@ -3923,21 +3995,25 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 
 // Calendar API クエリパラメータの構築
 //
-// timeMin に現在時刻、timeMax に「JST 翌日 23:59:59」を設定して
-// 当日と翌日の予定をまとめて取得するためのクエリ文字列を返す。
+// timeMin に「JST 当日 00:00」、timeMax に「JST 翌日 23:59:59」を設定して
+// 当日（開始済みの過去分を含む）と翌日の予定をまとめて取得するためのクエリ文字列を返す。
+// 当日 0 時起点にするのは、開始時刻を過ぎた当日予定を予定一覧にグレー表示で残すため。
+// API の timeMin はイベント終了時刻に対する下限のため、前日までに終了した予定は取得されない。
 static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
-    auto nowUtc = systemTimeToIso(utcNow) + ".000Z";
     SYSTEMTIME jstMidnight = utcToJst(utcNow);
     jstMidnight.wHour = jstMidnight.wMinute = jstMidnight.wSecond = jstMidnight.wMilliseconds = 0;
+    auto startUtc = systemTimeToIso(jstToUtc(jstMidnight)) + ".000Z";
     auto tomorrowEndJst = shiftSystemTime(jstMidnight, 2LL * 24 * 60 * 60 * 10'000'000LL - 10'000'000LL);
     auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
     auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
 
     // description は focusTime イベントがタスク由来か集中タイムかの判別に使う。
     // （parseCalendarEvents 参照。tasks.google.com/task/ の URL 有無で判定）
-    std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=50";
+    // maxResults は 250（API のデフォルト値）とする。取得窓が当日 0 時起点になり過去予定も
+    // 枠を消費するため、既定の 50 のままでは以降の予定が押し出されて通知が漏れる
+    std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=250";
     queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders,description)";
-    queryParams += L"&timeMin=" + toWide(urlEncode(nowUtc));
+    queryParams += L"&timeMin=" + toWide(urlEncode(startUtc));
     queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
     return queryParams;
 }
@@ -4076,9 +4152,9 @@ static void deliverPollResults(
     }
     g_cv.notify_one();
 
-    // 変更検知の突合は取得全件（当日＋翌日）で行う
+    // 変更検知の突合は取得全件（当日の開始済み分を含む当日＋翌日）で行う
     // 当日分に絞ってから突合すると、当日↔翌日の予定移動が偽のキャンセル・追加として誤検出される。
-    // 取得窓の上限（翌日末）は日内で固定であり、日付変更時はベースラインリセットで誤検知を防ぐ。
+    // 取得窓（JST 当日 0 時〜翌日末）は日内で固定であり、日付変更時はベースラインリセットで誤検知を防ぐ。
     std::vector<EventChange> changes;
     if (baselineEstablished) {
         changes = collectEventChanges(prevEvents, events);
@@ -4341,8 +4417,9 @@ int wmain() {
         addTrayIcon(g_hWnd);
 
         // レジストリから設定を復元（キー未作成時はデフォルト値）
-        g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
-        g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_soundEnabled   = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
+        g_muteInMeeting  = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_showPastEvents = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
