@@ -3034,6 +3034,41 @@ static void forceForeground(HWND hWnd) {
     SetForegroundWindow(hWnd);
 }
 
+// トレイポップアップの表示位置とアライメントを算出する
+//
+// タスクバーが配置された辺（下・上・左・右）にポップアップを密着させて表示する。
+// タスクバーに沿った軸（水平タスクバーなら X、垂直なら Y）はカーソル位置を起点とし、
+// 画面端超過は TrackPopupMenu の自動反転に任せる。
+// SHAppBarMessage 失敗時や uEdge が想定外なら現状挙動（カーソル位置＋左上アライメント）
+// に戻し、必ずポップアップが出るようにする。
+struct TrayPopupPos {
+    int  x;
+    int  y;
+    UINT alignFlags;  // TPM_ アライメントのみ。ボタン系（TPM_LEFTBUTTON 等）は呼び出し側で OR する
+};
+static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
+    APPBARDATA abd = { sizeof(abd) };
+    if (!SHAppBarMessage(ABM_GETTASKBARPOS, &abd)) {
+        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN };
+    }
+    switch (abd.uEdge) {
+    case ABE_BOTTOM:
+        // 底辺をタスクバー上端に密着、カーソル X から右方向に展開
+        return { cursor.x, abd.rc.top,    TPM_LEFTALIGN  | TPM_BOTTOMALIGN };
+    case ABE_TOP:
+        // 上辺をタスクバー下端に密着、カーソル X から右方向に展開
+        return { cursor.x, abd.rc.bottom, TPM_LEFTALIGN  | TPM_TOPALIGN };
+    case ABE_LEFT:
+        // 左辺をタスクバー右端に密着、カーソル Y から下方向に展開
+        return { abd.rc.right, cursor.y, TPM_LEFTALIGN  | TPM_TOPALIGN };
+    case ABE_RIGHT:
+        // 右辺をタスクバー左端に密着、カーソル Y から下方向に展開
+        return { abd.rc.left,  cursor.y, TPM_RIGHTALIGN | TPM_TOPALIGN };
+    default:
+        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN };
+    }
+}
+
 // 左クリック時の予定一覧ポップアップ表示
 // g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出してメニューに表示する。
 // 過去分はグレー表示で残し、当日の過去予定への導線とする。（トレイメニューの過去予定表示設定が OFF なら除外）
@@ -3119,7 +3154,8 @@ static void showSchedulePopup(HWND hWnd) {
     forceForeground(hWnd);
     // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
     // を発火してしまい、抑制トグル用の WM_MENURBUTTONUP が届かなくなる）
-    TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+    auto pos = computeTrayPopupPos(pt);
+    TrackPopupMenu(hMenu, TPM_LEFTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
     DestroyMenu(hMenu);
 }
 
@@ -3333,7 +3369,8 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT,    L"終了");
     forceForeground(hWnd);
-    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+    auto pos = computeTrayPopupPos(pt);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
     DestroyMenu(hMenu);
     g_popupShowing.store(false);
     updateTrayTooltip(hWnd);
