@@ -13,25 +13,12 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 ## Features
 
-- Polls Google Calendar (including time-specified, non-recurring tasks) authenticated via OAuth 2.0, and notifies you before events start or when they change, via toast notification and sound
-- Per-time-slot polling frequency: set polling frequency (times/hour) for each of the 24 hours of the day with `schedule`
-- Immediate polling: polls right away on PC sleep resume, session unlock, or network reconnection
-- Refresh now: run an immediate poll at any time from the tray menu, with success or failure reported via toast notification (disabled while unauthenticated or authenticating)
-- Notification sound: place `sound.wav` (16-bit PCM WAV) next to the executable to play a chime on notification
-- BLE headphone support: automatically inserts an inaudible 19kHz tone to prevent the beginning of the sound from being cut off due to connection delay
-- Ducking: mutes processes listed in `duck_targets` while the notification sound plays, then restores them afterward
-- Single-instance enforcement: automatically terminates the previous process when a new one starts
-- Startup registration: toggle Windows startup registration (HKCU Run key) from the tray menu
-- Configuration override: if `gcalntfy.local.toml` exists, its keys take priority (changes take effect after restarting the app)
+- Event notifications: polls Google Calendar and notifies you before events start or when they change, via toast notification and sound
+- Per-time-slot polling frequency: set the polling frequency for each time slot of the day
+- Ducking: mutes the processes you specify while the notification sound plays, then restores them afterward
 - System tray: check the event list and access various settings from the tray icon
-- Past events shown in gray: today's past events remain in the event list in gray and can be clicked to open the event page
-- Toggle past event display: turn the display of past events on or off from the tray menu
-- Persistent sound settings: the notification sound setting and "Disable while mic/camera in use" setting persist after restart
-- Cache restore on startup: caches the most recent polling result in `events.json` so event data from the last successful poll is shown even if the network is unavailable right after startup
-- Change detection notifications: detects date/time changes, cancellations, and new events, and reports them via toast notification
-- Multiple calendar support: specify additional calendar IDs with `ext_calendar_ids` to also poll external calendars
-- Support for per-event notification settings: also notifies at the popup timing configured in an event's own reminders (`notify_minutes` is always notified as the baseline)
-- Update notification: checks the latest GitHub release on startup and notifies you via toast notification and a version line in the tray menu if a new version is available (duplicate notifications for the same version are suppressed via the registry)
+- Past event display: today's past events remain in the event list in gray, and the display can be toggled on or off from the tray menu
+- Multiple calendar support: external calendars can also be polled
 
 ### System tray
 
@@ -119,7 +106,9 @@ On first launch, since there is no access token yet, a toast notification opens 
 
 ## Configuration
 
-Place `gcalntfy.toml` (or `gcalntfy.local.toml`) in the same folder as the executable.
+Place `gcalntfy.toml` in the same folder as the executable. If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. (Changes take effect after restarting the app.)
+
+To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the same folder as the executable.
 
 ```toml
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
