@@ -40,10 +40,28 @@ $devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
-rc /nologo /fo out\resource.res src\resource.rc
-if ($LASTEXITCODE) { exit 1 }
-
+# バージョン定義ヘッダの生成
+# version.rc.h は resource.rc 用、version.h は main.cpp 用。前者を rc 実行前に置く必要がある。
+# $Version は "1.2.3-4-gabc1234-dirty" 等の形も取るため、数値版は先頭の major.minor.patch のみ採る。
+# 第 4 数値は 0 固定。major.minor.patch を先頭に持たない場合（タグ未取得時など）は 0,0,0,0。
+$verMatch = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')
+$verNum = if ($verMatch.Success) {
+    "$($verMatch.Groups[1].Value),$($verMatch.Groups[2].Value),$($verMatch.Groups[3].Value),0"
+}
+else {
+    "0,0,0,0"
+}
+@(
+    "#define APP_VERSION_NUM $verNum",
+    "#define APP_VERSION_STR `"$Version`""
+) | Set-Content -Path out\version.rc.h -Encoding ascii
 "#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
+
+# /c65001 は .rc を UTF-8 として解釈させる指定であり、コメントと文字列リテラルの双方に必須。
+# 無指定では CP932 で MBCS 走査するため、行末バイトがリードバイト範囲に当たると次行が消え、
+# VERSIONINFO の日本語文字列（FileDescription）も文字化けする。
+rc /nologo /c65001 /I out\ /fo out\resource.res src\resource.rc
+if ($LASTEXITCODE) { exit 1 }
 
 # .env から OAuth クレデンシャルを読み込んで oauth.h を生成
 $envFile = Join-Path $PSScriptRoot ".env"
