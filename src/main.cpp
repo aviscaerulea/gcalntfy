@@ -90,6 +90,9 @@ static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
 static constexpr int MIN_NOTIFY_MINUTES = 0;
 static constexpr int MAX_NOTIFY_MINUTES = 30;
 
+// 予定一覧の赤文字閾値（urgent_minutes）のデフォルト（分）。0 で機能無効
+static constexpr int DEFAULT_URGENT_MINUTES = 60;
+
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
@@ -269,6 +272,7 @@ struct Config {
     std::vector<int>          schedule;          // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
+    int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -324,6 +328,8 @@ static std::unordered_map<std::string, std::string> g_mutedEvents;
 
 // 左クリックポップアップの予定項目描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont = nullptr;
+// 次の予定の太字強調用フォント（initMenuFonts で初期化。プロセス常駐のため明示解放しない）
+static HFONT g_hMenuFontBold = nullptr;
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 // ダッキング操作（duck/unduck）はすべて soundThread 内で実行する。
@@ -1671,6 +1677,14 @@ static Config loadConfig(const std::wstring& exeDir) {
     notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
+    // urgent_minutes（予定一覧の赤文字閾値、分単位。デフォルト 60、0 で無効、負値は 0 にクランプ）
+    long long urgentMin = DEFAULT_URGENT_MINUTES;
+    if (local && (*local)["urgent_minutes"].is_integer())
+        urgentMin = **(*local)["urgent_minutes"].as_integer();
+    else if (base && (*base)["urgent_minutes"].is_integer())
+        urgentMin = **(*base)["urgent_minutes"].as_integer();
+    cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
+
     // [guard] / [loudness] セクション読み込みヘルパー
     auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
         if (local && (*local)[section][key].is_boolean()) return **(*local)[section][key].as_boolean();
@@ -3005,6 +3019,10 @@ static void initMenuFonts() {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_hMenuFont = CreateFontIndirectW(&ncm.lfMenuFont);
+    // 次の予定の強調用に、メニューフォントの太字版を作成する
+    LOGFONTW lfBold = ncm.lfMenuFont;
+    lfBold.lfWeight = FW_BOLD;
+    g_hMenuFontBold = CreateFontIndirectW(&lfBold);
 }
 
 // 左クリックポップアップの予定項目（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
@@ -3015,6 +3033,8 @@ struct ScheduleItem {
     std::wstring label;  // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
     bool         muted;  // 抑制中フラグ（右クリックトグル時にもその場で更新する）
     bool         past;   // 開始時刻を過ぎた予定（グレー表示。クリック遷移と抑制トグルは通常どおり）
+    bool         soon;   // 開始まで urgent_minutes 分未満の今後の予定（非選択時に赤文字で描画する）
+    bool         next;   // 今後の予定のうち最初の 1 件（太字で描画する）
 };
 static std::vector<ScheduleItem> g_scheduleItems;
 
@@ -3077,10 +3097,12 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
 static void showSchedulePopup(HWND hWnd) {
     std::vector<CalendarEvent> events;
     std::unordered_map<std::string, std::string> mutedSnapshot;
+    int urgentMinutes;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        events       = g_pendingEvents;
+        events        = g_pendingEvents;
         mutedSnapshot = g_mutedEvents;
+        urgentMinutes = g_currentConfig.urgentMinutes;
     }
 
     SYSTEMTIME utcNow;
@@ -3092,6 +3114,8 @@ static void showSchedulePopup(HWND hWnd) {
     std::vector<ScheduleItem> todayEvents;
     size_t upcomingCount = 0;
     const bool showPast = g_showPastEvents.load();
+    // 次の予定（最初の今後予定）の太字強調は 1 件のみに与える
+    bool nextAssigned = false;
     for (const auto& ev : events) {
         // 終日予定は JST 00:00 開始に正規化されており「過ぎた予定」として常時グレー表示に
         // なってしまうため、従来どおり一覧に出さない
@@ -3107,7 +3131,30 @@ static void showSchedulePopup(HWND hWnd) {
         bool muted = mutedSnapshot.count(key) != 0;
         // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィックス不要）
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
-        todayEvents.push_back({toWide(ev.permalink), key, date, label, muted, past});
+        // 今後の予定にはタイトル末尾へ開始までの残り時間「（n時間n分後）」を付ける。
+        // ポップアップを開くたびに現在時刻で再計算される。1 時間未満は「（n分後）」、
+        // ちょうど n 時間なら「（n時間後）」と 0 分を省略する。過去予定には付けない。
+        // 当日フィルタ通過後のため日付は同一であり、時・分の差だけで求まる。（秒は切り捨て）
+        bool soon = false;
+        if (!past && jst.size() >= 16) {
+            int diffMin = (std::stoi(jst.substr(11, 2)) * 60 + std::stoi(jst.substr(14, 2)))
+                        - (std::stoi(nowJst.substr(11, 2)) * 60 + std::stoi(nowJst.substr(14, 2)));
+            // !past（jst >= nowJst の秒込み比較）かつ日付同一なら時分差は必ず 0 以上に
+            // なるため、このガードには通常到達しない。負値表示を確実に防ぐ防御のみ
+            if (diffMin < 0) diffMin = 0;
+            // 赤文字閾値（urgent_minutes）未満なら切迫扱い。0 は機能無効
+            soon = urgentMinutes > 0 && diffMin < urgentMinutes;
+            std::wstring rel;
+            if (diffMin < 60)           rel = std::to_wstring(diffMin) + L"分後";
+            else if (diffMin % 60 == 0) rel = std::to_wstring(diffMin / 60) + L"時間後";
+            else                        rel = std::to_wstring(diffMin / 60) + L"時間"
+                                            + std::to_wstring(diffMin % 60) + L"分後";
+            label += L"（" + rel + L"）";
+        }
+        // 次の予定（最初の今後予定）を太字強調の対象にする
+        bool next = !past && !nextAssigned;
+        if (next) nextAssigned = true;
+        todayEvents.push_back({toWide(ev.permalink), key, date, label, muted, past, soon, next});
     }
 
     g_scheduleItems.clear();
@@ -3502,7 +3549,9 @@ static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     if (eidx >= g_scheduleItems.size()) return FALSE;
     const auto& item = g_scheduleItems[eidx];
     HDC   hdc = GetDC(hWnd);
-    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    // 描画時と同じフォントで計測する（次の予定は太字で幅が広がるため、不一致だと末尾が欠ける）
+    HFONT old = static_cast<HFONT>(SelectObject(hdc,
+        item.next ? g_hMenuFontBold : g_hMenuFont));
     SIZE  sz  = {};
     GetTextExtentPoint32W(hdc, item.label.c_str(),
         static_cast<int>(item.label.size()), &sz);
@@ -3516,8 +3565,9 @@ static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 
 // 左クリックポップアップの owner-draw 項目描画
 // ODS_SELECTED に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は非選択時に
-// グレー文字で描画する。muted フラグが立つ項目には DrawTextW 後に 2 px の取消線を
-// 手動で重ね描画する。（取消線の色は文字色に追従する）
+// グレー文字、soon フラグが立つ項目は非選択時に赤文字で描画する。next フラグが立つ項目は
+// 選択・抑制状態にかかわらず太字で描画する。muted フラグが立つ項目には DrawTextW 後に
+// 2 px の取消線を手動で重ね描画する。（取消線の色は文字色に追従する）
 static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
     if (dis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(dis->itemData);
@@ -3547,11 +3597,18 @@ static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
                         (GetGValue(fg) * 2 + GetGValue(bg)) / 3,
                         (GetBValue(fg) * 2 + GetBValue(bg)) / 3);
     }
+    else if (item.soon) {
+        // 開始まで urgent_minutes 分未満の切迫予定はやや暗い赤で強調する。
+        // 赤に相当するシステム色はないため固定 RGB とする。（純赤はライト背景で眩しい）
+        textColor = RGB(200, 0, 0);
+    }
     else {
         textColor = GetSysColor(COLOR_MENUTEXT);
     }
     SetTextColor(dis->hDC, textColor);
-    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
+    // 次の予定は太字で強調する（選択中・抑制中でも維持）
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC,
+        item.next ? g_hMenuFontBold : g_hMenuFont));
     DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
         DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     if (item.muted) {

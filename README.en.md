@@ -26,6 +26,8 @@ The tray icon shows a badge in the bottom-right corner when upcoming events exis
 
 The event list, shown on left click, lets you open today's Google Calendar page by clicking the footer and toggle notification muting by right-clicking an event.
 
+Each item in the event list shows the time remaining until the event starts, recalculated from the current time each time the list is opened. Events starting in less than `urgent_minutes` (default 60 minutes) are shown in red, and the next event (the first upcoming one) is shown in bold.
+
 Right-clicking the tray icon provides various settings. The popup is displayed flush against the taskbar edge.
 
 ### Past event display
@@ -114,6 +116,8 @@ To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the sam
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
 # Minutes before an event to notify (0-30, default 5)
 # notify_minutes = 5
+# Threshold in minutes for showing events in red in the event list (default 60, 0 to disable)
+# urgent_minutes = 60
 # Process names to mute while the notification sound plays (empty array to disable)
 # duck_targets = ["chrome.exe", "msedge.exe"]
 # Additional calendar IDs to poll (primary is always enabled)
