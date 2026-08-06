@@ -93,6 +93,11 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 // 予定一覧の赤文字閾値（urgent_minutes）のデフォルト（分）。0 で機能無効
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
 
+// ホバーで予定一覧を表示するまでの遅延（ms）。0 は即時表示
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 500;
+static constexpr long long MIN_HOVER_DELAY_MS     = 0;
+static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
+
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
@@ -112,6 +117,7 @@ static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定の即時再取得（今すぐ更新）
 static constexpr UINT IDM_SHOW_PAST           = 40012; // 予定一覧の過去予定表示トグル
+static constexpr UINT IDM_HOVER_POPUP         = 40013; // ホバーでの予定一覧表示トグル
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
@@ -130,6 +136,13 @@ static constexpr UINT IDM_EVENT_MAX  = 41050;
 // ツールチップ定期更新タイマー（1 分間隔）
 static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
+
+// ホバー表示のワンショット遅延タイマーと、ホバー表示中の自動クローズ用ポーリングタイマー
+static constexpr UINT  IDT_HOVER_TRIGGER       = 2;
+static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 3;
+static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
+// カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
+static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
 
 // 自動契機の即時ポーリング抑制間隔（この時間内の要求は先送りし、トレイメニュー「今すぐ更新」の明示要求には適用しない）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
@@ -197,6 +210,21 @@ static std::atomic<bool> g_muteInMeeting{true};
 
 // 予定一覧に当日の過去予定を表示するかのフラグ（レジストリで永続化、トレイメニューでトグル）
 static std::atomic<bool> g_showPastEvents{true};
+
+// ホバーで予定一覧を表示するかのトグル（レジストリ HoverPopup で永続化、デフォルト ON）
+static std::atomic<bool> g_hoverPopupEnabled{true};
+// ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
+static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
+
+// ホバー起点表示の自動クローズ制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
+// g_hoverMode：ホバー起点で予定一覧を表示中か（クリック起点と自動クローズ適用を区別する）
+// g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
+// g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
+// g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
+static bool g_hoverMode           = false;
+static bool g_hoverAutoclosed     = false;
+static HWND g_hoverPrevForeground = nullptr;
+static int  g_hoverOutsideTicks   = 0;
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -273,6 +301,7 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
+    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 500）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -1685,6 +1714,14 @@ static Config loadConfig(const std::wstring& exeDir) {
         urgentMin = **(*base)["urgent_minutes"].as_integer();
     cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
 
+    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 500、0〜5000 にクランプ、0 で即時）
+    long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
+    if (local && (*local)["hover_delay_ms"].is_integer())
+        hoverDelay = **(*local)["hover_delay_ms"].as_integer();
+    else if (base && (*base)["hover_delay_ms"].is_integer())
+        hoverDelay = **(*base)["hover_delay_ms"].as_integer();
+    cfg.hoverDelayMs = (std::max)(MIN_HOVER_DELAY_MS, (std::min)(MAX_HOVER_DELAY_MS, hoverDelay));
+
     // [guard] / [loudness] セクション読み込みヘルパー
     auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
         if (local && (*local)[section][key].is_boolean()) return **(*local)[section][key].as_boolean();
@@ -1850,6 +1887,7 @@ static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\gcalntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_SHOW_PAST_EVENTS  = L"ShowPastEvents";
+static constexpr const wchar_t* REG_HOVER_POPUP       = L"HoverPopup";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2965,7 +3003,13 @@ static std::wstring upcomingCountText(int count) {
 
 // トレイアイコンのツールチップを更新する
 // 現在JST時刻以降の当日イベント件数を「本日の以降予定：N 件」として表示する。
-// ポップアップメニュー表示中は更新しない
+// ポップアップメニュー表示中は更新しない。
+//
+// ホバー表示が有効なときは件数ツールチップを空にする。同じホバー操作でツールチップと
+// 予定一覧が重なって表示され、機能が衝突するためだ。予定一覧は件数を含む上位互換の
+// 情報を示すため、表示を止めても失われる情報はない。
+// 未認証時は例外としてホバー表示自体が無反応のため、認証案内のツールチップを維持する。
+// バッジ更新はホバー表示の有無に関わらず継続する。（件数の有無を示す唯一の常時手掛かりのため）
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
@@ -2990,7 +3034,9 @@ static void updateTrayTooltip(HWND hWnd) {
     int count = countUpcomingTodayEvents(events);
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
-    wcscpy_s(nid.szTip, upcomingCountText(count).c_str());
+    // szTip は makeTrayNid のゼロ初期化で空文字列。ホバー表示が無効なときだけ件数を書き込む
+    if (!g_hoverPopupEnabled.load())
+        wcscpy_s(nid.szTip, upcomingCountText(count).c_str());
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     updateTrayIcon(hWnd, count > 0);
     g_tooltipUpdating = false;
@@ -2999,6 +3045,8 @@ static void updateTrayTooltip(HWND hWnd) {
 // トレイアイコンを除去する
 static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
+    KillTimer(hWnd, IDT_HOVER_TRIGGER);
+    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -3087,6 +3135,37 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
     default:
         return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN };
     }
+}
+
+// トレイアイコンの画面矩形を取得する
+// 失敗（アイコン未登録・過渡状態）は false を返し、呼び出し側は判定を保守的に扱う。
+static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
+    NOTIFYICONIDENTIFIER nii = { sizeof(nii) };
+    nii.hWnd = hWnd;
+    nii.uID  = 1;
+    return SUCCEEDED(Shell_NotifyIconGetRect(&nii, &rcOut));
+}
+
+// 自スレッド所有の可視ポップアップメニューウィンドウ（クラス #32768）にカーソルが乗っているか
+// 通知抑制トグルの再描画と同じ EnumThreadWindows 方式で列挙する。
+// 表示直後や破棄済みの過渡状態は false 側に落ちるが、自動クローズは連続 tick 判定のため単発の false は無害。
+static bool isCursorOverAnyMenuWindow(POINT pt) {
+    struct Ctx { POINT pt; bool over; } ctx = { pt, false };
+    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        wchar_t cls[16] = {};
+        if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
+        if (wcscmp(cls, L"#32768") != 0)               return TRUE;
+        if (!IsWindowVisible(hwnd))                    return TRUE;
+        RECT rc;
+        if (!GetWindowRect(hwnd, &rc))                 return TRUE;
+        if (PtInRect(&rc, c->pt)) {
+            c->over = true;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.over;
 }
 
 // 左クリック時の予定一覧ポップアップ表示
@@ -3410,6 +3489,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_showPastEvents ? MF_CHECKED : MF_UNCHECKED),
         IDM_SHOW_PAST, L"過去の予定を表示");
 
+    // ホバーでの予定一覧表示トグル（レジストリ永続化、デフォルト ON）
+    AppendMenuW(hMenu, MF_STRING | (g_hoverPopupEnabled ? MF_CHECKED : MF_UNCHECKED),
+        IDM_HOVER_POPUP, L"ホバーで予定一覧を表示");
+
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
@@ -3443,9 +3526,68 @@ static void launchInteractiveAuth() {
     }
 }
 
+// トレイアイコンホバー時の予定一覧表示
+//
+// 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
+// ホバー無効・未認証・既に表示中は無反応。発火時点でカーソルがアイコン矩形内に
+// 留まっているかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
+//
+// 自動クローズ：表示中は IDT_HOVER_AUTOCLOSE を回し、カーソルがアイコン矩形・メニュー矩形の
+// いずれの内側にも無い状態が HOVER_AUTOCLOSE_TICKS 連続で観測されたら EndMenu で閉じる。
+// TrackPopupMenu のモーダルループ中も WM_TIMER は WndProc に配送されるため成立する。
+//
+// フォーカス復元：ホバー表示はキーボードフォーカスを奪うため、自動クローズで閉じた場合のみ
+// 表示直前のフォアグラウンドウィンドウへ復元する。項目クリックや Esc・外側クリックで
+// 閉じた場合はユーザの明示操作なので復元しない。
+static void handleTrayHover(HWND hWnd) {
+    if (!g_hoverPopupEnabled.load()) return;
+    if (g_authRequired.load())       return;
+    if (g_popupShowing.load())       return;
+
+    RECT icon;
+    if (!getTrayIconRect(hWnd, icon)) return;
+    POINT pt;
+    GetCursorPos(&pt);
+    if (!PtInRect(&icon, pt)) return;
+
+    // forceForeground で自プロセスへ移る前のフォアグラウンドを記憶する
+    HWND prev = GetForegroundWindow();
+    if (prev == hWnd) prev = nullptr;
+
+    g_hoverPrevForeground = prev;
+    g_hoverAutoclosed     = false;
+    g_hoverOutsideTicks   = 0;
+    g_hoverMode           = true;
+
+    g_popupShowing.store(true);
+    clearTrayTooltip(hWnd);
+
+    // 自動クローズ用ポーリングはモーダルループ突入前に開始する
+    SetTimer(hWnd, IDT_HOVER_AUTOCLOSE, HOVER_AUTOCLOSE_POLL_MS, nullptr);
+    showSchedulePopup(hWnd);
+    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
+
+    bool autoclosed = g_hoverAutoclosed;
+    HWND restoreTo  = g_hoverPrevForeground;
+    g_hoverMode           = false;
+    g_hoverAutoclosed     = false;
+    g_hoverPrevForeground = nullptr;
+    g_hoverOutsideTicks   = 0;
+
+    g_popupShowing.store(false);
+
+    // 破棄済みウィンドウへの復元を避ける防御チェック
+    if (autoclosed && restoreTo && IsWindow(restoreTo))
+        SetForegroundWindow(restoreTo);
+
+    updateTrayTooltip(hWnd);
+}
+
 // トレイアイコン左クリック時の処理
 // 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
+// 表示中（ホバー起点を含む）の再入は無視する。
 static void handleTrayLeftClick(HWND hWnd) {
+    if (g_popupShowing.load()) return;  // ホバーで既に表示中なら二重起動しない
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         launchInteractiveAuth();
@@ -3503,6 +3645,12 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_SHOW_PAST) {
         g_showPastEvents.store(!g_showPastEvents.load());
         writeRegDword(REG_SHOW_PAST_EVENTS, g_showPastEvents.load() ? 1u : 0u);
+        return;
+    }
+    // 保留中ホバータイマーの取消は不要（コンテキストメニューを開いた時点で取消済み）
+    if (id == IDM_HOVER_POPUP) {
+        g_hoverPopupEnabled.store(!g_hoverPopupEnabled.load());
+        writeRegDword(REG_HOVER_POPUP, g_hoverPopupEnabled.load() ? 1u : 0u);
         return;
     }
     if (id == IDM_POLL_NOW) {
@@ -3685,10 +3833,29 @@ static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
 // 例外を投げうる C++ 処理を含むため、呼び出しは trayWndProc 経由で保護する
 static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+            KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 保留中のホバートリガーを取消（クリック優先）
             showTrayContextMenu(hWnd);
-        else if (lParam == WM_LBUTTONUP)
+        }
+        else if (lParam == WM_LBUTTONUP) {
+            KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 同上
             handleTrayLeftClick(hWnd);
+        }
+        else if (lParam == WM_MOUSEMOVE) {
+            // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
+            // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
+            // hover_delay_ms = 0 は即時表示。（デバウンスなし）
+            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load()) {
+                DWORD delay = g_hoverDelayMs.load();
+                if (delay == 0) {
+                    KillTimer(hWnd, IDT_HOVER_TRIGGER);
+                    handleTrayHover(hWnd);
+                }
+                else {
+                    SetTimer(hWnd, IDT_HOVER_TRIGGER, delay, nullptr);
+                }
+            }
+        }
         return 0;
     }
     if (msg == WM_UPDATE_TOOLTIP) {
@@ -3701,6 +3868,30 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
     if (msg == WM_TIMER && wParam == IDT_TOOLTIP_REFRESH) {
         updateTrayTooltip(hWnd);
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == IDT_HOVER_TRIGGER) {
+        // ワンショット化：発火したら即座に殺してから表示に進む
+        KillTimer(hWnd, IDT_HOVER_TRIGGER);
+        handleTrayHover(hWnd);
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == IDT_HOVER_AUTOCLOSE) {
+        // ホバー起点の表示のみが対象。クリック起点やコンテキストメニュー表示中は何もしない
+        if (!g_hoverMode) return 0;
+        POINT pt;
+        GetCursorPos(&pt);
+        RECT icon = {};
+        bool inIcon = getTrayIconRect(hWnd, icon) && PtInRect(&icon, pt);
+        bool inMenu = isCursorOverAnyMenuWindow(pt);
+        if (inIcon || inMenu) {
+            g_hoverOutsideTicks = 0;
+        }
+        else if (++g_hoverOutsideTicks >= HOVER_AUTOCLOSE_TICKS) {
+            // フォアグラウンド復元の判定に使うため、EndMenu の前にフラグを立てる
+            g_hoverAutoclosed = true;
+            EndMenu();
+        }
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -4597,9 +4788,13 @@ int wmain() {
         addTrayIcon(g_hWnd);
 
         // レジストリから設定を復元（キー未作成時はデフォルト値）
-        g_soundEnabled   = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
-        g_muteInMeeting  = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
-        g_showPastEvents = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
+        g_soundEnabled      = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
+        g_muteInMeeting     = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_showPastEvents    = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
+        g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
+
+        // toml のホバー遅延を確定（0〜5000 にクランプ済みの値）
+        g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
 
         writeLog("started");
         logSchedule(cfg.schedule);
