@@ -94,7 +94,7 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
 
 // ホバーで予定一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 500;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 250;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
 
@@ -301,7 +301,7 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
-    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 500）
+    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 250）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -1714,7 +1714,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         urgentMin = **(*base)["urgent_minutes"].as_integer();
     cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
 
-    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 500、0〜5000 にクランプ、0 で即時）
+    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 250、0〜5000 にクランプ、0 で即時）
     long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
     if (local && (*local)["hover_delay_ms"].is_integer())
         hoverDelay = **(*local)["hover_delay_ms"].as_integer();

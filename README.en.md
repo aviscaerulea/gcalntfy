@@ -22,7 +22,7 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon (default 0.5 seconds, adjustable via `hover_delay_ms`) opens the same event list as a left click.
+The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon (default 0.25 seconds, adjustable via `hover_delay_ms`) opens the same event list as a left click.
 
 An event list opened by hover closes automatically when the cursor leaves both the icon and the list, and focus returns to the previously active window. Hover display can be toggled with "Show event list on hover" in the right-click menu. (default ON, persists after restart)
 
@@ -122,8 +122,8 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 # notify_minutes = 5
 # Threshold in minutes for showing events in red in the event list (default 60, 0 to disable)
 # urgent_minutes = 60
-# Delay in ms before the event list opens on hover (0-5000, default 500, 0 for immediate)
-# hover_delay_ms = 500
+# Delay in ms before the event list opens on hover (0-5000, default 250, 0 for immediate)
+# hover_delay_ms = 250
 # Process names to mute while the notification sound plays (empty array to disable)
 # duck_targets = ["chrome.exe", "msedge.exe"]
 # Additional calendar IDs to poll (primary is always enabled)
