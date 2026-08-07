@@ -94,7 +94,7 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
 
 // ホバーで予定一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 250;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 200;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
 
@@ -143,6 +143,11 @@ static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 3;
 static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
 // カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
+// ホバー表示を閉じた直後、予定一覧の再表示を抑止する時間（ms）
+// ホバー表示中のアイコン左クリックは、メニュー側が押下を消費して表示を閉じる。
+// 続く WM_LBUTTONUP はトレイへ届くため、抑止しないと再表示になる。
+// 長さは押下から離すまでの人的な間を吸収する値とする
+static constexpr ULONGLONG HOVER_REOPEN_GUARD_MS = 500;
 
 // 自動契機の即時ポーリング抑制間隔（この時間内の要求は先送りし、トレイメニュー「今すぐ更新」の明示要求には適用しない）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
@@ -221,10 +226,12 @@ static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_
 // g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
 // g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
 // g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
+// g_hoverClosedTick：ホバー起点の表示を閉じた時刻（GetTickCount64。0 は未設定）
 static bool g_hoverMode           = false;
 static bool g_hoverAutoclosed     = false;
 static HWND g_hoverPrevForeground = nullptr;
 static int  g_hoverOutsideTicks   = 0;
+static ULONGLONG g_hoverClosedTick = 0;
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -301,7 +308,7 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
-    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 250）
+    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 200）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -1714,7 +1721,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         urgentMin = **(*base)["urgent_minutes"].as_integer();
     cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
 
-    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 250、0〜5000 にクランプ、0 で即時）
+    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 200、0〜5000 にクランプ、0 で即時）
     long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
     if (local && (*local)["hover_delay_ms"].is_integer())
         hoverDelay = **(*local)["hover_delay_ms"].as_integer();
@@ -3575,6 +3582,7 @@ static void handleTrayHover(HWND hWnd) {
     g_hoverOutsideTicks   = 0;
 
     g_popupShowing.store(false);
+    g_hoverClosedTick = GetTickCount64();
 
     // 破棄済みウィンドウへの復元を避ける防御チェック
     if (autoclosed && restoreTo && IsWindow(restoreTo))
@@ -3586,11 +3594,20 @@ static void handleTrayHover(HWND hWnd) {
 // トレイアイコン左クリック時の処理
 // 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
 // 表示中（ホバー起点を含む）の再入は無視する。
+//
+// ホバー表示中のアイコン左クリックは「閉じるだけ」で完結させる。押下はメニューの
+// モーダルループが消費して表示を閉じる。続く WM_LBUTTONUP はトレイへ届くため、
+// 抑止しないと閉じた直後に再表示され、一瞬消えて開き直る挙動になる。
+// 抑止は予定一覧の再表示のみが対象で、認証フローの起動は妨げない。
 static void handleTrayLeftClick(HWND hWnd) {
     if (g_popupShowing.load()) return;  // ホバーで既に表示中なら二重起動しない
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         launchInteractiveAuth();
+        return;
+    }
+    if (g_hoverClosedTick && GetTickCount64() - g_hoverClosedTick < HOVER_REOPEN_GUARD_MS) {
+        g_hoverClosedTick = 0;
         return;
     }
     g_popupShowing.store(true);
