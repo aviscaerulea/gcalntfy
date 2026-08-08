@@ -30,6 +30,8 @@ While hover display is ON, the tooltip showing the remaining event count is not 
 
 While hover display is ON, a left click does nothing. (except starting authentication while unauthenticated)
 
+Once the list is closed, it does not reopen until the cursor leaves the icon, so a small cursor movement right after closing does not bring it back.
+
 The event list lets you open today's Google Calendar page by clicking the footer and toggle notification muting by right-clicking an event.
 
 Each item in the event list shows the time remaining until the event starts, recalculated from the current time each time the list is opened. Events starting in less than `urgent_minutes` (default 60 minutes) are shown in red, and the next event (the first upcoming one) is shown in bold.

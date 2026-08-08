@@ -138,8 +138,10 @@ static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
 // ホバー表示のワンショット遅延タイマーと、ホバー表示中の自動クローズ用ポーリングタイマー
+// IDT_HOVER_REARM は表示を閉じた後、カーソルのアイコン離脱を待って再表示を解禁する
 static constexpr UINT  IDT_HOVER_TRIGGER       = 2;
 static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 3;
+static constexpr UINT  IDT_HOVER_REARM         = 4;
 static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
 // カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
@@ -221,10 +223,12 @@ static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_
 // g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
 // g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
 // g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
+// g_hoverSuppressed：表示を閉じた後の再表示抑止中か（カーソルがアイコンを離れると解除）
 static bool g_hoverMode           = false;
 static bool g_hoverAutoclosed     = false;
 static HWND g_hoverPrevForeground = nullptr;
 static int  g_hoverOutsideTicks   = 0;
+static bool g_hoverSuppressed     = false;
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -3047,6 +3051,7 @@ static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
     KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
+    KillTimer(hWnd, IDT_HOVER_REARM);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -3539,6 +3544,10 @@ static void launchInteractiveAuth() {
 // フォーカス復元：ホバー表示はキーボードフォーカスを奪うため、自動クローズで閉じた場合のみ
 // 表示直前のフォアグラウンドウィンドウへ復元する。項目クリックや Esc・外側クリックで
 // 閉じた場合はユーザの明示操作なので復元しない。
+//
+// 再表示の抑止：閉じた直後はカーソルがアイコン上に残るため、わずかなカーソル移動で
+// すぐ開き直ってしまう。閉じたら抑止状態に入り、IDT_HOVER_REARM でカーソルの
+// アイコン離脱を監視して解除する。（離れて戻る操作を再表示の意思表示とみなす）
 static void handleTrayHover(HWND hWnd) {
     if (!g_hoverPopupEnabled.load()) return;
     if (g_authRequired.load())       return;
@@ -3575,6 +3584,9 @@ static void handleTrayHover(HWND hWnd) {
     g_hoverOutsideTicks   = 0;
 
     g_popupShowing.store(false);
+
+    g_hoverSuppressed = true;
+    SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr);
 
     // 破棄済みウィンドウへの復元を避ける防御チェック
     if (autoclosed && restoreTo && IsWindow(restoreTo))
@@ -3853,7 +3865,8 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load()) {
+            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load() &&
+                !g_hoverSuppressed) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -3882,6 +3895,18 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         // ワンショット化：発火したら即座に殺してから表示に進む
         KillTimer(hWnd, IDT_HOVER_TRIGGER);
         handleTrayHover(hWnd);
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == IDT_HOVER_REARM) {
+        // カーソルがアイコンを離れたら再表示を解禁する。
+        // アイコン矩形を取得できない場合も解禁する。（抑止が永続すると表示不能になるため）
+        POINT pt;
+        GetCursorPos(&pt);
+        RECT icon = {};
+        if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
+            g_hoverSuppressed = false;
+            KillTimer(hWnd, IDT_HOVER_REARM);
+        }
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_HOVER_AUTOCLOSE) {
