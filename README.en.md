@@ -22,17 +22,13 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon (default 0.2 seconds, adjustable via `hover_delay_ms`) opens the event list.
+The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon (default 0.25 seconds, adjustable via `hover_delay_ms`) opens the same event list as a left click.
 
 An event list opened by hover closes automatically when the cursor leaves both the icon and the list, and focus returns to the previously active window. Hover display can be toggled with "Show event list on hover" in the right-click menu. (default ON, persists after restart)
 
-While hover display is ON, the tooltip showing the remaining event count is not displayed, since it would overlap with the event list on the same hover action. Turning it OFF shows the remaining event count on hover and opens the event list on left click.
+While hover display is ON, the tooltip showing the remaining event count is not displayed, since it would overlap with the event list on the same hover action. Turning it OFF shows the remaining event count on hover.
 
-While hover display is ON, a left click does nothing. (except starting authentication while unauthenticated)
-
-Once the list is closed, it does not reopen until the cursor leaves the icon, so a small cursor movement right after closing does not bring it back.
-
-The event list lets you open today's Google Calendar page by clicking the footer and toggle notification muting by right-clicking an event.
+The event list, shown on left click, lets you open today's Google Calendar page by clicking the footer and toggle notification muting by right-clicking an event.
 
 Each item in the event list shows the time remaining until the event starts, recalculated from the current time each time the list is opened. Events starting in less than `urgent_minutes` (default 60 minutes) are shown in red, and the next event (the first upcoming one) is shown in bold.
 
@@ -67,7 +63,7 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 
 ### Notification muting
 
-Right-click an event in the event list to toggle notification muting.
+Right-click an event in the event list (shown via left-click on the tray icon) to toggle notification muting.
 
 | Item | Behavior |
 |---|---|
@@ -126,8 +122,8 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 # notify_minutes = 5
 # Threshold in minutes for showing events in red in the event list (default 60, 0 to disable)
 # urgent_minutes = 60
-# Delay in ms before the event list opens on hover (0-5000, default 200, 0 for immediate)
-# hover_delay_ms = 200
+# Delay in ms before the event list opens on hover (0-5000, default 250, 0 for immediate)
+# hover_delay_ms = 250
 # Process names to mute while the notification sound plays (empty array to disable)
 # duck_targets = ["chrome.exe", "msedge.exe"]
 # Additional calendar IDs to poll (primary is always enabled)

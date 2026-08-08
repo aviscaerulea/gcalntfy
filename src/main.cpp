@@ -94,7 +94,7 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
 
 // ホバーで予定一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 200;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 250;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
 
@@ -129,7 +129,7 @@ static constexpr wchar_t CACHE_FILENAME[]        = L"events.json";
 // 通知抑制リストキャッシュファイル名（exe 同フォルダに保存）
 static constexpr wchar_t MUTED_CACHE_FILENAME[]  = L"muted_events.json";
 
-// 予定一覧のイベント項目（IDM_EVENT_BASE + index で最大 50 件）
+// 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大 50 件）
 static constexpr UINT IDM_EVENT_BASE = 41000;
 static constexpr UINT IDM_EVENT_MAX  = 41050;
 
@@ -138,10 +138,8 @@ static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
 // ホバー表示のワンショット遅延タイマーと、ホバー表示中の自動クローズ用ポーリングタイマー
-// IDT_HOVER_REARM は表示を閉じた後、カーソルのアイコン離脱を待って再表示を解禁する
 static constexpr UINT  IDT_HOVER_TRIGGER       = 2;
 static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 3;
-static constexpr UINT  IDT_HOVER_REARM         = 4;
 static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
 // カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
@@ -180,7 +178,7 @@ static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 // 開始からこの時間以内は進行中の可能性が高く、急な追加・日時変更の告知価値があるため通知する
 static constexpr long long CHANGE_NOTIFY_GRACE_HNS = 60LL * 60 * 10'000'000;
 
-// 予定なし時の表示文言（ツールチップ・予定一覧で共用）
+// 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
 static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"本日の以降予定：なし";
 
 // Google OAuth 2.0
@@ -223,12 +221,10 @@ static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_
 // g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
 // g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
 // g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
-// g_hoverSuppressed：表示を閉じた後の再表示抑止中か（カーソルがアイコンを離れると解除）
 static bool g_hoverMode           = false;
 static bool g_hoverAutoclosed     = false;
 static HWND g_hoverPrevForeground = nullptr;
 static int  g_hoverOutsideTicks   = 0;
-static bool g_hoverSuppressed     = false;
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -305,7 +301,7 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
-    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 200）
+    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 250）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -359,7 +355,7 @@ static std::wstring g_exeDir;
 // 通知抑制リスト：eventKey → JST 日付（YYYY-MM-DD）（g_mtx で保護）
 static std::unordered_map<std::string, std::string> g_mutedEvents;
 
-// 予定一覧ポップアップの予定項目描画用フォント（initMenuFonts で初期化）
+// 左クリックポップアップの予定項目描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont = nullptr;
 // 次の予定の太字強調用フォント（initMenuFonts で初期化。プロセス常駐のため明示解放しない）
 static HFONT g_hMenuFontBold = nullptr;
@@ -1718,7 +1714,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         urgentMin = **(*base)["urgent_minutes"].as_integer();
     cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
 
-    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 200、0〜5000 にクランプ、0 で即時）
+    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 250、0〜5000 にクランプ、0 で即時）
     long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
     if (local && (*local)["hover_delay_ms"].is_integer())
         hoverDelay = **(*local)["hover_delay_ms"].as_integer();
@@ -3051,7 +3047,6 @@ static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
     KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
-    KillTimer(hWnd, IDT_HOVER_REARM);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -3067,7 +3062,7 @@ static inline std::string eventKey(const CalendarEvent& e) {
 }
 
 // メニュー描画用フォントの初期化
-// OS のメニューフォント設定を取得して予定一覧ポップアップの予定項目描画用フォントを作成する。
+// OS のメニューフォント設定を取得して左クリックポップアップの予定項目描画用フォントを作成する。
 static void initMenuFonts() {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
@@ -3078,7 +3073,7 @@ static void initMenuFonts() {
     g_hMenuFontBold = CreateFontIndirectW(&lfBold);
 }
 
-// 予定一覧ポップアップの予定項目（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
+// 左クリックポップアップの予定項目（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
 struct ScheduleItem {
     std::wstring permalink;
     std::string  key;    // eventKey(e)：右クリック抑制トグル用
@@ -3173,7 +3168,7 @@ static bool isCursorOverAnyMenuWindow(POINT pt) {
     return ctx.over;
 }
 
-// 予定一覧ポップアップの表示
+// 左クリック時の予定一覧ポップアップ表示
 // g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出してメニューに表示する。
 // 過去分はグレー表示で残し、当日の過去予定への導線とする。（トレイメニューの過去予定表示設定が OFF なら除外）
 // 終日予定は表示しない。
@@ -3544,10 +3539,6 @@ static void launchInteractiveAuth() {
 // フォーカス復元：ホバー表示はキーボードフォーカスを奪うため、自動クローズで閉じた場合のみ
 // 表示直前のフォアグラウンドウィンドウへ復元する。項目クリックや Esc・外側クリックで
 // 閉じた場合はユーザの明示操作なので復元しない。
-//
-// 再表示の抑止：閉じた直後はカーソルがアイコン上に残るため、わずかなカーソル移動で
-// すぐ開き直ってしまう。閉じたら抑止状態に入り、IDT_HOVER_REARM でカーソルの
-// アイコン離脱を監視して解除する。（離れて戻る操作を再表示の意思表示とみなす）
 static void handleTrayHover(HWND hWnd) {
     if (!g_hoverPopupEnabled.load()) return;
     if (g_authRequired.load())       return;
@@ -3585,9 +3576,6 @@ static void handleTrayHover(HWND hWnd) {
 
     g_popupShowing.store(false);
 
-    g_hoverSuppressed = true;
-    SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr);
-
     // 破棄済みウィンドウへの復元を避ける防御チェック
     if (autoclosed && restoreTo && IsWindow(restoreTo))
         SetForegroundWindow(restoreTo);
@@ -3597,21 +3585,14 @@ static void handleTrayHover(HWND hWnd) {
 
 // トレイアイコン左クリック時の処理
 // 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
-// 表示中の再入は無視する。
-//
-// ホバー表示が有効なときは予定一覧を出さない。ホバーで自動表示される以上、
-// 左クリックでの表示は不要であり、表示中のクリックが「閉じた直後に開き直す」
-// 挙動を生むためだ。（押下はメニューが消費して閉じ、続く離しがトレイへ届く）
-// 未認証時の認証フロー起動はこの抑止の対象外とする。ホバー表示は未認証時に
-// 出ないため、左クリックが認証への唯一のトレイ側入口として残る。
+// 表示中（ホバー起点を含む）の再入は無視する。
 static void handleTrayLeftClick(HWND hWnd) {
-    if (g_popupShowing.load()) return;  // 起点を問わずポップアップ表示中は二重起動しない
+    if (g_popupShowing.load()) return;  // ホバーで既に表示中なら二重起動しない
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         launchInteractiveAuth();
         return;
     }
-    if (g_hoverPopupEnabled.load()) return;
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
     showSchedulePopup(hWnd);
@@ -3708,7 +3689,7 @@ static void handleTrayCommand(UINT id) {
     }
 }
 
-// 予定一覧ポップアップの owner-draw 項目サイズ計算
+// 左クリックポップアップの owner-draw 項目サイズ計算
 // 戻り値：TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
 static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     if (mis->CtlType != ODT_MENU) return FALSE;
@@ -3730,7 +3711,7 @@ static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     return TRUE;
 }
 
-// 予定一覧ポップアップの owner-draw 項目描画
+// 左クリックポップアップの owner-draw 項目描画
 // ODS_SELECTED に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は非選択時に
 // グレー文字、soon フラグが立つ項目は非選択時に赤文字で描画する。next フラグが立つ項目は
 // 選択・抑制状態にかかわらず太字で描画する。muted フラグが立つ項目には DrawTextW 後に
@@ -3803,7 +3784,7 @@ static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
     return TRUE;
 }
 
-// 予定項目の通知抑制をトグルする（予定一覧ポップアップ上の右クリック）
+// 予定項目の通知抑制をトグルする（左クリックポップアップ上の右クリック）
 // g_mutedEvents と item.muted をトグルし、自スレッド所有のメニューウィンドウを再描画する。
 static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
     UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
@@ -3857,16 +3838,14 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             showTrayContextMenu(hWnd);
         }
         else if (lParam == WM_LBUTTONUP) {
-            // ホバートリガーは取り消さない。ホバー表示が有効なら左クリックは無効であり、
-            // クリックで保留中の自動表示まで打ち消さないため
+            KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 同上
             handleTrayLeftClick(hWnd);
         }
         else if (lParam == WM_MOUSEMOVE) {
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load() &&
-                !g_hoverSuppressed) {
+            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load()) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -3895,18 +3874,6 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         // ワンショット化：発火したら即座に殺してから表示に進む
         KillTimer(hWnd, IDT_HOVER_TRIGGER);
         handleTrayHover(hWnd);
-        return 0;
-    }
-    if (msg == WM_TIMER && wParam == IDT_HOVER_REARM) {
-        // カーソルがアイコンを離れたら再表示を解禁する。
-        // アイコン矩形を取得できない場合も解禁する。（抑止が永続すると表示不能になるため）
-        POINT pt;
-        GetCursorPos(&pt);
-        RECT icon = {};
-        if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
-            g_hoverSuppressed = false;
-            KillTimer(hWnd, IDT_HOVER_REARM);
-        }
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_HOVER_AUTOCLOSE) {
@@ -3943,7 +3910,7 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
         if (drawScheduleMenuItem(dis)) return TRUE;
     }
-    // 予定一覧ポップアップ上の右クリック：通知抑制をトグルする
+    // 左クリックポップアップ上の右クリック：通知抑制をトグルする
     // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
     if (msg == WM_MENURBUTTONUP) {
         toggleScheduleItemMute(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
