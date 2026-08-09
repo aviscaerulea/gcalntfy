@@ -8,7 +8,9 @@
 
 A lightweight Windows tray app that notifies you with Windows notifications before your Google Calendar events start or when they change.
 
-Measured physical memory usage is under 10 MB. (May vary depending on the environment and the number of events within the next 48 hours.)
+Its main features are event notifications and the event list opened from the system tray.
+
+Measured physical memory usage is about 10 MB or less.
 
 ![The event list opened from the tray icon](docs/images/event-list.png)
 
