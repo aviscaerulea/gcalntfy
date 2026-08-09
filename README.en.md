@@ -10,11 +10,12 @@ A lightweight Windows tray app that notifies you with Windows notifications befo
 
 Measured physical memory usage is under 10 MB. (May vary depending on the environment and the number of events within the next 48 hours.)
 
+![The event list opened from the tray icon](docs/images/event-list.png)
+
 ## Features
 
 - Event notifications: polls Google Calendar and notifies you before events start or when they change, via toast notification and sound
 - Per-time-slot polling frequency: set the polling frequency for each time slot of the day
-- Ducking: mutes the processes you specify while the notification sound plays, then restores them afterward
 - System tray: check the event list and access various settings from the tray icon
 - Past event display: today's past events remain in the event list in gray, and the display can be toggled on or off from the tray menu
 - Multiple calendar support: external calendars can also be polled
