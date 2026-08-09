@@ -1409,7 +1409,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
     return result;
 }
 
-// ==================== イベントキャッシュ ====================
+// ==================== 共通 JSON ファイル I/O ====================
 
 // JSON 配列ファイルを読み込んで JsonArray を返す
 // 前段の共通処理：CreateFileW → GetFileSize（0 バイトと 1MB 超は不正扱い）→ ReadFile → JsonArray::Parse
@@ -1506,6 +1506,8 @@ static bool atomicWriteJson(const std::wstring& path, const std::string& json,
     return true;
 }
 
+// ==================== イベントキャッシュ ====================
+
 // イベントキャッシュの保存
 // ポーリング成功時に呼び出し、イベントリストを JSON ファイルに上書き保存する。
 // ファイル I/O はロック外で呼ぶこと（events は呼び出し元のローカルコピー）。
@@ -1584,6 +1586,8 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
         return {};
     }
 }
+
+// ==================== 通知抑制リスト ====================
 
 // 通知抑制リストの保存
 // トグル操作のたびに呼び出し、g_mutedEvents を JSON ファイルに上書き保存する。
