@@ -14,7 +14,7 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 ## Features
 
-- Event notifications: polls Google Calendar and notifies you before events start or when they change, via toast notification and sound
+- Event notifications: polls Google Calendar and notifies you before events start or when they change, via Windows notification and sound
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
@@ -23,7 +23,7 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon opens the same event list as a left click. Hover display can be toggled with "Show list automatically on mouse hover" in the tray menu.
+The tray icon shows a badge in the bottom-right corner when there are events yet to start. Keeping the cursor on the icon opens the same event list as a left click. Hover display can be toggled with "Show list automatically on mouse hover" in the tray menu.
 
 The event list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
 
@@ -43,20 +43,20 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 
 ### Notification timing
 
-| Timing | Toast notification | Sound notification | Condition |
+| Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
 | Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
 | At the notification time set in Google Calendar | Yes | Yes | Only when the event has a popup notification set |
 | When a change, cancellation, or addition is found | Yes | No | When the content differs from the previous check (changes affecting only events more than one hour past their start time are not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
 
-Example notification when an event cancellation is detected:
+Example notification when an event cancellation is found:
 
-![Toast notification shown when an event cancellation is detected](docs/images/cancel-toast.png)
+![Windows notification shown when an event cancellation is found](docs/images/cancel-toast.png)
 
 Example notification when "Refresh now" succeeds:
 
-![Toast notification shown when "Refresh now" succeeds](docs/images/update-toast.png)
+![Windows notification shown when "Refresh now" succeeds](docs/images/update-toast.png)
 
 ### Notification muting
 
@@ -65,8 +65,8 @@ Right-click an event in the event list to toggle notification muting.
 | Item | Behavior |
 |---|---|
 | Scope | The selected instance only (for recurring events, only the current day's instance is muted; subsequent days notify normally) |
-| Muted notifications | Toast and sound notifications at the `notify_minutes` and reminders timings |
-| Not muted | Change/cancellation/new-event detection notifications (always notified regardless of the mute setting, since they carry important information) |
+| Muted notifications | Windows and sound notifications before an event starts and at the notification time set in Google Calendar |
+| Not muted | Notifications when a change, cancellation, or addition is found (always notified regardless of the mute setting, since they carry important information) |
 | Persistence | Saved to `muted_events.json` next to the executable and persists after restart. Entries for past dates are automatically removed on startup |
 | Visual indication | Muted events are shown with strikethrough text |
 
@@ -105,7 +105,7 @@ gcalntfy
 
 On launch, the app resides in the system tray and polls Google Calendar according to your configuration to notify you of events.
 
-On first launch, since there is no access token yet, a toast notification opens your browser. Clicking "Allow" with your Google account completes authentication, and the refresh token is saved to the registry (`HKCU\SOFTWARE\gcalntfy`). No re-authentication is needed on subsequent launches.
+On first launch, since there is no access token yet, a Windows notification opens your browser. Clicking "Allow" with your Google account completes authentication, and the refresh token is saved to the registry (`HKCU\SOFTWARE\gcalntfy`). No re-authentication is needed on subsequent launches.
 
 ## Configuration
 
