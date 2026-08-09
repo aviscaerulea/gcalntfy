@@ -27,7 +27,7 @@ The tray icon shows a badge in the bottom-right corner when there are events yet
 
 The event list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
 
-Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event toggles notification muting.
+Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event stops its notifications.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
@@ -60,15 +60,15 @@ Example notification when "Refresh now" succeeds:
 
 ### Notification muting
 
-Right-click an event in the event list to toggle notification muting.
+Right-click an event in the event list to stop its notifications. Right-click again to turn them back on.
 
 | Item | Behavior |
 |---|---|
-| Scope | The selected instance only (for recurring events, only the current day's instance is muted; subsequent days notify normally) |
-| Muted notifications | Windows and sound notifications before an event starts and at the notification time set in Google Calendar |
-| Not muted | Notifications when a change, cancellation, or addition is found (always notified regardless of the mute setting, since they carry important information) |
-| Persistence | Saved to `muted_events.json` next to the executable and persists after restart. Entries for past dates are automatically removed on startup |
-| Visual indication | Muted events are shown with strikethrough text |
+| What is stopped | Only the event you right-clicked (for repeating events, only that day's occurrence) |
+| Notifications stopped | Those before an event starts and at the notification time set in Google Calendar |
+| Notifications not stopped | Those for a change, cancellation, or addition (always delivered, since they matter) |
+| Saving the setting | Kept after you quit the app (entries for past days are removed on the next launch) |
+| Appearance | Events with notifications stopped are shown with strikethrough text |
 
 ### Whether sound notifications play
 
