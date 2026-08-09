@@ -64,6 +64,14 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 | On detecting an event's date/time change, cancellation, or new addition | Yes | No | When a difference from the previous poll is detected (changes affecting only events more than one hour past their start time are generally not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the count of today's remaining events on success, or the failure reason on failure) |
 
+On detecting an event cancellation, the following Toast notification is shown.
+
+![Toast notification shown when an event cancellation is detected](docs/images/cancel-toast.png)
+
+On success, "Refresh now" shows the following Toast notification.
+
+![Toast notification shown when "Refresh now" succeeds](docs/images/update-toast.png)
+
 ### Notification muting
 
 Right-click an event in the event list to toggle notification muting.
