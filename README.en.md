@@ -8,7 +8,7 @@
 
 A lightweight Windows tray app that notifies you with Windows notifications before your Google Calendar events start or when they change.
 
-Its main features are event notifications and the event list opened from the system tray.
+Its main features are event notifications and the event list opened from the tray icon.
 
 Measured physical memory usage is about 10 MB or less.
 
