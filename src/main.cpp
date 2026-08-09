@@ -1414,7 +1414,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 // JSON 配列ファイルを読み込んで JsonArray を返す
 // 前段の共通処理：CreateFileW → GetFileSize（0 バイトと 1MB 超は不正扱い）→ ReadFile → JsonArray::Parse
 // ファイル未存在は「不在」を示す nullopt。読み込み・パース失敗も nullopt。
-// logTag はエラー出力用の識別子（"cache" / "muted" 等）。
+// logTag はエラー出力用の識別子。（"cache" / "muted" 等）
 static std::optional<winrt::Windows::Data::Json::JsonArray>
 readJsonArrayFile(const std::wstring& path, const char* logTag)
 {
