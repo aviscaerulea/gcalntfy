@@ -21,16 +21,14 @@ Measured physical memory usage is about 10 MB or less.
   - Past events: display can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
-  - Notification muting: right-clicking an event excludes it from notifications
+  - Stopping notifications: right-clicking an event stops notifications for it
 - Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when there are events yet to start. Keeping the cursor on the icon opens the same event list as a left click. Hover display can be toggled with "Show list automatically on mouse hover" in the tray menu.
+The tray icon shows a badge in the bottom-right corner when there are events yet to start.
 
-The event list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
-
-Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event excludes it from notifications.
+Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
