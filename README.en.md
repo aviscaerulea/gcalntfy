@@ -16,26 +16,20 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 
 - Event notifications: polls Google Calendar and notifies you before events start or when they change, via toast notification and sound
 - System tray: view the event list and change settings from the tray icon
-- Past event display: today's past events remain in the event list in gray, and the display can be toggled on or off from the tray menu
+  - Past events: display can be toggled on or off
+  - Next event: shown in bold (turns red when within the configured time)
+  - Browser display: clicking an event or the footer opens it in the browser
 - Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon (default 0.1 seconds, adjustable via `hover_delay_ms`) opens the same event list as a left click.
+The tray icon shows a badge in the bottom-right corner when upcoming events exist. Keeping the cursor on the icon opens the same event list as a left click. Hover display can be toggled with "Show list automatically on mouse hover" in the right-click menu.
 
-The event list never takes focus. Showing it does not interrupt typing in the window you were using.
+The event list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
 
-The event list closes automatically when the cursor leaves both the icon and the list. A left click toggles it: it closes the list when shown and opens it immediately when hidden. Left clicks within a grace period after the list appeared on hover (default 0.3 seconds, adjustable via `hover_click_guard_ms`) are ignored, so that an automatic hover display arriving just before an intended click does not turn that click into a close.
+Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event toggles notification muting.
 
-After the list closes, hover will not reopen it until the cursor leaves the icon. This prevents the list from reopening on the slightest movement right after closing.
-
-Hover display can be toggled with "Show list automatically on mouse hover" in the right-click menu. (default ON, persists after restart) Even when OFF, a left click still opens the list.
-
-The event list lets you open today's Google Calendar page by clicking the footer and toggle notification muting by right-clicking an event. The list is mouse-only and cannot be operated with the keyboard.
-
-Each item in the event list shows the time remaining until the event starts, recalculated from the current time each time the list is opened. Events starting in less than `urgent_minutes` (default 60 minutes) are shown in red, and the next event (the first upcoming one) is shown in bold.
-
-Right-clicking the tray icon provides various settings. The popup is displayed flush against the taskbar edge.
+Right-clicking the tray icon provides various settings.
 
 ### Past event display
 
