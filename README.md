@@ -32,7 +32,7 @@ Google カレンダーの予定の開始前や変更を Windows 通知で知ら�
 
 各種設定は、トレイアイコンの右クリックで開くトレイメニューから操作できます。
 
-### Google タスクの通知対応
+### Google タスクの通知対応（制限事項）
 
 | 種別 | 対象 |
 |---|:---:|
@@ -103,17 +103,3 @@ gcalntfy
 同フォルダに `gcalntfy.local.toml` を併置すると、そちらの記述をキー単位で優先適用します。変更したい項目だけをこちらに書いておけば、バージョンアップで `gcalntfy.toml` を入れ替えても設定を移し替えずに済みます。
 
 通知音を鳴らすには `sound.wav`（16bit PCM WAV）も exe と同フォルダに配置してください。
-
-## 制限事項
-
-繰り返しタスクは Google Calendar API のイベント一覧に一切現れないため、通知対象外です。（時刻を指定した繰り返さないタスクは対象）
-
-## ビルド
-
-```shell
-task build
-```
-
-Visual Studio 2022 または Build Tools（C++20、MSVC）が必要です。成果物は `out/gcalntfy.exe` に生成します。
-
-ビルド前に `.env` を作成してください。次に `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定してください。

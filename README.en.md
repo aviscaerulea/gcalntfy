@@ -32,7 +32,7 @@ Each item in the event list shows the time remaining until the event starts, in 
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
-### Google Tasks notifications
+### Google Tasks notifications (limitations)
 
 | Type | Supported |
 |---|:---:|
@@ -103,17 +103,3 @@ Place `gcalntfy.toml` in the same folder as the executable. The available settin
 If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. Keeping only the settings you want to change there means you do not have to migrate them when a new version replaces `gcalntfy.toml`.
 
 To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the same folder as the executable.
-
-## Limitations
-
-Recurring tasks never appear in the Google Calendar API's event list, so they are not notification targets. (Time-specified, non-recurring tasks are supported)
-
-## Build
-
-```shell
-task build
-```
-
-Requires Visual Studio 2022 or Build Tools (C++20, MSVC). The output is `out/gcalntfy.exe`.
-
-Before building, create a `.env` file and set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
