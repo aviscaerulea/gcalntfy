@@ -6,11 +6,11 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/gcalntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml)
 
-A lightweight Windows tray app that notifies you with Windows notifications before your Google Calendar events start or when they change.
-
-Its main features are event notifications and the event list opened from the tray icon.
+A lightweight resident app that delivers Google Calendar notifications and shows your event list from the Windows tray.
 
 Measured physical memory usage is about 10 MB or less.
+
+A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you of updates to your Redmine tickets.
 
 ![The event list opened from the tray icon](docs/images/event-list.png)
 

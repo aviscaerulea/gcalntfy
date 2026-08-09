@@ -6,11 +6,11 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/gcalntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml)
 
-Google カレンダーの予定の開始前や変更を Windows 通知で知らせる軽量常駐アプリです。
-
-主な機能は、予定を知らせる通知と、トレイアイコンから開く予定一覧の表示です。
+タスクトレイから Google カレンダーの通知と一覧表示を行う軽量常駐アプリです。
 
 実測での物理メモリ使用量は約 10MB 以下です。
+
+姉妹ツールとして、Redmine のチケットの更新を通知する [redntfy](https://github.com/aviscaerulea/redntfy) もあります。
 
 ![トレイアイコンから開いた予定一覧](docs/images/event-list.png)
 
