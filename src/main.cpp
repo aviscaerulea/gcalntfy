@@ -94,9 +94,16 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
 
 // ホバーで予定一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 250;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 100;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
+
+// ホバー自動表示直後にアイコン左クリックの「閉じる」を無視する猶予（ms）。0 で無効
+// 一覧を出すつもりのクリックの直前にホバー表示が割り込むと、クリックが「閉じる」に
+// 化けて「クリックしたのに何も出ない」体験になるため設ける
+static constexpr long long DEFAULT_HOVER_CLICK_GUARD_MS = 300;
+static constexpr long long MIN_HOVER_CLICK_GUARD_MS     = 0;
+static constexpr long long MAX_HOVER_CLICK_GUARD_MS     = 5000;
 
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
@@ -129,20 +136,18 @@ static constexpr wchar_t CACHE_FILENAME[]        = L"events.json";
 // 通知抑制リストキャッシュファイル名（exe 同フォルダに保存）
 static constexpr wchar_t MUTED_CACHE_FILENAME[]  = L"muted_events.json";
 
-// 左クリック予定一覧のイベント項目（IDM_EVENT_BASE + index で最大 50 件）
-static constexpr UINT IDM_EVENT_BASE = 41000;
-static constexpr UINT IDM_EVENT_MAX  = 41050;
-
-// ツールチップ定期更新タイマー（1 分間隔）
+// トレイアイコンのバッジ定期更新タイマー（1 分間隔）
+// 予定一覧を開かずとも以降予定の有無が時間経過で変わるため、定期的に見直す
 static constexpr UINT  IDT_TOOLTIP_REFRESH  = 1;
 static constexpr DWORD TOOLTIP_REFRESH_MS   = 60000;
 
-// ホバー表示のワンショット遅延タイマーと、ホバー表示中の自動クローズ用ポーリングタイマー
-static constexpr UINT  IDT_HOVER_TRIGGER       = 2;
-static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 3;
-static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
-// カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
-static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
+// ホバー表示のワンショット遅延タイマーと、一覧ポップアップの監視用ポーリングタイマー
+// IDT_LIST_WATCH は表示中の離脱検出と、明示クローズ後のホバー再アーム保留の解除を兼ねる
+static constexpr UINT  IDT_HOVER_TRIGGER  = 2;
+static constexpr UINT  IDT_LIST_WATCH     = 3;
+static constexpr DWORD LIST_WATCH_POLL_MS = 200;
+// カーソルがアイコン・一覧の外に連続でこの tick 数（約 400ms）観測されたら閉じる
+static constexpr int   LIST_LEAVE_TICKS   = 2;
 
 // 自動契機の即時ポーリング抑制間隔（この時間内の要求は先送りし、トレイメニュー「今すぐ更新」の明示要求には適用しない）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
@@ -215,21 +220,25 @@ static std::atomic<bool> g_showPastEvents{true};
 static std::atomic<bool> g_hoverPopupEnabled{true};
 // ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
 static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
+// ホバー自動表示直後のクリック猶予（ms、0〜5000 にクランプ済み）。起動時に反映し以降不変
+static std::atomic<DWORD> g_hoverClickGuardMs{static_cast<DWORD>(DEFAULT_HOVER_CLICK_GUARD_MS)};
 
-// ホバー起点表示の自動クローズ制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
-// g_hoverMode：ホバー起点で予定一覧を表示中か（クリック起点と自動クローズ適用を区別する）
-// g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
-// g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
-// g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
-static bool g_hoverMode           = false;
-static bool g_hoverAutoclosed     = false;
-static HWND g_hoverPrevForeground = nullptr;
-static int  g_hoverOutsideTicks   = 0;
+// 一覧ポップアップの開閉制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
+// g_listOutsideTicks：カーソルがアイコン・一覧矩形の外に居た連続 tick 数
+// g_hoverRearmPending：明示クローズ後、カーソルがアイコンから離れるまでホバー再表示を
+//   保留するフラグ。（閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
+//   IDT_LIST_WATCH の監視でアイコン離脱を検出したら解除する）
+// g_hoverShownAt：ホバーで自動表示した時刻（GetTickCount64）。左クリック表示とクローズで
+//   0 に戻す。（不変条件：非 0 はホバー起点の一覧が表示中のときだけ）
+static int       g_listOutsideTicks  = 0;
+static bool      g_hoverRearmPending = false;
+static ULONGLONG g_hoverShownAt      = 0;
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
-// トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
+// トレイのポップアップ表示中フラグ（一覧ポップアップ可視、または右クリックメニュー表示中）
+// ツールチップ・バッジ更新の抑制に加え、左クリックの開閉トグル判定とホバーのアーム抑止にも使う
 static std::atomic<bool> g_popupShowing{false};
 
 // スリープ復帰・ロック解除・ネットワーク復帰など自動契機の即時ポーリングフラグ
@@ -301,7 +310,8 @@ struct Config {
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
-    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 250）
+    long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 100）
+    long long                 hoverClickGuardMs;  // ホバー表示直後のクリック猶予（ms、0〜5000、0 で無効、デフォルト 300）
     std::vector<std::string>  extCalendarIds;     // 追加でポーリングするカレンダー ID（primary は常に有効）
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -355,7 +365,7 @@ static std::wstring g_exeDir;
 // 通知抑制リスト：eventKey → JST 日付（YYYY-MM-DD）（g_mtx で保護）
 static std::unordered_map<std::string, std::string> g_mutedEvents;
 
-// 左クリックポップアップの予定項目描画用フォント（initMenuFonts で初期化）
+// 一覧ポップアップと右クリックメニューの描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont = nullptr;
 // 次の予定の太字強調用フォント（initMenuFonts で初期化。プロセス常駐のため明示解放しない）
 static HFONT g_hMenuFontBold = nullptr;
@@ -1714,13 +1724,22 @@ static Config loadConfig(const std::wstring& exeDir) {
         urgentMin = **(*base)["urgent_minutes"].as_integer();
     cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
 
-    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 250、0〜5000 にクランプ、0 で即時）
+    // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 100、0〜5000 にクランプ、0 で即時）
     long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
     if (local && (*local)["hover_delay_ms"].is_integer())
         hoverDelay = **(*local)["hover_delay_ms"].as_integer();
     else if (base && (*base)["hover_delay_ms"].is_integer())
         hoverDelay = **(*base)["hover_delay_ms"].as_integer();
     cfg.hoverDelayMs = (std::max)(MIN_HOVER_DELAY_MS, (std::min)(MAX_HOVER_DELAY_MS, hoverDelay));
+
+    // hover_click_guard_ms（ホバー自動表示直後のクリック猶予、ms 単位。デフォルト 300、0〜5000 にクランプ、0 で無効）
+    long long hoverGuard = DEFAULT_HOVER_CLICK_GUARD_MS;
+    if (local && (*local)["hover_click_guard_ms"].is_integer())
+        hoverGuard = **(*local)["hover_click_guard_ms"].as_integer();
+    else if (base && (*base)["hover_click_guard_ms"].is_integer())
+        hoverGuard = **(*base)["hover_click_guard_ms"].as_integer();
+    cfg.hoverClickGuardMs =
+        (std::max)(MIN_HOVER_CLICK_GUARD_MS, (std::min)(MAX_HOVER_CLICK_GUARD_MS, hoverGuard));
 
     // [guard] / [loudness] セクション読み込みヘルパー
     auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
@@ -2980,7 +2999,7 @@ static void clearTrayTooltip(HWND hWnd) {
 //
 // 現在の JST 時刻以降に開始する当日イベントを数える。終日予定は JST 00:00 開始へ
 // 正規化されるため、当日分は常に対象外になる。
-// ツールチップと「今すぐ更新」の完了通知で同じ意味の件数を示すために共用する。
+// トレイバッジの点灯判定と「今すぐ更新」の完了通知で同じ意味の件数を示すために共用する。
 static int countUpcomingTodayEvents(const std::vector<CalendarEvent>& events) {
     SYSTEMTIME utcNow;
     GetSystemTime(&utcNow);
@@ -2995,21 +3014,20 @@ static int countUpcomingTodayEvents(const std::vector<CalendarEvent>& events) {
 }
 
 // 当日の以降予定件数の表示文言を組み立てる
-// 0 件は NO_UPCOMING_EVENTS の文言に落とす。（ツールチップと完了通知で表記を揃える）
+// 0 件は NO_UPCOMING_EVENTS の文言に落とす。（一覧のフッターと完了通知で表記を揃える）
+// 件数ツールチップの全廃により、現在の利用先は「今すぐ更新」の完了通知のみ。
 static std::wstring upcomingCountText(int count) {
     if (count <= 0) return NO_UPCOMING_EVENTS;
     return L"本日の以降予定：" + std::to_wstring(count) + L" 件";
 }
 
-// トレイアイコンのツールチップを更新する
-// 現在JST時刻以降の当日イベント件数を「本日の以降予定：N 件」として表示する。
-// ポップアップメニュー表示中は更新しない。
-//
-// ホバー表示が有効なときは件数ツールチップを空にする。同じホバー操作でツールチップと
-// 予定一覧が重なって表示され、機能が衝突するためだ。予定一覧は件数を含む上位互換の
-// 情報を示すため、表示を止めても失われる情報はない。
-// 未認証時は例外としてホバー表示自体が無反応のため、認証案内のツールチップを維持する。
-// バッジ更新はホバー表示の有無に関わらず継続する。（件数の有無を示す唯一の常時手掛かりのため）
+// トレイアイコンの状態表示（ツールチップ・バッジ）を更新する
+// 件数ツールチップは全廃済みで、通常時は空ツールチップの維持とバッジ（以降予定あり）の更新のみを
+// 行う。（件数は一覧ポップアップのフッターが、以降予定の有無はバッジが担う。ツールチップを出すと
+// 同じホバー操作で一覧と重なって衝突する）
+// 未認証時のみ例外として、認証案内のツールチップを表示する。（ホバー表示自体が無反応のため
+// 一覧とは衝突しない）
+// ポップアップ表示中は更新しない。
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
@@ -3032,11 +3050,9 @@ static void updateTrayTooltip(HWND hWnd) {
         events = g_pendingEvents;
     }
     int count = countUpcomingTodayEvents(events);
+    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る。（ツールチップなしを維持する）
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
-    // szTip は makeTrayNid のゼロ初期化で空文字列。ホバー表示が無効なときだけ件数を書き込む
-    if (!g_hoverPopupEnabled.load())
-        wcscpy_s(nid.szTip, upcomingCountText(count).c_str());
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     updateTrayIcon(hWnd, count > 0);
     g_tooltipUpdating = false;
@@ -3046,7 +3062,7 @@ static void updateTrayTooltip(HWND hWnd) {
 static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
-    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
+    KillTimer(hWnd, IDT_LIST_WATCH);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -3061,8 +3077,9 @@ static inline std::string eventKey(const CalendarEvent& e) {
     return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
 
-// メニュー描画用フォントの初期化
-// OS のメニューフォント設定を取得して左クリックポップアップの予定項目描画用フォントを作成する。
+// 描画用フォントの初期化
+// OS のメニューフォント設定を取得し、一覧ポップアップの行描画用フォントを作成する。
+// メニュー由来の設定を使うのは、一覧をメニューと同じ見た目に揃えるためだ。
 static void initMenuFonts() {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
@@ -3073,15 +3090,15 @@ static void initMenuFonts() {
     g_hMenuFontBold = CreateFontIndirectW(&lfBold);
 }
 
-// 左クリックポップアップの予定項目（IDM_EVENT_BASE + index に対応、WndProc スレッドのみ使用）
+// 一覧ポップアップの予定項目（表示中の行に 1 対 1 で対応、WndProc スレッドのみ使用）
 struct ScheduleItem {
     std::wstring permalink;
     std::string  key;    // eventKey(e)：右クリック抑制トグル用
     std::string  date;   // JST YYYY-MM-DD：抑制リスト保存用
-    std::wstring label;  // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
+    std::wstring label;  // 描画テキスト
     bool         muted;  // 抑制中フラグ（右クリックトグル時にもその場で更新する）
     bool         past;   // 開始時刻を過ぎた予定（グレー表示。クリック遷移と抑制トグルは通常どおり）
-    bool         soon;   // 開始まで urgent_minutes 分未満の今後の予定（非選択時に赤文字で描画する）
+    bool         soon;   // 開始まで urgent_minutes 分未満の今後の予定（非ホット時に赤文字で描画する）
     bool         next;   // 今後の予定のうち最初の 1 件（太字で描画する）
 };
 static std::vector<ScheduleItem> g_scheduleItems;
@@ -3146,34 +3163,327 @@ static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
     return SUCCEEDED(Shell_NotifyIconGetRect(&nii, &rcOut));
 }
 
-// 自スレッド所有の可視ポップアップメニューウィンドウ（クラス #32768）にカーソルが乗っているか
-// 通知抑制トグルの再描画と同じ EnumThreadWindows 方式で列挙する。
-// 表示直後や破棄済みの過渡状態は false 側に落ちるが、自動クローズは連続 tick 判定のため単発の false は無害。
-static bool isCursorOverAnyMenuWindow(POINT pt) {
-    struct Ctx { POINT pt; bool over; } ctx = { pt, false };
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lp) -> BOOL {
-        auto* c = reinterpret_cast<Ctx*>(lp);
-        wchar_t cls[16] = {};
-        if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
-        if (wcscmp(cls, L"#32768") != 0)               return TRUE;
-        if (!IsWindowVisible(hwnd))                    return TRUE;
-        RECT rc;
-        if (!GetWindowRect(hwnd, &rc))                 return TRUE;
-        if (PtInRect(&rc, c->pt)) {
-            c->over = true;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.over;
+// 一覧行の左右パディング（px）
+// 計測と描画で食い違うと文字が欠けるため、予定行・フッター行の双方でこの値を共有する
+static constexpr int LIST_ROW_PADDING = 16;
+
+// 一覧行の DrawTextW 共通フラグ
+// DT_NOPREFIX がないと予定タイトル中の & がニーモニック指定として食われ、次の文字に下線が付く。
+// （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
+static constexpr UINT LIST_ROW_DT_FLAGS = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
+
+// 予定行のサイズ計測
+// 描画と同じフォントで測る。次の予定は太字で幅が広がるため、不一致だと末尾が欠ける。
+static SIZE measureScheduleRow(HDC hdc, const ScheduleItem& item) {
+    HFONT old = static_cast<HFONT>(SelectObject(hdc,
+        item.next ? g_hMenuFontBold : g_hMenuFont));
+    SIZE sz = {};
+    GetTextExtentPoint32W(hdc, item.label.c_str(),
+        static_cast<int>(item.label.size()), &sz);
+    SelectObject(hdc, old);
+    sz.cx += LIST_ROW_PADDING * 2;
+    sz.cy += 6;
+    return sz;
 }
 
-// 左クリック時の予定一覧ポップアップ表示
-// g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出してメニューに表示する。
+// 予定行の描画
+// hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は
+// 非ホット時にグレー文字、soon フラグが立つ項目は非ホット時に赤文字で描画する。next フラグが
+// 立つ項目はホット・抑制状態にかかわらず太字で描画する。muted フラグが立つ項目には
+// DrawTextW 後に 2px の取消線を手動で重ね描画する。（取消線の色は文字色に追従する）
+static void drawScheduleRow(HDC hdc, const RECT& rcItem, const ScheduleItem& item, bool hot) {
+    FillRect(hdc, &rcItem,
+        reinterpret_cast<HBRUSH>(
+            static_cast<INT_PTR>(hot ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+
+    RECT textRect  = rcItem;
+    textRect.left += LIST_ROW_PADDING;
+    SetBkMode(hdc, TRANSPARENT);
+    // 過去予定は非ホット時のみグレー化する。（ホット中はハイライト背景での視認性を優先）
+    // グレーは COLOR_GRAYTEXT のままでは濃いため、メニュー背景色を 1/3 混ぜて一段薄くする。
+    // 固定 RGB でなくシステム配色から導出するので、ハイコントラスト等の配色変更にも追従する。
+    // （GetSysColor はライト・ダークモード切替には追従せず、常にライト系の値を返す）
+    COLORREF textColor;
+    if (hot) {
+        textColor = GetSysColor(COLOR_HIGHLIGHTTEXT);
+    }
+    else if (item.past) {
+        COLORREF fg = GetSysColor(COLOR_GRAYTEXT);
+        COLORREF bg = GetSysColor(COLOR_MENU);
+        textColor = RGB((GetRValue(fg) * 2 + GetRValue(bg)) / 3,
+                        (GetGValue(fg) * 2 + GetGValue(bg)) / 3,
+                        (GetBValue(fg) * 2 + GetBValue(bg)) / 3);
+    }
+    else if (item.soon) {
+        // 開始まで urgent_minutes 分未満の切迫予定はやや暗い赤で強調する。
+        // 赤に相当するシステム色はないため固定 RGB とする。（純赤はライト背景で眩しい）
+        textColor = RGB(200, 0, 0);
+    }
+    else {
+        textColor = GetSysColor(COLOR_MENUTEXT);
+    }
+    SetTextColor(hdc, textColor);
+    // 次の予定は太字で強調する（ホット中・抑制中でも維持）
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc,
+        item.next ? g_hMenuFontBold : g_hMenuFont));
+    DrawTextW(hdc, item.label.c_str(), -1, &textRect, LIST_ROW_DT_FLAGS);
+    if (item.muted) {
+        SIZE sz = {};
+        GetTextExtentPoint32W(hdc, item.label.c_str(),
+            static_cast<int>(item.label.size()), &sz);
+        constexpr int STRIKE_THICKNESS = 2;
+        // 中央から 1px だけ下寄せにして視認性を上げる
+        constexpr int STRIKE_Y_OFFSET  = 1;
+        // テキスト左端より 3px、右端より 4px 外側まで線を伸ばす
+        constexpr int STRIKE_MARGIN_LEFT  = 3;
+        constexpr int STRIKE_MARGIN_RIGHT = 4;
+        int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
+        RECT strikeRect = {
+            textRect.left - STRIKE_MARGIN_LEFT,
+            lineY - STRIKE_THICKNESS / 2,
+            textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
+            lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
+        };
+        HBRUSH hLineBrush = CreateSolidBrush(textColor);
+        FillRect(hdc, &strikeRect, hLineBrush);
+        DeleteObject(hLineBrush);
+    }
+    SelectObject(hdc, oldFont);
+}
+
+// ==================== 一覧ポップアップウィンドウ ====================
+// TrackPopupMenu のモーダルメニューをやめ、フォーカスを一切奪わない非アクティブの
+// 自前ポップアップ（WS_EX_NOACTIVATE）で予定一覧を表示する。
+// 非モーダルのため、フォーカス復元・EndMenu といったモーダルメニュー時代の補正処理は
+// 存在しない。キー入力は受けないマウス専用の UI である。
+// 開く：ホバー（IDT_HOVER_TRIGGER 経由）またはアイコン左クリック（即時）。
+// 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
+// アイコン左クリックのトグル・行クリックで予定ページを開いたとき。起点によらず同一ルール。
+// 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
+// 無視する。（詳細は handleTrayLeftClick を参照）
+
+// 一覧ポップアップのウィンドウクラス名（自前クラスのため他プロセスからは参照されない）
+static constexpr wchar_t LIST_WND_CLASS[] = L"gcalntfy_list";
+
+// 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
+// 2 箇所で食い違うと枠サイズと実ウィンドウのレイアウトがずれるため 1 箇所に集約する。
+// WS_POPUP | WS_BORDER：メニュー相当の枠付きポップアップ。
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない。（本ウィンドウの核）
+// WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない。
+// WS_EX_TOPMOST：タスクバー近傍でも手前に出す。
+static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER;
+static constexpr DWORD LIST_WND_EXSTYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+
+// セパレータ行の高さ（余白込み。メニューのセパレータ相当）
+static constexpr int LIST_SEPARATOR_HEIGHT = 9;
+
+// 一覧の行種別と配置（クライアント座標）。表示のたびに構築する
+enum class ListRowKind { Event, Separator, Footer, Empty };
+struct ListRowLayout {
+    ListRowKind kind;
+    int         top;
+    int         height;
+    size_t      index;  // Event のとき g_scheduleItems のインデックス（他種別は未使用の 0）
+};
+static HWND g_listWnd = nullptr;                 // 初回表示時に生成して以降使い回す
+static std::vector<ListRowLayout> g_listLayout;  // トレイ WndProc スレッド専用
+static std::wstring g_listFooterText;            // フッター行の文言（0 件時は未使用）
+static int g_listHotRow = -1;                    // ホット行（g_listLayout の添字。-1 = なし）
+
+// 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
+static bool isListPopupVisible() {
+    return g_listWnd && IsWindowVisible(g_listWnd);
+}
+
+// 後方定義の関数を一覧ウィンドウの WndProc から呼ぶための前方宣言
+static void hideListPopup(HWND trayWnd);
+static void handleTrayCommand(UINT id);
+static void toggleScheduleItemMute(size_t itemIndex);
+
+// クライアント座標 y の行ヒットテスト（セパレータは対象外）。ヒットなしは -1
+static int listRowHitTest(int y) {
+    for (size_t i = 0; i < g_listLayout.size(); ++i) {
+        const auto& row = g_listLayout[i];
+        if (row.kind == ListRowKind::Separator) continue;
+        if (y >= row.top && y < row.top + row.height) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// 行のクライアント矩形（横幅はウィンドウ全幅）
+static RECT listRowRect(HWND hWnd, const ListRowLayout& row) {
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    rc.top    = row.top;
+    rc.bottom = row.top + row.height;
+    return rc;
+}
+
+// フッター・0 件行の描画（単色テキスト行。クリック可能なためホット時はハイライトする）
+static void drawTextRow(HDC hdc, const RECT& rc, const wchar_t* text, bool hot) {
+    FillRect(hdc, &rc, reinterpret_cast<HBRUSH>(
+        static_cast<INT_PTR>(hot ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, GetSysColor(hot ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+    RECT textRect = rc;
+    textRect.left += LIST_ROW_PADDING;  // 予定行と同じ左パディング
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    DrawTextW(hdc, text, -1, &textRect, LIST_ROW_DT_FLAGS);
+    SelectObject(hdc, old);
+}
+
+// 一覧ウィンドウの全面描画
+// メモリ DC にダブルバッファで全行を描いてから転送し、チラつきを防ぐ。
+static void paintListWindow(HWND hWnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hWnd, &ps);
+    RECT client;
+    GetClientRect(hWnd, &client);
+    HDC     hMem    = CreateCompatibleDC(hdc);
+    HBITMAP hBmp    = CreateCompatibleBitmap(hdc, client.right, client.bottom);
+    // GDI 枯渇時は生成が NULL を返す。ダブルバッファを諦めて直接描き、無描画を避ける
+    HDC     hTarget = (hMem && hBmp) ? hMem : hdc;
+    HBITMAP hOldBmp = (hTarget == hMem) ? static_cast<HBITMAP>(SelectObject(hMem, hBmp)) : nullptr;
+    FillRect(hTarget, &client, reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_MENU + 1)));
+    for (size_t i = 0; i < g_listLayout.size(); ++i) {
+        const auto& row = g_listLayout[i];
+        RECT rc = client;
+        rc.top    = row.top;
+        rc.bottom = row.top + row.height;
+        bool hot = (static_cast<int>(i) == g_listHotRow);
+        switch (row.kind) {
+        case ListRowKind::Event:
+            if (row.index < g_scheduleItems.size())
+                drawScheduleRow(hTarget, rc, g_scheduleItems[row.index], hot);
+            break;
+        case ListRowKind::Separator: {
+            // メニューのセパレータ相当の 1px 水平線
+            int  y    = (rc.top + rc.bottom) / 2;
+            RECT line = { rc.left + 2, y, rc.right - 2, y + 1 };
+            HBRUSH br = CreateSolidBrush(GetSysColor(COLOR_GRAYTEXT));
+            FillRect(hTarget, &line, br);
+            DeleteObject(br);
+            break;
+        }
+        case ListRowKind::Footer:
+            drawTextRow(hTarget, rc, g_listFooterText.c_str(), hot);
+            break;
+        case ListRowKind::Empty:
+            drawTextRow(hTarget, rc, NO_UPCOMING_EVENTS, hot);
+            break;
+        }
+    }
+    if (hTarget == hMem) {
+        BitBlt(hdc, 0, 0, client.right, client.bottom, hMem, 0, 0, SRCCOPY);
+        SelectObject(hMem, hOldBmp);
+    }
+    if (hBmp) DeleteObject(hBmp);
+    if (hMem) DeleteDC(hMem);
+    EndPaint(hWnd, &ps);
+}
+
+// 一覧ポップアップのウィンドウプロシージャ
+// 非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。マウス専用。
+// 予定行の左クリック＝予定ページを開いて閉じる。フッター・0 件行＝当日ページを開いて閉じる。
+// 予定行の右クリック＝通知抑制のトグルで、一覧は開いたまま。
+// 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
+static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_PAINT) {
+        paintListWindow(hWnd);
+        return 0;
+    }
+    if (msg == WM_MOUSEACTIVATE) {
+        // クリックでもアクティブ化しない（WS_EX_NOACTIVATE の補強。フォーカス非奪取の要）
+        return MA_NOACTIVATE;
+    }
+    if (msg == WM_MOUSEMOVE) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit != g_listHotRow) {
+            // 変化した行だけ再描画してチラつきを抑える（erase FALSE：行描画が背景ごと塗る）
+            int prev = g_listHotRow;
+            g_listHotRow = hit;
+            if (prev >= 0 && prev < static_cast<int>(g_listLayout.size())) {
+                RECT rc = listRowRect(hWnd, g_listLayout[prev]);
+                InvalidateRect(hWnd, &rc, FALSE);
+            }
+            if (hit >= 0) {
+                RECT rc = listRowRect(hWnd, g_listLayout[hit]);
+                InvalidateRect(hWnd, &rc, FALSE);
+            }
+        }
+        // ウィンドウ外へ出たときのホット解除用（毎回の再登録は無害）
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    if (msg == WM_MOUSELEAVE) {
+        if (g_listHotRow >= 0 && g_listHotRow < static_cast<int>(g_listLayout.size())) {
+            RECT rc = listRowRect(hWnd, g_listLayout[g_listHotRow]);
+            g_listHotRow = -1;
+            InvalidateRect(hWnd, &rc, FALSE);
+        }
+        return 0;
+    }
+    if (msg == WM_LBUTTONUP) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit < 0) return 0;
+        const auto& row = g_listLayout[hit];
+        if (row.kind == ListRowKind::Event && row.index < g_scheduleItems.size()) {
+            // 参照はメッセージポンプ越しに持ち越さない。ShellExecuteW は内部でポンプを
+            // 回し得るため、実行中に g_scheduleItems が差し替わると参照が dangling になる。
+            // URL を値でコピーしてから呼ぶ。
+            const std::wstring url = g_scheduleItems[row.index].permalink;
+            if (isHttpUrl(url))
+                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else {
+            // フッター・0 件行は Google Calendar の当日ページを開く（既存処理を共用）
+            handleTrayCommand(IDM_OPEN_CALENDAR_TODAY);
+        }
+        // 予定ページを開いたら一覧は役目を終える
+        if (g_hWnd) hideListPopup(g_hWnd);
+        return 0;
+    }
+    if (msg == WM_RBUTTONUP) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit >= 0 && g_listLayout[hit].kind == ListRowKind::Event)
+            toggleScheduleItemMute(g_listLayout[hit].index);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// 一覧ポップアップウィンドウの生成（初回のみ。以降は表示/非表示で使い回す）
+// トレイウィンドウを親に生成するため、終了時の親破棄で連鎖破棄される。
+static HWND ensureListWindow() {
+    if (g_listWnd) return g_listWnd;
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_DROPSHADOW;
+    wc.lpfnWndProc   = listWndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    // UNICODE 未定義ビルドのため IDC_ARROW（MAKEINTRESOURCE）は LPSTR に展開される。W 版へ読み替える
+    wc.hCursor       = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+    wc.lpszClassName = LIST_WND_CLASS;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        writeLog("list: RegisterClassExW failed: " + std::to_string(GetLastError()));
+        return nullptr;
+    }
+    g_listWnd = CreateWindowExW(LIST_WND_EXSTYLE,
+        LIST_WND_CLASS, nullptr, LIST_WND_STYLE,
+        0, 0, 0, 0, g_hWnd, nullptr, wc.hInstance, nullptr);
+    if (!g_listWnd)
+        writeLog("list: CreateWindowExW failed: " + std::to_string(GetLastError()));
+    return g_listWnd;
+}
+
+// 予定一覧ポップアップの表示（ホバー・左クリック共通）
+// g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出して表示する。
 // 過去分はグレー表示で残し、当日の過去予定への導線とする。（トレイメニューの過去予定表示設定が OFF なら除外）
 // 終日予定は表示しない。
-// 左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
-static void showSchedulePopup(HWND hWnd) {
+// 行の左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
+// 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
+static void showListPopup(HWND trayWnd) {
     std::vector<CalendarEvent> events;
     std::unordered_map<std::string, std::string> mutedSnapshot;
     int urgentMinutes;
@@ -3208,7 +3518,7 @@ static void showSchedulePopup(HWND hWnd) {
         auto key   = eventKey(ev);
         auto date  = jst.substr(0, 10);
         bool muted = mutedSnapshot.count(key) != 0;
-        // "HH:MM タイトル" 形式（MF_UNCHECKED/MF_CHECKED がアイコン列を確保するためプレフィックス不要）
+        // "HH:MM タイトル" 形式（左余白は行パディングが確保するためプレフィックス不要）
         std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
         // 今後の予定にはタイトル末尾へ開始までの残り時間「（n時間n分後）」を付ける。
         // ポップアップを開くたびに現在時刻で再計算される。1 時間未満は「（n分後）」、
@@ -3236,53 +3546,157 @@ static void showSchedulePopup(HWND hWnd) {
         todayEvents.push_back({toWide(ev.permalink), key, date, label, muted, past, soon, next});
     }
 
+    HWND hWnd = ensureListWindow();
+    if (!hWnd) return;
+
     g_scheduleItems.clear();
-    HMENU hMenu = CreatePopupMenu();
-    if (!hMenu) {
-        writeLog("showSchedulePopup: CreatePopupMenu failed");
+    g_listLayout.clear();
+    g_listFooterText.clear();
+    g_listHotRow = -1;
+
+    // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
+    POINT cursor;
+    GetCursorPos(&cursor);
+    MONITORINFO mi = { sizeof(mi) };
+    const bool haveMi =
+        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi) != FALSE;
+    // WS_BORDER の枠を差し引いたクライアント高の上限（取得失敗時は打ち切りなし）
+    RECT frame = { 0, 0, 0, 0 };
+    AdjustWindowRectEx(&frame, LIST_WND_STYLE, FALSE, LIST_WND_EXSTYLE);
+    const int maxClientH = haveMi
+        ? static_cast<int>(mi.rcWork.bottom - mi.rcWork.top) - (frame.bottom - frame.top)
+        : INT_MAX;
+
+    // 行の計測に DC が要る。GDI 枯渇などで取れないときは何も表示しない。
+    // （計測なしでは高さも幅もゼロ同然になり、内容の読めない極小ウィンドウを
+    // 最前面に出したうえ表示中フラグでバッジ更新まで止めてしまうため）
+    HDC hdc = GetDC(hWnd);
+    if (!hdc) {
+        writeLog("list: GetDC failed");
         return;
     }
+    int width = 0;
+    int y     = 0;
+    auto pushRow = [&](ListRowKind kind, int h, size_t index) {
+        g_listLayout.push_back({ kind, y, h, index });
+        y += h;
+    };
+    // テキスト行（フッター・0 件行）の高さと幅。計測は描画と同じ g_hMenuFont で行う
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(hdc, &tm);
+    const int textRowHeight = tm.tmHeight + 6;
+    SelectObject(hdc, oldFont);
+    auto textRowWidth = [&](const wchar_t* text) {
+        HFONT prev = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+        SIZE sz = {};
+        GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
+        SelectObject(hdc, prev);
+        return static_cast<int>(sz.cx) + LIST_ROW_PADDING * 2;
+    };
+
     if (todayEvents.empty()) {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, NO_UPCOMING_EVENTS);
+        width = textRowWidth(NO_UPCOMING_EVENTS);
+        pushRow(ListRowKind::Empty, textRowHeight, 0);
     }
     else {
-        // 表示上限の超過時は古い過去予定から省き、以降の予定を優先して残す。
+        // 全予定行の高さを先に測る。（打ち切り範囲を決めてからレイアウトを組むため）
+        std::vector<SIZE> sizes;
+        sizes.reserve(todayEvents.size());
+        for (const auto& te : todayEvents) sizes.push_back(measureScheduleRow(hdc, te));
+
+        // セパレータとフッターは必ず末尾へ収めるため、先に高さを予約して予定行の枠を求める。
+        // 収まらない分は先頭（最も古い過去予定）から省き、今後の予定を優先して残す。
         // （todayEvents は開始時刻昇順のため、過去分は先頭に連続して並ぶ）
-        constexpr size_t cap = IDM_EVENT_MAX - IDM_EVENT_BASE;
+        // 過去分を全て省いてもなお溢れる場合に限り、今後の予定を末尾から切る。
+        const int eventsMaxH = maxClientH - (LIST_SEPARATOR_HEIGHT + textRowHeight);
+        const size_t pastCount = todayEvents.size() - upcomingCount;
         size_t begin = 0;
-        if (todayEvents.size() > cap)
-            begin = (std::min)(todayEvents.size() - upcomingCount, todayEvents.size() - cap);
-        UINT idx = 0;
+        long long total = 0;
+        for (const auto& sz : sizes) total += sz.cy;
+        while (begin < pastCount && total > eventsMaxH) total -= sizes[begin++].cy;
+
         for (size_t i = begin; i < todayEvents.size(); ++i) {
-            const auto& te = todayEvents[i];
-            if (idx >= cap) break;
-            // MFT_OWNERDRAW で WM_MEASUREITEM / WM_DRAWITEM に描画を委譲する。
-            // dwItemData にインデックスを渡し、描画時に g_scheduleItems から参照する。
-            MENUITEMINFOW mii = { sizeof(mii) };
-            mii.fMask     = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
-            mii.fType     = MFT_OWNERDRAW;
-            mii.wID       = IDM_EVENT_BASE + idx;
-            mii.dwItemData = static_cast<ULONG_PTR>(idx);
-            InsertMenuItemW(hMenu, idx, TRUE, &mii);
-            g_scheduleItems.push_back(te);
-            ++idx;
+            if (y + sizes[i].cy > eventsMaxH) break;
+            g_scheduleItems.push_back(todayEvents[i]);
+            width = (std::max)(width, static_cast<int>(sizes[i].cx));
+            pushRow(ListRowKind::Event, static_cast<int>(sizes[i].cy), g_scheduleItems.size() - 1);
         }
-        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        // 件数は今後の予定のみを数える（ツールチップの「本日の以降予定」と同じ意味を維持）
-        std::wstring footer = L"本日の以降予定：" + std::to_wstring(upcomingCount)
+
+        // 件数は今後の予定のみを数える（「今すぐ更新」の完了通知と同じ意味を維持）。
+        // 省略が起きても件数は減らさず、総数を示したままにする
+        g_listFooterText = L"本日の以降予定：" + std::to_wstring(upcomingCount)
                 + (todayEvents.size() > g_scheduleItems.size() ? L" 件（超過分省略）" : L" 件")
                 + L"（右クリックで通知抑制）";
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CALENDAR_TODAY, footer.c_str());
+        width = (std::max)(width, textRowWidth(g_listFooterText.c_str()));
+        pushRow(ListRowKind::Separator, LIST_SEPARATOR_HEIGHT, 0);
+        pushRow(ListRowKind::Footer, textRowHeight, 0);
     }
+    ReleaseDC(hWnd, hdc);
+
+    // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
+    RECT wr = { 0, 0, width, y };
+    AdjustWindowRectEx(&wr, LIST_WND_STYLE, FALSE, LIST_WND_EXSTYLE);
+    const int w = wr.right - wr.left;
+    const int h = wr.bottom - wr.top;
+
+    // 位置はタスクバーの辺に密着させる。computeTrayPopupPos のアライメント指示
+    // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳し、
+    // メニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
+    auto pos = computeTrayPopupPos(cursor);
+    int wx = pos.x;
+    int wy = pos.y;
+    if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
+    if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
+    if (haveMi) {
+        wx = (std::max)(static_cast<int>(mi.rcWork.left),
+                        (std::min)(wx, static_cast<int>(mi.rcWork.right) - w));
+        wy = (std::max)(static_cast<int>(mi.rcWork.top),
+                        (std::min)(wy, static_cast<int>(mi.rcWork.bottom) - h));
+    }
+
+    // SWP_NOACTIVATE でフォーカスを奪わずに表示する
+    SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(hWnd, nullptr, FALSE);
+
+    g_popupShowing.store(true);
+    g_listOutsideTicks = 0;
+    // 離脱監視の開始。失敗時は表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
+    // 監視なしでは出しっぱなしになるため）
+    if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
+        writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
+        ShowWindow(hWnd, SW_HIDE);
+        g_popupShowing.store(false);
+    }
+}
+
+// 一覧ポップアップを閉じる（離脱・トグル・行クリックの共通経路）
+// カーソルがまだアイコン上にあるときはホバー再アームを保留し、IDT_LIST_WATCH を
+// 保留解除の監視に転用する。（閉じた直後の微動で即座に開き直るのを防ぐ。
+// アイコンから離れたら監視側が保留を解除してタイマーを止める）
+// SetTimer は既存タイマーの張り直しとして常に呼ぶ。（失敗すると保留が解除不能になるため、
+// 失敗時は保留しない）
+static void hideListPopup(HWND trayWnd) {
+    if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
+    g_popupShowing.store(false);
+    g_listHotRow = -1;
+    // ホバー起点の記録を破棄する。（クリック猶予は表示中の一覧にだけ効かせる。
+    // 残すと右クリックメニュー表示中など後続の g_popupShowing = true で猶予が誤発動する）
+    g_hoverShownAt = 0;
 
     POINT pt;
     GetCursorPos(&pt);
-    forceForeground(hWnd);
-    // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
-    // を発火してしまい、抑制トグル用の WM_MENURBUTTONUP が届かなくなる）
-    auto pos = computeTrayPopupPos(pt);
-    TrackPopupMenu(hMenu, TPM_LEFTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
-    DestroyMenu(hMenu);
+    RECT icon;
+    if (getTrayIconRect(trayWnd, icon) && PtInRect(&icon, pt)) {
+        g_hoverRearmPending =
+            SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr) != 0;
+    }
+    else {
+        g_hoverRearmPending = false;
+        KillTimer(trayWnd, IDT_LIST_WATCH);
+    }
+    // バッジ（以降予定の有無）を最新化する
+    updateTrayTooltip(trayWnd);
 }
 
 // ==================== 更新チェック ====================
@@ -3438,11 +3852,15 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
     return TRUE;
 }
 
-// トレイアイコン用ウィンドウプロシージャ
-// 右クリックトレイメニューの構築と表示
+// トレイ右クリックメニューの構築と表示
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
-// その場で構築する（チェック状態は呼び出し時の最新値を反映）。
+// その場で構築する。（チェック状態は呼び出し時の最新値を反映）
+// 副作用：一覧ポップアップが出ていれば閉じ、表示中フラグを立てて
+// ツールチップ・バッジ更新を抑止する。メニュー終了時に両方とも戻す。
 static void showTrayContextMenu(HWND hWnd) {
+    // 一覧ポップアップが出ていれば先に閉じる。（メニューと重なるのを防ぎ、メニュー終了時の
+    // g_popupShowing.store(false) が可視の一覧とフラグを食い違わせるのも防ぐ）
+    if (isListPopupVisible()) hideListPopup(hWnd);
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
     POINT pt;
@@ -3489,9 +3907,9 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_showPastEvents ? MF_CHECKED : MF_UNCHECKED),
         IDM_SHOW_PAST, L"過去の予定を表示");
 
-    // ホバーでの予定一覧表示トグル（レジストリ永続化、デフォルト ON）
+    // ホバーで一覧を自動表示するトグル（レジストリ永続化、デフォルト ON。OFF でも左クリックでは開ける）
     AppendMenuW(hMenu, MF_STRING | (g_hoverPopupEnabled ? MF_CHECKED : MF_UNCHECKED),
-        IDM_HOVER_POPUP, L"ホバーで予定一覧を表示");
+        IDM_HOVER_POPUP, L"マウスホバーで一覧を自動表示");
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
@@ -3529,20 +3947,17 @@ static void launchInteractiveAuth() {
 // トレイアイコンホバー時の予定一覧表示
 //
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// ホバー無効・未認証・既に表示中は無反応。発火時点でカーソルがアイコン矩形内に
-// 留まっているかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
+// ホバー無効・未認証・表示中・再アーム保留中（明示クローズ後、カーソルがアイコンを
+// 離れるまで）は無反応。発火時点でカーソルがアイコン矩形内に留まっているかを再確認して
+// から表示する。（遅延中の離脱で発火した空タイマー対策）
 //
-// 自動クローズ：表示中は IDT_HOVER_AUTOCLOSE を回し、カーソルがアイコン矩形・メニュー矩形の
-// いずれの内側にも無い状態が HOVER_AUTOCLOSE_TICKS 連続で観測されたら EndMenu で閉じる。
-// TrackPopupMenu のモーダルループ中も WM_TIMER は WndProc に配送されるため成立する。
-//
-// フォーカス復元：ホバー表示はキーボードフォーカスを奪うため、自動クローズで閉じた場合のみ
-// 表示直前のフォアグラウンドウィンドウへ復元する。項目クリックや Esc・外側クリックで
-// 閉じた場合はユーザの明示操作なので復元しない。
+// 一覧は非アクティブウィンドウのためフォーカスを奪わず、復元処理も要らない。
+// 表示中の自動クローズは IDT_LIST_WATCH が担う。
 static void handleTrayHover(HWND hWnd) {
     if (!g_hoverPopupEnabled.load()) return;
     if (g_authRequired.load())       return;
     if (g_popupShowing.load())       return;
+    if (g_hoverRearmPending)         return;
 
     RECT icon;
     if (!getTrayIconRect(hWnd, icon)) return;
@@ -3550,54 +3965,39 @@ static void handleTrayHover(HWND hWnd) {
     GetCursorPos(&pt);
     if (!PtInRect(&icon, pt)) return;
 
-    // forceForeground で自プロセスへ移る前のフォアグラウンドを記憶する
-    HWND prev = GetForegroundWindow();
-    if (prev == hWnd) prev = nullptr;
-
-    g_hoverPrevForeground = prev;
-    g_hoverAutoclosed     = false;
-    g_hoverOutsideTicks   = 0;
-    g_hoverMode           = true;
-
-    g_popupShowing.store(true);
-    clearTrayTooltip(hWnd);
-
-    // 自動クローズ用ポーリングはモーダルループ突入前に開始する
-    SetTimer(hWnd, IDT_HOVER_AUTOCLOSE, HOVER_AUTOCLOSE_POLL_MS, nullptr);
-    showSchedulePopup(hWnd);
-    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
-
-    bool autoclosed = g_hoverAutoclosed;
-    HWND restoreTo  = g_hoverPrevForeground;
-    g_hoverMode           = false;
-    g_hoverAutoclosed     = false;
-    g_hoverPrevForeground = nullptr;
-    g_hoverOutsideTicks   = 0;
-
-    g_popupShowing.store(false);
-
-    // 破棄済みウィンドウへの復元を避ける防御チェック
-    if (autoclosed && restoreTo && IsWindow(restoreTo))
-        SetForegroundWindow(restoreTo);
-
-    updateTrayTooltip(hWnd);
+    showListPopup(hWnd);
+    // ホバー起点の時刻を記録する。（左クリックの「閉じる」猶予判定用）
+    // 表示が成立したときだけ記録し、不変条件「非 0 はホバー起点の一覧が表示中のときだけ」を
+    // 保つ。（クローズ側の hideListPopup が 0 に戻す）
+    if (g_popupShowing.load()) g_hoverShownAt = GetTickCount64();
 }
 
 // トレイアイコン左クリック時の処理
-// 未認証時は対話的認証フローを起動、それ以外は予定一覧ポップアップを表示する。
-// 表示中（ホバー起点を含む）の再入は無視する。
+// 一覧ポップアップのトグル：表示中なら閉じ、非表示なら遅延なしで即表示する。
+// ただしホバー自動表示から hover_click_guard_ms（0 で無効）以内の左クリックは無視する。
+// （一覧を出すつもりのクリックの直前にホバー表示が割り込むと、クリックが「閉じる」に
+// 化けて「クリックしたのに何も出ない」体験になるため。左クリックで表示した場合は
+// 意図が明確なので猶予を設けず、次の左クリックで直ちに閉じる。右クリックメニューは対象外）
+// ポップアップは非アクティブでマウスキャプチャも取らないため、アイコンのクリックは
+// 表示中でも通常どおりここへ届く。
+// 未認証時は一覧を出さず、対話的認証フローを起動する。
 static void handleTrayLeftClick(HWND hWnd) {
-    if (g_popupShowing.load()) return;  // ホバーで既に表示中なら二重起動しない
+    if (g_popupShowing.load()) {
+        DWORD guard = g_hoverClickGuardMs.load();
+        if (g_hoverShownAt != 0 && guard != 0 &&
+            GetTickCount64() - g_hoverShownAt < guard) {
+            return;
+        }
+        hideListPopup(hWnd);
+        return;
+    }
     // 未認証時はメニューを挟まず即フロー起動。tooltip で事前にユーザに告知済み
     if (g_authRequired.load()) {
         launchInteractiveAuth();
         return;
     }
-    g_popupShowing.store(true);
-    clearTrayTooltip(hWnd);
-    showSchedulePopup(hWnd);
-    g_popupShowing.store(false);
-    updateTrayTooltip(hWnd);
+    showListPopup(hWnd);
+    g_hoverShownAt = 0;  // 左クリック起点は猶予なし（次の左クリックで直ちに閉じる）
 }
 
 // 当日ログファイルのパスを取得し、存在しなければ logs フォルダのパスを返す
@@ -3617,7 +4017,8 @@ static std::wstring getCurrentLogTarget() {
 }
 
 // WM_COMMAND ディスパッチ
-// メニュー選択（IDM_*）と予定一覧クリック（IDM_EVENT_BASE 以降）を処理する。
+// 右クリックメニューの選択（IDM_*）を処理する。
+// 一覧ポップアップのフッター・0 件行のクリックも、当日ページを開くためにここを共用する。
 static void handleTrayCommand(UINT id) {
     if (id == IDM_EXIT) {
         g_shutdownRequested = true;
@@ -3680,119 +4081,15 @@ static void handleTrayCommand(UINT id) {
             ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
-    if (id >= IDM_EVENT_BASE && id < IDM_EVENT_MAX) {
-        UINT idx = id - IDM_EVENT_BASE;
-        if (idx < g_scheduleItems.size() && isHttpUrl(g_scheduleItems[idx].permalink)) {
-            ShellExecuteW(nullptr, L"open", g_scheduleItems[idx].permalink.c_str(),
-                          nullptr, nullptr, SW_SHOWNORMAL);
-        }
-    }
 }
 
-// 左クリックポップアップの owner-draw 項目サイズ計算
-// 戻り値：TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
-static BOOL measureScheduleMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    if (mis->CtlType != ODT_MENU) return FALSE;
-    UINT eidx = static_cast<UINT>(mis->itemData);
-    if (eidx >= g_scheduleItems.size()) return FALSE;
-    const auto& item = g_scheduleItems[eidx];
-    HDC   hdc = GetDC(hWnd);
-    // 描画時と同じフォントで計測する（次の予定は太字で幅が広がるため、不一致だと末尾が欠ける）
-    HFONT old = static_cast<HFONT>(SelectObject(hdc,
-        item.next ? g_hMenuFontBold : g_hMenuFont));
-    SIZE  sz  = {};
-    GetTextExtentPoint32W(hdc, item.label.c_str(),
-        static_cast<int>(item.label.size()), &sz);
-    SelectObject(hdc, old);
-    ReleaseDC(hWnd, hdc);
-    // 左右パディングとして 16 px ずつ確保する
-    mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
-    mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
-    return TRUE;
-}
+// 予定項目の通知抑制をトグルする（一覧ポップアップ上の行右クリック）
+// g_mutedEvents と item.muted をトグルし、当該行だけを再描画する。
+// （取消線の描画自体は drawScheduleRow が muted を参照して行う）
+static void toggleScheduleItemMute(size_t itemIndex) {
+    if (itemIndex >= g_scheduleItems.size()) return;
 
-// 左クリックポップアップの owner-draw 項目描画
-// ODS_SELECTED に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は非選択時に
-// グレー文字、soon フラグが立つ項目は非選択時に赤文字で描画する。next フラグが立つ項目は
-// 選択・抑制状態にかかわらず太字で描画する。muted フラグが立つ項目には DrawTextW 後に
-// 2 px の取消線を手動で重ね描画する。（取消線の色は文字色に追従する）
-static BOOL drawScheduleMenuItem(DRAWITEMSTRUCT* dis) {
-    if (dis->CtlType != ODT_MENU) return FALSE;
-    UINT eidx = static_cast<UINT>(dis->itemData);
-    if (eidx >= g_scheduleItems.size()) return FALSE;
-    const auto& item     = g_scheduleItems[eidx];
-    bool        selected = (dis->itemState & ODS_SELECTED) != 0;
-
-    FillRect(dis->hDC, &dis->rcItem,
-        reinterpret_cast<HBRUSH>(
-            static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
-
-    RECT textRect  = dis->rcItem;
-    textRect.left += 16;
-    SetBkMode(dis->hDC, TRANSPARENT);
-    // 過去予定は非選択時のみグレー化する。（選択中はハイライト背景での視認性を優先）
-    // グレーは COLOR_GRAYTEXT のままでは濃いため、メニュー背景色を 1/3 混ぜて一段薄くする。
-    // 固定 RGB でなくシステム配色から導出するので、ハイコントラスト等の配色変更にも追従する。
-    // （GetSysColor はライト・ダークモード切替には追従せず、常にライト系の値を返す）
-    COLORREF textColor;
-    if (selected) {
-        textColor = GetSysColor(COLOR_HIGHLIGHTTEXT);
-    }
-    else if (item.past) {
-        COLORREF fg = GetSysColor(COLOR_GRAYTEXT);
-        COLORREF bg = GetSysColor(COLOR_MENU);
-        textColor = RGB((GetRValue(fg) * 2 + GetRValue(bg)) / 3,
-                        (GetGValue(fg) * 2 + GetGValue(bg)) / 3,
-                        (GetBValue(fg) * 2 + GetBValue(bg)) / 3);
-    }
-    else if (item.soon) {
-        // 開始まで urgent_minutes 分未満の切迫予定はやや暗い赤で強調する。
-        // 赤に相当するシステム色はないため固定 RGB とする。（純赤はライト背景で眩しい）
-        textColor = RGB(200, 0, 0);
-    }
-    else {
-        textColor = GetSysColor(COLOR_MENUTEXT);
-    }
-    SetTextColor(dis->hDC, textColor);
-    // 次の予定は太字で強調する（選択中・抑制中でも維持）
-    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC,
-        item.next ? g_hMenuFontBold : g_hMenuFont));
-    DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-    if (item.muted) {
-        SIZE sz = {};
-        GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
-            static_cast<int>(item.label.size()), &sz);
-        constexpr int STRIKE_THICKNESS = 2;
-        // 中央から 1 px だけ下寄せにして視認性を上げる
-        constexpr int STRIKE_Y_OFFSET  = 1;
-        // テキスト左端より 3 px、右端より 4 px 外側まで線を伸ばす
-        constexpr int STRIKE_MARGIN_LEFT  = 3;
-        constexpr int STRIKE_MARGIN_RIGHT = 4;
-        int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
-        RECT strikeRect = {
-            textRect.left - STRIKE_MARGIN_LEFT,
-            lineY - STRIKE_THICKNESS / 2,
-            textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
-            lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
-        };
-        HBRUSH hLineBrush = CreateSolidBrush(textColor);
-        FillRect(dis->hDC, &strikeRect, hLineBrush);
-        DeleteObject(hLineBrush);
-    }
-    SelectObject(dis->hDC, oldFont);
-    return TRUE;
-}
-
-// 予定項目の通知抑制をトグルする（左クリックポップアップ上の右クリック）
-// g_mutedEvents と item.muted をトグルし、自スレッド所有のメニューウィンドウを再描画する。
-static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
-    UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
-    if (id < IDM_EVENT_BASE || id >= IDM_EVENT_MAX) return;
-    UINT eidx = id - IDM_EVENT_BASE;
-    if (eidx >= g_scheduleItems.size()) return;
-
-    auto& item = g_scheduleItems[eidx];
+    auto& item = g_scheduleItems[itemIndex];
     bool nowMuted;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -3807,17 +4104,18 @@ static void toggleScheduleItemMute(UINT itemIdx, HMENU hm) {
         }
     }
     item.muted = nowMuted;
-    // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
-    // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-        wchar_t className[16] = {};
-        if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
-            && wcscmp(className, L"#32768") == 0) {
-            InvalidateRect(hwnd, nullptr, TRUE);
-            UpdateWindow(hwnd);
+    // 当該行だけを再描画する。（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
+    // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）
+    if (g_listWnd) {
+        for (const auto& row : g_listLayout) {
+            if (row.kind == ListRowKind::Event && row.index == itemIndex) {
+                RECT rc = listRowRect(g_listWnd, row);
+                InvalidateRect(g_listWnd, &rc, FALSE);
+                UpdateWindow(g_listWnd);
+                break;
+            }
         }
-        return TRUE;
-    }, 0);
+    }
     saveMutedEvents(g_exeDir);
     // 通知スレッドを直接起こして抑制状態を即時反映する（ポーリング成功を待たない）
     {
@@ -3845,7 +4143,10 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load()) {
+            // トグル OFF・未認証・表示中・再アーム保留中（明示クローズ後、アイコン離脱まで）は
+            // アームしない
+            if (g_hoverPopupEnabled.load() && !g_authRequired.load() && !g_popupShowing.load()
+                && !g_hoverRearmPending) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -3876,21 +4177,34 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         handleTrayHover(hWnd);
         return 0;
     }
-    if (msg == WM_TIMER && wParam == IDT_HOVER_AUTOCLOSE) {
-        // ホバー起点の表示のみが対象。クリック起点やコンテキストメニュー表示中は何もしない
-        if (!g_hoverMode) return 0;
+    if (msg == WM_TIMER && wParam == IDT_LIST_WATCH) {
         POINT pt;
         GetCursorPos(&pt);
-        RECT icon = {};
-        bool inIcon = getTrayIconRect(hWnd, icon) && PtInRect(&icon, pt);
-        bool inMenu = isCursorOverAnyMenuWindow(pt);
-        if (inIcon || inMenu) {
-            g_hoverOutsideTicks = 0;
+        if (isListPopupVisible()) {
+            // 表示中：アイコンとポップアップの両方から離れた状態が連続したら閉じる。
+            // アイコン矩形の取得失敗（過渡状態）は場外と数えず今回の判定を見送る。
+            // getTrayIconRect の契約どおり保守的＝閉じない側に倒し、次の tick で再判定する
+            RECT icon = {};
+            if (!getTrayIconRect(hWnd, icon)) return 0;
+            RECT wnd = {};
+            GetWindowRect(g_listWnd, &wnd);
+            if (PtInRect(&icon, pt) || PtInRect(&wnd, pt)) {
+                g_listOutsideTicks = 0;
+            }
+            else if (++g_listOutsideTicks >= LIST_LEAVE_TICKS) {
+                hideListPopup(hWnd);
+            }
         }
-        else if (++g_hoverOutsideTicks >= HOVER_AUTOCLOSE_TICKS) {
-            // フォアグラウンド復元の判定に使うため、EndMenu の前にフラグを立てる
-            g_hoverAutoclosed = true;
-            EndMenu();
+        else if (g_hoverRearmPending) {
+            // 明示クローズ後の再アーム保留：カーソルがアイコンから離れたら解除して止める
+            RECT icon = {};
+            if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
+                g_hoverRearmPending = false;
+                KillTimer(hWnd, IDT_LIST_WATCH);
+            }
+        }
+        else {
+            KillTimer(hWnd, IDT_LIST_WATCH);  // 非表示かつ保留なしの迷子タイマーは止める
         }
         return 0;
     }
@@ -3902,19 +4216,11 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (mis->CtlType == ODT_MENU && mis->itemID == IDM_OPEN_GITHUB)
             return measureVersionMenuItem(hWnd, mis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
-        if (measureScheduleMenuItem(hWnd, mis)) return TRUE;
     }
     if (msg == WM_DRAWITEM) {
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (dis->CtlType == ODT_MENU && dis->itemID == IDM_OPEN_GITHUB)
             return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
-        if (drawScheduleMenuItem(dis)) return TRUE;
-    }
-    // 左クリックポップアップ上の右クリック：通知抑制をトグルする
-    // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く（選択は発生しない）。
-    if (msg == WM_MENURBUTTONUP) {
-        toggleScheduleItemMute(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
-        return 0;
     }
     if (msg == WM_DESTROY) {
         PostQuitMessage(0);
@@ -4793,8 +5099,9 @@ int wmain() {
         g_showPastEvents    = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
         g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
 
-        // toml のホバー遅延を確定（0〜5000 にクランプ済みの値）
+        // toml のホバー遅延・クリック猶予を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
+        g_hoverClickGuardMs.store(static_cast<DWORD>(cfg.hoverClickGuardMs));
 
         writeLog("started");
         logSchedule(cfg.schedule);
@@ -4815,7 +5122,7 @@ int wmain() {
         // 通知抑制リストを復元（過去分のエントリは自動プルーニング）
         loadMutedEvents(exeDir);
 
-        // メニュー描画用フォントを初期化（以降、WM_MEASUREITEM / WM_DRAWITEM で使用する）
+        // 描画用フォントを初期化（以降、一覧ポップアップの描画と更新通知項目のオーナードローで使用する）
         initMenuFonts();
 
         // キャッシュからイベントデータを復元（起動直後のポーリング失敗に備える）
