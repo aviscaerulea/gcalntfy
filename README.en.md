@@ -45,10 +45,10 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 
 | Timing | Toast notification | Sound notification | Condition |
 |---|:---:|:---:|---|
-| `notify_minutes` before (default 5 minutes) | Yes | Yes | Always notified (baseline) |
-| At the timing configured in the event's reminders | Yes | Yes | Only when the event has a popup reminder configured |
-| On detecting an event's date/time change, cancellation, or new addition | Yes | No | When a difference from the previous poll is detected (changes affecting only events more than one hour past their start time are generally not notified) |
-| After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the count of today's remaining events on success, or the failure reason on failure) |
+| Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
+| At the notification time set in Google Calendar | Yes | Yes | Only when the event has a popup notification set |
+| When a change, cancellation, or addition is found | Yes | No | When the content differs from the previous check (changes affecting only events more than one hour past their start time are not notified) |
+| After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
 
 Example notification when an event cancellation is detected:
 
