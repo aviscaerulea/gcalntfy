@@ -1,60 +1,61 @@
-@README.md
-
 ## 開発環境
 
-Visual Studio 2022 または Build Tools（C++20、MSVC）が必要。
+- Visual Studio 2022 または Build Tools（C++20、MSVC）
+- vcpkg（`VCPKG_INSTALLATION_ROOT` 環境変数、または PATH 上で解決する。libebur128 はビルド時に自動導入）
+- Task、PowerShell 7（`pwsh`）
+- `rm`、`cp`、`mkdir` を含む coreutils（Git Bash 等。Taskfile が使用する）
+
+## ビルド方法
 
 ```shell
 task build    # ビルド（out/gcalntfy.exe）
 task release  # リリースビルド + zip 作成
 ```
 
-ビルド前に `.env` を作成して GCP の OAuth クライアント情報を設定すること。
-
-## .env の設定
+ビルド前に `.env` を作成する。次に GCP の OAuth クライアント情報を設定する。
 
 ```
 GOOGLE_CLIENT_ID=xxxxxxxxxxxx.apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxx
 ```
 
-## 参考
-
-<!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
 
-**IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
-the codebase.** The graph is faster, cheaper (fewer tokens), and gives
-you structural context (callers, dependents, test coverage) that file
-scanning cannot.
+This project has a knowledge graph over its C/C++ and PowerShell sources
+(`src/`, `build.ps1`). When exploring those sources, use the code-review-graph
+MCP tools before Grep/Glob/Read: the graph is cheaper in tokens and gives
+structural context (callers, dependents) that file scanning cannot.
 
-### When to use graph tools FIRST
+The graph does not cover Markdown, TOML, or build and CI definitions
+(`Taskfile.yml`, GitHub Actions). Use Grep/Glob/Read for those, and for anything
+the graph turns out to miss.
 
-- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
-- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
-- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
-- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
-- **Architecture questions**: `get_architecture_overview` + `list_communities`
-
-Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
-
-### Key Tools
+### Key tools
 
 | Tool | Use when |
 |------|----------|
-| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
-| `get_review_context` | Need source snippets for review — token-efficient |
-| `get_impact_radius` | Understanding blast radius of a change |
-| `get_affected_flows` | Finding which execution paths are impacted |
-| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
-| `semantic_search_nodes` | Finding functions/classes by name or keyword |
-| `get_architecture_overview` | Understanding high-level codebase structure |
-| `refactor_tool` | Planning renames, finding dead code |
+| `mcp__code-review-graph__detect_changes_tool` | Reviewing code changes — gives risk-scored analysis |
+| `mcp__code-review-graph__get_review_context_tool` | Need source snippets for review — token-efficient |
+| `mcp__code-review-graph__get_impact_radius_tool` | Understanding blast radius of a change |
+| `mcp__code-review-graph__get_affected_flows_tool` | Finding which execution paths are impacted |
+| `mcp__code-review-graph__query_graph_tool` | Tracing callers, callees, imports, dependencies |
+| `mcp__code-review-graph__semantic_search_nodes_tool` | Finding functions by name or keyword |
+| `mcp__code-review-graph__get_architecture_overview_tool` | Understanding high-level codebase structure |
+| `mcp__code-review-graph__refactor_tool` | Planning renames, finding dead code |
+
+Embeddings are not generated for this project, so `semantic_search_nodes_tool`
+matches on names and keywords rather than meaning.
 
 ### Workflow
 
-1. The graph auto-updates on file changes (via hooks).
-2. Use `detect_changes` for code review.
-3. Use `get_affected_flows` to understand impact.
-4. Use `query_graph` pattern="tests_for" to check coverage.
+The PostToolUse hook runs `code-review-graph update --skip-flows` on file
+changes. Nodes and edges stay current; flow and community data do not. Refresh
+them with `code-review-graph update` (without the flag) before relying on
+`get_affected_flows_tool` or `get_architecture_overview_tool`.
+
+1. Review code changes with `detect_changes_tool`.
+2. Refresh flows, then understand impact with `get_affected_flows_tool`.
+
+## 参考
+
+@README.md
