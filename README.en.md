@@ -19,6 +19,7 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
   - Past events: display can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
+  - Notification muting: right-clicking an event excludes it from notifications
 - Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
@@ -27,7 +28,7 @@ The tray icon shows a badge in the bottom-right corner when there are events yet
 
 The event list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
 
-Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event stops its notifications.
+Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page, and right-clicking an event excludes it from notifications.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
@@ -57,18 +58,6 @@ Example notification when an event cancellation is found:
 Example notification when "Refresh now" succeeds:
 
 ![Windows notification shown when "Refresh now" succeeds](docs/images/update-toast.png)
-
-### Notification muting
-
-Right-click an event in the event list to stop its notifications. Right-click again to turn them back on.
-
-| Item | Behavior |
-|---|---|
-| What is stopped | Only the event you right-clicked (for repeating events, only that day's occurrence) |
-| Notifications stopped | Those before an event starts and at the notification time set in Google Calendar |
-| Notifications not stopped | Those for a change, cancellation, or addition (always delivered, since they matter) |
-| Saving the setting | Kept after you quit the app (entries for past days are removed on the next launch) |
-| Appearance | Events with notifications stopped are shown with strikethrough text |
 
 ### Whether sound notifications play
 
