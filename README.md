@@ -2,7 +2,6 @@
 
 [![日本語](https://img.shields.io/badge/lang-日本語-red)](README.md)
 [![English](https://img.shields.io/badge/lang-English-blue)](README.en.md)
-
 [![Release](https://img.shields.io/github/v/release/aviscaerulea/gcalntfy)](https://github.com/aviscaerulea/gcalntfy/releases/latest)
 [![License](https://img.shields.io/github/license/aviscaerulea/gcalntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml)
@@ -42,7 +41,7 @@ Google Calendar の予定の開始前や変更を Windows 通知で知らせる�
 
 当日の開始時刻を過ぎた予定は、終日予定を除いて予定一覧にグレー表示で残り、クリックで予定ページを開けます。バッジとフッターの件数は今後の予定のみを数えます。
 
-トレイメニューの「過去の予定を表示」で、デフォルト ON の過去分表示を ON/OFF に切り替えられます。設定は再起動後も維持され、OFF にしても予定の取得・通知には影響せず一覧の表示のみが変わります。
+トレイメニューの「過去の予定を表示」で、デフォルト ON の過去分表示を ON/OFF に切り替えられます。設定は再起動後も残ります。OFF にしても予定の取得・通知には影響せず、一覧の表示のみが変わります。
 
 ### タスクの通知対応
 
@@ -67,7 +66,7 @@ Calendar UI の「集中タイム（サイレント モード）」予定はタ�
 
 ### 通知抑制
 
-トレイアイコン左クリックで表示される予定一覧で、予定項目を右クリックすると通知抑制をトグルできます。
+予定一覧で予定項目を右クリックすると、通知抑制をトグルできます。
 
 | 項目 | 仕様 |
 |---|---|
@@ -95,7 +94,7 @@ Calendar UI の「集中タイム（サイレント モード）」予定はタ�
 
 ### 手順
 
-任意フォルダで zip を展開して `gcalntfy.exe` を実行してください。
+任意フォルダで zip を展開してください。次に `gcalntfy.exe` を実行してください。
 
 または、[Scoop](https://scoop.sh/) でインストールできます。
 
@@ -112,13 +111,13 @@ gcalntfy
 
 起動するとシステムトレイに常駐し、設定に従って Google Calendar をポーリングして予定を通知します。
 
-初回起動時はアクセストークンがないため、Toast 通知でブラウザが開きます。Google アカウントで「許可」をクリックすると認証が完了し、リフレッシュトークンがレジストリ（`HKCU\SOFTWARE\gcalntfy`）に保存されます。以降の起動では再認証は不要です。
+初回起動時はアクセストークンがないため、Toast 通知でブラウザが開きます。Google アカウントで「許可」をクリックすると認証が完了し、リフレッシュトークンをレジストリ（`HKCU\SOFTWARE\gcalntfy`）に保存します。以降の起動では再認証は不要です。
 
 ## 設定
 
 `gcalntfy.toml` を exe と同フォルダに配置してください。`gcalntfy.local.toml` を併置すると、そちらの記述をキー単位で優先適用します。（変更の反映はアプリ再起動時）
 
-通知音を鳴らす場合は `sound.wav`（16bit PCM WAV）も exe と同フォルダに配置してください。
+通知音を鳴らすには `sound.wav`（16bit PCM WAV）も exe と同フォルダに配置してください。
 
 ```toml
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
@@ -161,6 +160,6 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 task build
 ```
 
-Visual Studio 2022 または Build Tools（C++20、MSVC）が必要です。成果物は `out/gcalntfy.exe` に生成されます。
+Visual Studio 2022 または Build Tools（C++20、MSVC）が必要です。成果物は `out/gcalntfy.exe` に生成します。
 
-ビルド前に `.env` を作成して `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定してください。
+ビルド前に `.env` を作成してください。次に `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定してください。

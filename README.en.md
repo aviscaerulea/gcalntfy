@@ -2,7 +2,6 @@
 
 [![日本語](https://img.shields.io/badge/lang-日本語-red)](README.md)
 [![English](https://img.shields.io/badge/lang-English-blue)](README.en.md)
-
 [![Release](https://img.shields.io/github/v/release/aviscaerulea/gcalntfy)](https://github.com/aviscaerulea/gcalntfy/releases/latest)
 [![License](https://img.shields.io/github/license/aviscaerulea/gcalntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/gcalntfy/actions/workflows/release.yml)
@@ -67,7 +66,7 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 
 ### Notification muting
 
-Right-click an event in the event list (shown via left-click on the tray icon) to toggle notification muting.
+Right-click an event in the event list to toggle notification muting.
 
 | Item | Behavior |
 |---|---|
