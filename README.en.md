@@ -92,47 +92,17 @@ scoop install gcalntfy
 gcalntfy
 ```
 
-On launch, the app resides in the system tray and polls Google Calendar according to your configuration to notify you of events.
+On launch, the app resides in the system tray, checks Google Calendar regularly, and notifies you of your events.
 
-On first launch, since there is no access token yet, a Windows notification opens your browser. Clicking "Allow" with your Google account completes authentication, and the refresh token is saved to the registry (`HKCU\SOFTWARE\gcalntfy`). No re-authentication is needed on subsequent launches.
+Only the first launch requires linking your Google account. A Windows notification opens your browser, where you click "Allow".
 
 ## Configuration
 
-Place `gcalntfy.toml` in the same folder as the executable. If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. (Changes take effect after restarting the app.)
+Place `gcalntfy.toml` in the same folder as the executable. The available settings and their meanings are documented in the comments of that file. (Changes take effect after restarting the app.)
+
+If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. Keeping only the settings you want to change there means you do not have to migrate them when a new version replaces `gcalntfy.toml`.
 
 To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the same folder as the executable.
-
-```toml
-# Polls per hour for each time slot (24 entries for 0:00-23:00, minimum 1)
-schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
-# Minutes before an event to notify (0-30, default 5)
-# notify_minutes = 5
-# Threshold in minutes for showing events in red in the event list (default 60, 0 to disable)
-# urgent_minutes = 60
-# Delay in ms before the event list opens on hover (0-5000, default 100, 0 for immediate)
-# hover_delay_ms = 100
-# Grace period in ms after a hover-triggered display during which clicks are ignored (0-5000, default 300, 0 to disable)
-# hover_click_guard_ms = 300
-# Process names to mute while the notification sound plays and restore afterward (empty array to disable)
-# duck_targets = ["chrome.exe", "msedge.exe"]
-# Additional calendar IDs to poll (primary is always enabled)
-# You can find a calendar ID under Google Calendar "Settings" -> "Integrate calendar"
-# ext_calendar_ids = ["abc123@group.calendar.google.com"]
-
-# Guard tone settings (BLE headphone workaround)
-[guard]
-# tone_ms = 1500           # Guard tone length (ms, applies to both start and end, 0 to disable, default: 1500)
-
-# Loudness normalization settings
-[loudness]
-# enabled = true           # Enable/disable (default: true)
-# target = -16.0           # Target loudness LUFS (default: -16.0)
-# peak_ceiling = 0.891     # True peak ceiling (default: 0.891 = -1 dBFS)
-
-# Update check settings
-[update]
-# enabled = true           # Enable/disable the startup GitHub update check (default: true)
-```
 
 ## Limitations
 
