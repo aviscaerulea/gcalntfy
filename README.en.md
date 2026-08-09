@@ -15,10 +15,9 @@ Measured physical memory usage is under 10 MB. (May vary depending on the enviro
 ## Features
 
 - Event notifications: polls Google Calendar and notifies you before events start or when they change, via toast notification and sound
-- Per-time-slot polling frequency: set the polling frequency for each time slot of the day
-- System tray: check the event list and access various settings from the tray icon
+- System tray: view the event list and change settings from the tray icon
 - Past event display: today's past events remain in the event list in gray, and the display can be toggled on or off from the tray menu
-- Multiple calendar support: external calendars can also be polled
+- Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
 
@@ -129,6 +128,7 @@ Place `gcalntfy.toml` in the same folder as the executable. If you also place `g
 To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the same folder as the executable.
 
 ```toml
+# Polls per hour for each time slot (24 entries for 0:00-23:00, minimum 1)
 schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1, 1]
 # Minutes before an event to notify (0-30, default 5)
 # notify_minutes = 5
@@ -138,7 +138,7 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 1,
 # hover_delay_ms = 100
 # Grace period in ms after a hover-triggered display during which clicks are ignored (0-5000, default 300, 0 to disable)
 # hover_click_guard_ms = 300
-# Process names to mute while the notification sound plays (empty array to disable)
+# Process names to mute while the notification sound plays and restore afterward (empty array to disable)
 # duck_targets = ["chrome.exe", "msedge.exe"]
 # Additional calendar IDs to poll (primary is always enabled)
 # You can find a calendar ID under Google Calendar "Settings" -> "Integrate calendar"
