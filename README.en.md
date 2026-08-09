@@ -21,7 +21,7 @@ Measured physical memory usage is about 10 MB or less.
   - Past events: display can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
-  - Stopping notifications: right-clicking an event stops notifications for it
+  - Notification suppression (stopping notifications): right-clicking an event stops notifications for it and shows it with a strikethrough
 - Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
