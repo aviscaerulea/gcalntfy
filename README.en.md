@@ -16,39 +16,31 @@ A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you 
 
 ## Features
 
-- Event notifications: polls Google Calendar and notifies you before events start or when they change, via Windows notification and sound
+- Event notifications: polls Google Calendar and notifies you via Windows notification before events start or when they change (notifications before an event also play a sound)
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
   - Notification suppression (stopping notifications): right-clicking an event stops notifications for it and shows it with a strikethrough
+  - Hover display: hovering the cursor over the tray icon opens the event list automatically
+  - Auto start: launching at Windows logon can be toggled on or off
 - Multiple calendar support: handles events from external calendars alongside your main calendar
 
 ### System tray
 
-The tray icon shows a badge in the bottom-right corner when there are events yet to start.
+The tray icon shows a badge in the bottom-right corner when there are events yet to start today.
 
-Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens today's Google Calendar page.
+Each item in the event list shows the time remaining until the event starts, in the form "(n hours n minutes from now)". Under an hour it is shortened to "(n minutes from now)", and on the exact hour to "(n hours from now)". Events starting soon are shown in red, and the next event is shown in bold. Clicking the footer opens the weekly view of Google Calendar.
 
-Right-clicking the tray icon opens the tray menu, which provides various settings.
-
-### Google Tasks notifications (limitations)
-
-| Type | Supported |
-|---|:---:|
-| Time-specified, non-recurring task | Yes |
-| Recurring task | No |
-
-Recurring tasks never appear in the Google Calendar API's event list, so they cannot be handled at the retrieval stage.
-"Focus time (silent mode)" events in the Calendar UI are returned with the same internal type as tasks (focusTime), but are identified and excluded from notification targets.
+Right-clicking the tray icon opens the tray menu, which provides various settings. Toggles in the tray menu are saved to the registry, not written to the configuration file.
 
 ### Notification timing
 
 | Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
 | Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
-| At the notification time set in Google Calendar | Yes | Yes | Only when the event has a popup notification set |
-| When a change, cancellation, or addition is found | Yes | No | When the content differs from the previous check (changes affecting only events more than one hour past their start time are not notified) |
+| At the notification time set in Google Calendar | Yes | Yes | Only when the individual event has a popup notification set (calendar-wide default notifications are not covered) |
+| When a change, cancellation, or addition is found | Yes | No | When an event's start time differs from the previous check, or an event was added or removed (changes affecting only events more than one hour past their start time are not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
 
 Example notification when an event cancellation is found:
@@ -65,7 +57,7 @@ Example notification when "Refresh now" succeeds:
 |---|:---:|
 | A sound file (`sound.wav`) exists next to the executable | Yes |
 | No sound file exists | No |
-| "Sound notification" is set to OFF in the tray menu | No |
+| "Play notification sound" is set to OFF in the tray menu | No |
 | "Disable while mic/camera in use" is ON and the mic/camera is in use | No |
 
 ## Installation
@@ -73,13 +65,18 @@ Example notification when "Refresh now" succeeds:
 ### Requirements
 
 - Windows 10/11
+- Microsoft Visual C++ Redistributable (x64)
 - OAuth 2.0 authentication with a Google account is required on first launch
 
 ### Steps
 
-Extract the zip to any folder and run `gcalntfy.exe`.
+#### From the release ZIP
 
-Or install via [Scoop](https://scoop.sh/):
+Download the zip from the [releases page](https://github.com/aviscaerulea/gcalntfy/releases/latest). Extract it to any folder, then run `gcalntfy.exe`.
+
+#### From Scoop
+
+Install via [Scoop](https://scoop.sh/):
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
@@ -102,4 +99,22 @@ Place `gcalntfy.toml` in the same folder as the executable. The available settin
 
 If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. Keeping only the settings you want to change there means you do not have to migrate them when a new version replaces `gcalntfy.toml`.
 
-To play a notification sound, also place `sound.wav` (16-bit PCM WAV) in the same folder as the executable.
+The notification sound uses the `sound.wav` included in the distribution. To use a different sound, replace that file in the same folder as the executable with a 16-bit PCM WAV.
+
+## Limitations
+
+### Google Tasks notifications
+
+| Type | Supported |
+|---|:---:|
+| Time-specified, non-recurring task | Yes |
+| Recurring task | No |
+
+Recurring tasks never appear in the Google Calendar API's event list, so they cannot be handled at the retrieval stage.
+"Focus time (silent mode)" events in the Calendar UI are returned with the same internal type as tasks (focusTime), but are identified and excluded from notification targets.
+
+### Events not handled
+
+- All-day events: not shown in the event list
+- Events you declined: excluded at the retrieval stage
+- Cancelled events: excluded at the retrieval stage
