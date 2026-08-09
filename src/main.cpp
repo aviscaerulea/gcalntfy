@@ -68,6 +68,7 @@
 #include <thread>
 #include <cstdio>
 #include <cmath>
+#include <limits>
 
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -1707,39 +1708,31 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.extCalendarIds = readExtCalendarIds(local);
     if (cfg.extCalendarIds.empty()) cfg.extCalendarIds = readExtCalendarIds(base);
 
+    // トップレベル整数キー読み込みヘルパー
+    // local 優先、なければ base、いずれも無ければ def を採用し、[lo, hi] にクランプする
+    auto readConfigTopInt = [&](const char* key, long long def, long long lo, long long hi) -> long long {
+        long long v = def;
+        if (local && (*local)[key].is_integer())      v = **(*local)[key].as_integer();
+        else if (base && (*base)[key].is_integer())   v = **(*base)[key].as_integer();
+        return (std::max)(lo, (std::min)(hi, v));
+    };
+
     // notify_minutes（通知リード時間、分単位。デフォルト 5 分、0〜30 にクランプ）
-    long long notifyMin = DEFAULT_NOTIFY_MINUTES;
-    if (local && (*local)["notify_minutes"].is_integer())
-        notifyMin = **(*local)["notify_minutes"].as_integer();
-    else if (base && (*base)["notify_minutes"].is_integer())
-        notifyMin = **(*base)["notify_minutes"].as_integer();
-    notifyMin = (std::max)((long long)MIN_NOTIFY_MINUTES, (std::min)((long long)MAX_NOTIFY_MINUTES, notifyMin));
+    long long notifyMin = readConfigTopInt("notify_minutes",
+        DEFAULT_NOTIFY_MINUTES, MIN_NOTIFY_MINUTES, MAX_NOTIFY_MINUTES);
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
     // urgent_minutes（予定一覧の赤文字閾値、分単位。デフォルト 60、0 で無効、負値は 0 にクランプ）
-    long long urgentMin = DEFAULT_URGENT_MINUTES;
-    if (local && (*local)["urgent_minutes"].is_integer())
-        urgentMin = **(*local)["urgent_minutes"].as_integer();
-    else if (base && (*base)["urgent_minutes"].is_integer())
-        urgentMin = **(*base)["urgent_minutes"].as_integer();
-    cfg.urgentMinutes = static_cast<int>((std::max)(0LL, urgentMin));
+    cfg.urgentMinutes = static_cast<int>(readConfigTopInt("urgent_minutes",
+        DEFAULT_URGENT_MINUTES, 0, (std::numeric_limits<long long>::max)()));
 
     // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 100、0〜5000 にクランプ、0 で即時）
-    long long hoverDelay = DEFAULT_HOVER_DELAY_MS;
-    if (local && (*local)["hover_delay_ms"].is_integer())
-        hoverDelay = **(*local)["hover_delay_ms"].as_integer();
-    else if (base && (*base)["hover_delay_ms"].is_integer())
-        hoverDelay = **(*base)["hover_delay_ms"].as_integer();
-    cfg.hoverDelayMs = (std::max)(MIN_HOVER_DELAY_MS, (std::min)(MAX_HOVER_DELAY_MS, hoverDelay));
+    cfg.hoverDelayMs = readConfigTopInt("hover_delay_ms",
+        DEFAULT_HOVER_DELAY_MS, MIN_HOVER_DELAY_MS, MAX_HOVER_DELAY_MS);
 
     // hover_click_guard_ms（ホバー自動表示直後のクリック猶予、ms 単位。デフォルト 300、0〜5000 にクランプ、0 で無効）
-    long long hoverGuard = DEFAULT_HOVER_CLICK_GUARD_MS;
-    if (local && (*local)["hover_click_guard_ms"].is_integer())
-        hoverGuard = **(*local)["hover_click_guard_ms"].as_integer();
-    else if (base && (*base)["hover_click_guard_ms"].is_integer())
-        hoverGuard = **(*base)["hover_click_guard_ms"].as_integer();
-    cfg.hoverClickGuardMs =
-        (std::max)(MIN_HOVER_CLICK_GUARD_MS, (std::min)(MAX_HOVER_CLICK_GUARD_MS, hoverGuard));
+    cfg.hoverClickGuardMs = readConfigTopInt("hover_click_guard_ms",
+        DEFAULT_HOVER_CLICK_GUARD_MS, MIN_HOVER_CLICK_GUARD_MS, MAX_HOVER_CLICK_GUARD_MS);
 
     // [guard] / [loudness] セクション読み込みヘルパー
     auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
