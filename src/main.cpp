@@ -517,7 +517,11 @@ static std::wstring escapeXml(const std::wstring& s) {
         case L'<':  r += L"&lt;";   break;
         case L'>':  r += L"&gt;";   break;
         case L'"':  r += L"&quot;"; break;
-        default:    r += c;
+        default:
+            // XML 1.0 で禁止される C0 制御文字（TAB=0x09、LF=0x0A、CR=0x0D 以外の 0x00〜0x1F）はスキップする
+            // 素通しすると XmlDocument::LoadXml が例外を投げ、当該予定の Toast 通知が恒久的にスキップされるため
+            if (c < 0x20 && c != L'\t' && c != L'\n' && c != L'\r') break;
+            r += c;
         }
     }
     return r;
