@@ -1407,6 +1407,54 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 
 // ==================== イベントキャッシュ ====================
 
+// JSON 配列ファイルを読み込んで JsonArray を返す
+// 前段の共通処理：CreateFileW → GetFileSize（0 バイトと 1MB 超は不正扱い）→ ReadFile → JsonArray::Parse
+// ファイル未存在は「不在」を示す nullopt。読み込み・パース失敗も nullopt。
+// logTag はエラー出力用の識別子（"cache" / "muted" 等）。
+static std::optional<winrt::Windows::Data::Json::JsonArray>
+readJsonArrayFile(const std::wstring& path, const char* logTag)
+{
+    using namespace winrt::Windows::Data::Json;
+
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return std::nullopt;
+
+    SetLastError(0);
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == INVALID_FILE_SIZE) {
+        DWORD err = GetLastError();
+        CloseHandle(hFile);
+        writeLog(err != NO_ERROR
+            ? std::string(logTag) + ": GetFileSize failed (error " + std::to_string(err) + ")"
+            : std::string(logTag) + ": unexpected file size (4GB+)");
+        return std::nullopt;
+    }
+    if (fileSize == 0 || fileSize > 1024 * 1024) {
+        CloseHandle(hFile);
+        if (fileSize != 0)
+            writeLog(std::string(logTag) + ": unexpected file size (" + std::to_string(fileSize) + ")");
+        return std::nullopt;
+    }
+    std::string buf(fileSize, '\0');
+    DWORD readBytes = 0;
+    BOOL ok = ReadFile(hFile, buf.data(), fileSize, &readBytes, nullptr);
+    CloseHandle(hFile);
+    if (!ok || readBytes != fileSize) {
+        writeLog(std::string(logTag) + ": read failed ("
+            + std::to_string(readBytes) + "/" + std::to_string(fileSize) + " bytes)");
+        return std::nullopt;
+    }
+
+    try {
+        return JsonArray::Parse(winrt::to_hstring(buf));
+    }
+    catch (...) {
+        writeLog(std::string(logTag) + ": parse failed");
+        return std::nullopt;
+    }
+}
+
 // JSON 文字列をアトミックにファイルへ書き出す（"<path>.tmp" 経由で MoveFileEx 置換）
 // 電源断・クラッシュで本体ファイルが壊れる可能性を避ける。
 // logTag はエラー出力用の識別子（"cache" / "muted" 等）。成功時 true、失敗時 false。
@@ -1490,37 +1538,11 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
     auto path = dir + L"\\" + CACHE_FILENAME;
 
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return {};
-
-    SetLastError(0);
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize == INVALID_FILE_SIZE) {
-        DWORD err = GetLastError();
-        CloseHandle(hFile);
-        writeLog(err != NO_ERROR
-            ? "cache: GetFileSize failed (error " + std::to_string(err) + ")"
-            : "cache: unexpected file size (4GB+)");
-        return {};
-    }
-    if (fileSize == 0 || fileSize > 1024 * 1024) {
-        CloseHandle(hFile);
-        if (fileSize != 0) writeLog("cache: unexpected file size (" + std::to_string(fileSize) + ")");
-        return {};
-    }
-    std::string buf(fileSize, '\0');
-    DWORD readBytes = 0;
-    BOOL ok = ReadFile(hFile, buf.data(), fileSize, &readBytes, nullptr);
-    CloseHandle(hFile);
-
-    if (!ok || readBytes != fileSize) {
-        writeLog("cache: read failed (" + std::to_string(readBytes) + "/" + std::to_string(fileSize) + " bytes)");
-        return {};
-    }
+    auto arrOpt = readJsonArrayFile(path, "cache");
+    if (!arrOpt) return {};
+    auto arr = *arrOpt;
 
     try {
-        auto arr = JsonArray::Parse(winrt::to_hstring(buf));
         std::vector<CalendarEvent> events;
         events.reserve(arr.Size());
         for (auto item : arr) {
@@ -1586,29 +1608,16 @@ static void saveMutedEvents(const std::wstring& dir) {
 // 通知抑制リストの読み込み
 // 起動時に呼び出し、当日以降のエントリのみ g_mutedEvents に格納する（過去分を自動プルーニング）。
 // ファイル未存在・パースエラー時は何もしない。
+// 前段の I/O エラーは共通ヘルパが writeLog に記録する。
 static void loadMutedEvents(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
     auto path = dir + L"\\" + MUTED_CACHE_FILENAME;
 
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-
-    SetLastError(0);
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize == INVALID_FILE_SIZE || fileSize == 0 || fileSize > 1024 * 1024) {
-        CloseHandle(hFile);
-        return;
-    }
-    std::string buf(fileSize, '\0');
-    DWORD readBytes = 0;
-    BOOL ok = ReadFile(hFile, buf.data(), fileSize, &readBytes, nullptr);
-    CloseHandle(hFile);
-    if (!ok || readBytes != fileSize) return;
+    auto arrOpt = readJsonArrayFile(path, "muted");
+    if (!arrOpt) return;
+    auto arr = *arrOpt;
 
     try {
-        auto arr = JsonArray::Parse(winrt::to_hstring(buf));
-
         SYSTEMTIME utcNow;
         GetSystemTime(&utcNow);
         auto jstNow = utcToJst(utcNow);
