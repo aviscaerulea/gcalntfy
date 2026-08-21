@@ -932,7 +932,7 @@ static std::string extractQueryValue(const std::string& req, const std::string& 
     return req.substr(pos, end - pos);
 }
 
-// ループバックサーバで認証コードを待ち受ける（120秒タイムアウト）
+// ループバックサーバで認証コードを待ち受ける（120 秒タイムアウト）
 // select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
 // \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
 // expectedState が非空の場合、受信した state と一致しなければ空文字列を返す（CSRF 対策）。
