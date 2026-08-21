@@ -2332,7 +2332,7 @@ cleanup:
 
 // WASAPI バッファに不可聴正弦波を書き込む
 //
-// サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
+// トーン周波数がサンプルレートのナイキスト周波数以上の場合はゼロ埋めにフォールバックする。
 // phase はバッファ分割供給間で位相を維持するための参照引数。
 static void fillToneBuffer(BYTE* buf, UINT32 frames,
                            const WAVEFORMATEX& wavFmt, double& phase) {
