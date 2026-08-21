@@ -15,7 +15,8 @@
  * 依存ライブラリ：本ファイルの #pragma comment(lib, ...) 群と build.ps1 のリンク行を正とする。
  *         一覧をここへ複製すると再び乖離するため、個々のライブラリ名は列挙しない。
  * 外部依存：libebur128（vcpkg: libebur128:x64-windows-static）
- * ビルド：task build（実体は build.ps1）が唯一のビルド経路である。
+ * ビルド：コンパイルとリンクの実体は build.ps1 が単独で担う。task build はその呼び出しと
+ *         アセットコピーを包むラッパであり、CI もタスクランナーを介さず build.ps1 を直接呼ぶ。
  *         build.ps1 が生成ヘッダ（version.rc.h・version.h・oauth.h）の作成と vcpkg 依存の
  *         導入を担うため、cl を直接呼ぶ手順ではビルドを再現できない。
  *         コンパイル・リンクオプションの詳細は build.ps1 を参照する。
