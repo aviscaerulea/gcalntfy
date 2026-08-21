@@ -4,6 +4,7 @@
 param([string]$Version = "0.0.0", [switch]$Release)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+# リリースワークフローはタグ名由来の値を渡すため、先頭の v を落として数値表記へ正規化する
 $Version = $Version -replace '^v', ''
 
 # vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シムの優先順）
@@ -31,6 +32,10 @@ $vcpkgLib     = "$vcpkgRoot\installed\x64-windows-static\lib"
 & "$vcpkgRoot\vcpkg.exe" install libebur128:x64-windows-static
 if ($LASTEXITCODE) { exit 1 }
 
+# VC++ 開発環境の検出と初期化
+# vswhere で Visual Studio / Build Tools のインストール先を特定し、DevShell モジュール経由で
+# 開発シェルへ入る。-products '*' は既定の検索対象に含まれない Build Tools のスタンドアロン
+# 構成を拾うために必要であり、外すと Build Tools のみの環境で検出に失敗する。
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe が見つからない: $vswhere"; exit 1 }
 $vsPath = & $vswhere -products '*' -latest -property installationPath
