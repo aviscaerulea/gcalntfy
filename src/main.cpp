@@ -2875,6 +2875,9 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 }
 
 // トレイアイコンの登録
+//
+// 副作用：ツールチップ定期更新タイマーを開始する。タスクバー再生成時の再呼び出しでは
+// 同じタイマー ID で張り直しになるため、多重登録にはならない。
 static void addTrayIcon(HWND hWnd) {
     g_trayBadgeActive = false;  // バッジ状態をリセットしてアイコン再登録後の差分検出を保証
     auto nid = makeTrayNid(hWnd);
@@ -3091,6 +3094,10 @@ static void updateTrayTooltip(HWND hWnd) {
 }
 
 // トレイアイコンを除去する
+//
+// 副作用：ツールチップ定期更新に加え、ホバー検知と一覧監視のタイマーも停止する。
+// 後 2 者はトレイアイコンとは別サブシステム由来だが、アイコン除去後は発火先を失うため
+// ここでまとめて停止する。
 static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_TOOLTIP_REFRESH);
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
