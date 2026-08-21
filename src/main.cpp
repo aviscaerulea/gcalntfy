@@ -964,17 +964,13 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
-    // 受信エラー応答（UTF-8 で「認証中にエラーが発生しました。再度お試しください。」を埋め込む）
+    // 受信エラー応答
     // ブラウザのタブが永久にローディング状態になるのを防ぐため、不完全リクエスト検知時もレスポンスを返す。
     static const char* RESPONSE_RECV_ERROR =
         "HTTP/1.1 500 Internal Server Error\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
-        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE4\xB8\xAD\xE3\x81\xAB"
-        "\xE3\x82\xA8\xE3\x83\xA9\xE3\x83\xBC\xE3\x81\x8C\xE7\x99\xBA\xE7\x94\x9F"
-        "\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x97\xE3\x81\x9F\xE3\x80\x82"
-        "\xE5\x86\x8D\xE5\xBA\xA6\xE3\x81\x8A\xE8\xA9\xA6\xE3\x81\x97\xE3\x81\x8F"
-        "\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p></body></html>";
+        "<html><body><p>認証中にエラーが発生しました。再度お試しください。</p></body></html>";
 
     std::string req;
     // HTTP リクエスト読み出しループ
@@ -1005,27 +1001,21 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         return {};
     }
 
-    // 認証完了応答（UTF-8 バイト列で「認証完了。このタブは閉じてください。」を埋め込む）
+    // 認証完了応答
     // 完成後の HTML をブラウザに返してタブのクローズを促す。
     static const char* RESPONSE_OK =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
-        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE5\xAE\x8C\xE4\xBA\x86\xE3\x80\x82"
-        "\xE3\x81\x93\xE3\x81\xAE\xE3\x82\xBF\xE3\x83\x96\xE3\x81\xAF\xE9\x96\x89\xE3"
-        "\x81\x98\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80"
-        "\x82</p></body></html>";
+        "<html><body><p>認証完了。このタブは閉じてください。</p></body></html>";
 
-    // state ミスマッチ応答（UTF-8 で「認証情報が一致しません。再度お試しください。」を埋め込む）
+    // state ミスマッチ応答
     // ユーザに認証完了と誤認させないため、state 検証失敗時はこちらを返す。
     static const char* RESPONSE_STATE_MISMATCH =
         "HTTP/1.1 400 Bad Request\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
-        "<html><body><p>\xE8\xAA\x8D\xE8\xA8\xBC\xE6\x83\x85\xE5\xA0\xB1\xE3\x81\x8C"
-        "\xE4\xB8\x80\xE8\x87\xB4\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x9B\xE3\x82\x93\xE3"
-        "\x80\x82\xE5\x86\x8D\xE5\xBA\xA6\xE3\x81\x8A\xE8\xA9\xA6\xE3\x81\x97\xE3\x81"
-        "\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p></body></html>";
+        "<html><body><p>認証情報が一致しません。再度お試しください。</p></body></html>";
 
     // クエリ抽出範囲の Request-Line 限定
     // ヘッダ部の Referer 等に細工された code=/state= の誤マッチを防ぐため、
