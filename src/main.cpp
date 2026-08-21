@@ -8,16 +8,17 @@
  * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
- * 終了コード:
+ * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
- *   1  - 設定エラー（TOML 読み込み失敗・必須キー未設定）
  *   2  - 予期しない初期化エラー
  *
- * 依存ライブラリ: WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
- * 外部依存: libebur128（vcpkg: libebur128:x64-windows-static）
- * ビルド: rc /nologo resource.rc
- *         cl /nologo /utf-8 /std:c++20 /EHsc /O2 /Fegcalntfy.exe main.cpp resource.res
- *             /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib
+ * 依存ライブラリ：本ファイルの #pragma comment(lib, ...) 群と build.ps1 のリンク行を正とする。
+ *         一覧をここへ複製すると再び乖離するため、個々のライブラリ名は列挙しない。
+ * 外部依存：libebur128（vcpkg: libebur128:x64-windows-static）
+ * ビルド：task build（実体は build.ps1）が唯一のビルド経路である。
+ *         build.ps1 が生成ヘッダ（version.rc.h・version.h・oauth.h）の作成と vcpkg 依存の
+ *         導入を担うため、cl を直接呼ぶ手順ではビルドを再現できない。
+ *         コンパイル・リンクオプションの詳細は build.ps1 を参照する。
  */
 
 // ebur128 は windows.h より先にインクルードする（ヘッダ内マクロ衝突回避）
