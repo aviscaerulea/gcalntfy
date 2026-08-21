@@ -4988,7 +4988,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             GetSystemTime(&utcNow);
             auto jstNow = utcToJst(utcNow);
 
-            // 日付変更：強制ポーリングと変更検知ベースラインをリセットする
+            // 日付変更：取得契機の成立フラグを立て、変更検知ベースラインを未確立へ戻す
             // notifiedSet は通知スレッドが自然失効で管理する
             if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                 lastJstDay          = static_cast<int>(jstNow.wDay);
