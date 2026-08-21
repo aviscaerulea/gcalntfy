@@ -4535,7 +4535,7 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
 // 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
 // 全イベント × 全通知タイミングを走査して最小発火時間を求めてから wait_until で待機する。
-static void notifyThreadFunc(const std::wstring& exeDir) {
+static void notifyThreadFunc() {
     // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する
     try {
         winrt::init_apartment();
@@ -5202,7 +5202,7 @@ int wmain() {
         }
 
         // 通知スレッド起動
-        notifyThread = std::thread(notifyThreadFunc, exeDir);
+        notifyThread = std::thread(notifyThreadFunc);
 
         // 通知抑制リストを復元（過去分のエントリは自動プルーニング）
         loadMutedEvents(exeDir);
