@@ -4329,7 +4329,7 @@ struct EventChange {
 // 終日予定は JST 0 時開始に正規化され当日分が常に開始済み扱いになるため、変更後が終日の
 // 追加・日時変更は除外せず通知する。（キャンセルの除外は終日予定にも適用される）
 // Added 検知は取得窓への新規進入を検知するものであり、ユーザが Calendar
-// に実際に追加した予定との区別は行わない。（firstPoll スキップで起動直後の誤検知を抑制）
+// に実際に追加した予定との区別は行わない。（無条件取得の回をスキップして起動直後の誤検知を抑制）
 // このため、一度消えた予定の再出現（作り直し、再招待、窓外からの復帰）も Added とする。
 // 変更検知は抑制状態を参照しない。抑制の意図をアプリは知り得ず、変更や再出現で参加できる
 // ようになる場合があるためだ。抑制は開始前通知の側だけに適用する。
@@ -4928,7 +4928,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     }
 
     int  lastJstDay          = -1;
-    bool firstPoll           = true;  // 起動時は schedule に関わらず必ず 1 回ポーリング
+    bool pollImmediately     = true;  // 今回は schedule を待たず無条件に取得する（起動時・強制取得・日付変更で立つ）
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
     bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
     int  partialFailureStreak = 0;    // 部分失敗の連続回数（全カレンダー成功でリセット）
@@ -4961,23 +4961,22 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             ULONGLONG lastTick  = g_lastPollTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
-            if ((forceTriggered || stale) && !firstPoll) {
-                if (!pollNow && lastTick > 0 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
-                    // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
-                    // （ここでポーリング本体へ進むとクールダウンが機能しない）
-                    if (forceTriggered) {
-                        writeLog("force poll deferred (cooldown)");
-                        deferredForce = true;
-                        waitInterruptible(static_cast<DWORD>(FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick)));
-                        continue;
-                    }
+            if ((forceTriggered || stale) && !pollImmediately) {
+                // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
+                // （ここでポーリング本体へ進むとクールダウンが機能しない）。
+                // pollNow が真なら forceTriggered も真になるため、先送り判定に forceTriggered の
+                // 再確認は要らない
+                if (forceTriggered && !pollNow && lastTick > 0
+                    && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
+                    writeLog("force poll deferred (cooldown)");
+                    deferredForce = true;
+                    waitInterruptible(static_cast<DWORD>(FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick)));
+                    continue;
                 }
-                else {
-                    if (pollNow)             writeLog("poll now triggered (tray menu)");
-                    else if (forceTriggered) writeLog("force poll triggered");
-                    if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
-                    firstPoll = true;
-                }
+                if (pollNow)             writeLog("poll now triggered (tray menu)");
+                else if (forceTriggered) writeLog("force poll triggered");
+                if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
+                pollImmediately = true;
             }
 
             SYSTEMTIME utcNow;
@@ -4988,7 +4987,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // notifiedSet は通知スレッドが自然失効で管理する
             if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                 lastJstDay          = static_cast<int>(jstNow.wDay);
-                firstPoll           = true;
+                pollImmediately     = true;
                 baselineEstablished = false;
             }
 
@@ -5094,7 +5093,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 showToastSafe(L"更新完了", upcomingCountText(countUpcomingTodayEvents(events)));
             }
 
-            firstPoll           = false;
+            pollImmediately     = false;
             baselineEstablished = true;
             g_lastPollTick.store(GetTickCount64());
             waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
