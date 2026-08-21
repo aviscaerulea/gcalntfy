@@ -4969,8 +4969,10 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if ((forceTriggered || stale) && !pollImmediately) {
                 // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
                 // （ここでポーリング本体へ進むとクールダウンが機能しない）。
-                // pollNow が真なら forceTriggered も真になるため、先送り判定に forceTriggered の
-                // 再確認は要らない
+                // 手動更新要求はユーザの明示操作のため、先送りの対象から外す。
+                // 強制取得の再確認は形式上は冗長だ。強制取得が偽なら外側条件から古さ検知が真であり、
+                // 経過は古さ判定のしきい値（1 時間）以上でクールダウン期間（60 秒）未満と排他になるためだ。
+                // 条件の意図を読み取りやすくするため、判定にはそのまま残す。
                 if (forceTriggered && !pollNow && lastTick > 0
                     && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
                     writeLog("force poll deferred (cooldown)");
