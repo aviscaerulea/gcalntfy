@@ -1,4 +1,4 @@
-# vi: ts=4 sw=4 ff=unix fenc=utf-8
+﻿# vi: ts=4 sw=4 ff=unix fenc=utf-8
 # gcalntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
 param([string]$Version = "0.0.0", [switch]$Release)
