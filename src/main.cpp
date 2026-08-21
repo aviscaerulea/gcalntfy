@@ -4933,7 +4933,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
     int  lastJstDay          = -1;
     // 取得契機の成立フラグ。起動時、即時ポーリング要求、古さ判定、日付変更で真になり、ポーリング完走で偽に戻る。
-    // 真の回はクールダウンによる先送りの対象外とし、トリガーログの重複出力も抑止する。
+    // 真の回はクールダウンによる先送りの対象外とし、その回に成立した契機のトリガーログを出さない。
     // リトライで継続した回をまたいで持続するため、先送り済みの契機を取りこぼさない。
     bool pollImmediately     = true;
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
