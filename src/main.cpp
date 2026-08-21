@@ -4915,7 +4915,8 @@ static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：トークンリフレッシュ → Calendar API ポーリング → 結果を通知スレッドへ受け渡し。
 // 中断は g_shutdownRequested の atomic フラグ経由（waitInterruptible が 100 ms 単位で監視）。
-// ポーリング本体はループ 1 周ごとに無条件に走り、起動直後も schedule と無関係に必ず 1 回取得する。
+// 取得可否は schedule に条件づけられず、起動直後も schedule と無関係に 1 回取得する。
+// 認証フロー実行中の待機、クールダウンによる先送り、失敗時のリトライでは、その 1 周を取得なしで終える。
 // schedule はループ末尾の待機長としてのみ効き、1 時間あたりの取得回数を決める。
 static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // WinRT アパートメント初期化
