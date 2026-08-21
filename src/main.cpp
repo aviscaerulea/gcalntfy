@@ -2883,7 +2883,8 @@ static void addTrayIcon(HWND hWnd) {
     wcscpy_s(nid.szTip, L"読み込み中...");
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
     Shell_NotifyIconW(NIM_ADD, &nid);
-    if (nid.hIcon) DestroyIcon(nid.hIcon);
+    // LoadIconW が返すのはプロセス共有のアイコンハンドルであり、DestroyIcon の対象外だ。
+    // OS がプロセス終了まで保持するため、破棄しなくてもリークにはならない。
     SetTimer(hWnd, IDT_TOOLTIP_REFRESH, TOOLTIP_REFRESH_MS, nullptr);
 }
 
@@ -3008,16 +3009,14 @@ static void updateTrayIcon(HWND hWnd, bool hasUpcoming) {
 
     auto nid   = makeTrayNid(hWnd);
     nid.uFlags = NIF_ICON;
-    if (hasUpcoming) {
-        nid.hIcon = createBadgedIcon();
-        if (!nid.hIcon)
-            nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
-    }
-    else {
-        nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
-    }
+    // 破棄責務はバッジ合成に成功した自前生成ハンドルにのみ生じる。
+    // フォールバックの LoadIconW はプロセス共有のハンドルを返し、DestroyIcon の対象外だ。
+    HICON ownedIcon = hasUpcoming ? createBadgedIcon() : nullptr;
+    nid.hIcon = ownedIcon
+        ? ownedIcon
+        : LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
-    if (nid.hIcon) DestroyIcon(nid.hIcon);
+    if (ownedIcon) DestroyIcon(ownedIcon);
 }
 
 // トレイアイコンのツールチップをクリアする（ポップアップ表示前に呼ぶ）
