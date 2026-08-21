@@ -1662,7 +1662,11 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
     }
 }
 
-// schedule 配列を TOML テーブルから読み込む（なければ nullopt）
+// schedule 配列を TOML テーブルから読み込む
+//
+// テーブルが無い、または schedule キーが配列でない場合は nullopt を返す。
+// 値を返す場合の要素数は常に 24 で、不足分は 1 で補い、25 要素目以降は切り捨てる。
+// 各要素は [1, 60] にクランプし、整数として読めない要素は 1 として扱う。
 static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
     if (!tbl) return std::nullopt;
     const auto* arr = (*tbl)["schedule"].as_array();
