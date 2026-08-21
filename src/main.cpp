@@ -2365,7 +2365,7 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
 
 // ノーマライズ済み PCM データを WASAPI 共有モードで再生する
 //
-// 再生フロー（guardEnabled が true の場合）:
+// 再生フロー（cfg.guardToneMs > 0 の場合）：
 //   ガードトーン（リードイン） → 通知音（チャイム）→ ガードトーン（リードアウト）
 // samples / wavFmt は呼び出し側（SoundContext）が所有する複製を受け取る（静的変数は参照しない）。
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
