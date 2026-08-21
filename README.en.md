@@ -39,6 +39,7 @@ Right-clicking the tray icon opens the tray menu, which provides various setting
 | Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
 | Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
+| Just before an event starts (disabled by default) | Yes | Yes | Only when the imminent notification is enabled (up to 60 seconds ahead; its sound can be turned off in the configuration) |
 | At the notification time set in Google Calendar | Yes | Yes | Only when the individual event has a popup notification set (calendar-wide default notifications are not covered) |
 | When a change, cancellation, or addition is found | Yes | No | When an event's start time differs from the previous check, or an event was added or removed (changes affecting only events more than one hour past their start time are not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
@@ -59,6 +60,7 @@ Example notification when "Refresh now" succeeds:
 | No sound file exists | No |
 | "Play notification sound" is set to OFF in the tray menu | No |
 | "Disable while mic/camera in use" is ON and the mic/camera is in use | No |
+| The imminent notification sound is turned off (imminent notification only) | No |
 
 ## Installation
 

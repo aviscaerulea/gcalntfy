@@ -4,6 +4,7 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
+ * imminent_seconds を指定すると、開始直前にも Toast 通知を出す（デフォルト 0＝無効）。
  * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
@@ -90,6 +91,13 @@ static const wchar_t* APP_AUMID = L"com.gcalntfy";
 static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
 static constexpr int MIN_NOTIFY_MINUTES = 0;
 static constexpr int MAX_NOTIFY_MINUTES = 30;
+
+// 直前通知のリード時間（imminent_seconds）のデフォルト（秒）と有効範囲。0 で無効
+// 基本通知（notify_minutes）の後、開始の直前で「まもなく始まる」と気づかせる 2 段目の通知。
+// 秒単位で刻むのは 1 分未満のリードを扱うためで、通知済み記録も秒粒度で持つ
+static constexpr int DEFAULT_IMMINENT_SECONDS = 0;
+static constexpr int MIN_IMMINENT_SECONDS     = 0;
+static constexpr int MAX_IMMINENT_SECONDS     = 60;
 
 // 予定一覧の赤文字閾値（urgent_minutes）のデフォルト（分）。0 で機能無効
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
@@ -310,6 +318,8 @@ struct Config {
     std::vector<int>          schedule;          // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
+    long long                 imminentLeadMs;     // 直前通知のリード時間（ミリ秒、TOML では秒で指定。0 で無効）
+    bool                      imminentSound;      // 直前通知で通知音を鳴らすか（デフォルト true）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
     long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 100）
     long long                 hoverClickGuardMs;  // ホバー表示直後のクリック猶予（ms、0〜5000、0 で無効、デフォルト 300）
@@ -1734,10 +1744,28 @@ static Config loadConfig(const std::wstring& exeDir) {
         return (std::max)(lo, (std::min)(hi, v));
     };
 
+    // トップレベル真偽値キー読み込みヘルパー
+    // local 優先、なければ base、いずれもなければ def を採用する
+    auto readConfigTopBool = [&](const char* key, bool def) -> bool {
+        if (local && (*local)[key].is_boolean()) return **(*local)[key].as_boolean();
+        if (base && (*base)[key].is_boolean())   return **(*base)[key].as_boolean();
+        return def;
+    };
+
     // notify_minutes（通知リード時間、分単位。デフォルト 5 分、0〜30 にクランプ）
     long long notifyMin = readConfigTopInt("notify_minutes",
         DEFAULT_NOTIFY_MINUTES, MIN_NOTIFY_MINUTES, MAX_NOTIFY_MINUTES);
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
+
+    // imminent_seconds（直前通知のリード時間、秒単位。デフォルト 0 で無効、0〜60 にクランプ）
+    long long imminentSec = readConfigTopInt("imminent_seconds",
+        DEFAULT_IMMINENT_SECONDS, MIN_IMMINENT_SECONDS, MAX_IMMINENT_SECONDS);
+    cfg.imminentLeadMs = imminentSec * 1000LL;
+
+    // imminent_sound（直前通知の通知音。デフォルト true）
+    // 直前通知だけのタイミングに適用する。基本通知や Google カレンダー側の通知と
+    // 同時刻に重なった発火では、基本通知側の扱いを優先して鳴らす
+    cfg.imminentSound = readConfigTopBool("imminent_sound", true);
 
     // urgent_minutes（予定一覧の赤文字閾値、分単位。デフォルト 60、0 で無効、負値は 0 にクランプ）
     cfg.urgentMinutes = static_cast<int>(readConfigTopInt("urgent_minutes",
@@ -4393,22 +4421,24 @@ static void notifyEventChanges(const std::vector<EventChange>& changes)
 
 // 通知済みセットのベースキー（"eventKey|開始日時"）を生成する
 // 開始日時を含めるのは、予定の日時変更でキーを変えて通知済み記録を無効化し、変更後の
-// 時刻で直前通知を発火させるため。取得窓が当日 0 時起点になり、終了済み予定も当日中は
+// 時刻で改めて通知を発火させるため。取得窓が当日 0 時起点になり、終了済み予定も当日中は
 // リストに残り続ける。このためリスト消失による記録の自然失効は期待できない。
 static inline std::string notifyBaseKey(const CalendarEvent& e) {
     return eventKey(e) + "|" + e.datetime;
 }
 
 // 通知済みセット用キーを生成する
-// leadMsVal はミリ秒単位。notifyBaseKey に "@分数" サフィックスを付けた形式で返す
+// leadMsVal はミリ秒単位。notifyBaseKey に "@秒数" サフィックスを付けた形式で返す。
+// 秒粒度なのは 1 分未満のリードを持つ直前通知を区別するため。リード時間が一致する
+// タイミング（例：基本通知 1 分前と直前通知 60 秒）では同一キーになり、通知が 1 回にまとまる
 static inline std::string notifyKey(const CalendarEvent& e, long long leadMsVal) {
-    return notifyBaseKey(e) + "@" + std::to_string(leadMsVal / 60000);
+    return notifyBaseKey(e) + "@" + std::to_string(leadMsVal / 1000);
 }
 
 // notifiedSet の自然失効：新リストに含まれないキーを削除する
 //
-// notifiedSet のキーは "eventKey|開始日時@minutes" 形式。（notifyKey 参照）
-// イベントが削除・日時変更されたとき、対応するすべての "@minutes" エントリを失効させる。
+// notifiedSet のキーは "eventKey|開始日時@秒数" 形式（notifyKey 参照）。
+// イベントが削除・日時変更されたとき、対応するすべての "@秒数" エントリを失効させる。
 static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
                              const std::vector<CalendarEvent>& events)
 {
@@ -4416,7 +4446,7 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
     for (const auto& e : events) validBaseKeys.insert(notifyBaseKey(e));
 
     for (auto it = notifiedSet.begin(); it != notifiedSet.end(); ) {
-        // "@minutes" サフィックスを除いたベースキーで照合する。ベースキー側にはカレンダー ID や
+        // "@秒数" サフィックスを除いたベースキーで照合する。ベースキー側にはカレンダー ID や
         // タイトル由来の '@' が混入しうるが、サフィックスが必ず末尾に付くため rfind で境界を誤らない
         auto sep = it->rfind('@');
         auto base = (sep != std::string::npos) ? it->substr(0, sep) : *it;
@@ -4425,18 +4455,23 @@ static void pruneNotifiedSet(std::set<std::string>& notifiedSet,
 }
 
 // 通知発火：Toast 表示と音声再生を実行し、notifiedSet を更新する
-// 音声スキップ判定（音声 OFF・会議中）はここで行い、Toast はグループ全件に出す。
+// 音声スキップ判定（音声 OFF・直前通知の消音・会議中）はここで行い、Toast はグループ全件に出す。
+// allowSound は呼び出し側が決めた発火単位の音声可否で、直前通知だけのタイミングを
+// imminent_sound = false で消すために使う。
 static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group,
-    const std::string& targetDatetime, long long targetLeadMs,
+    const std::string& targetDatetime, long long targetLeadMs, bool allowSound,
     const Config& localConfig, std::set<std::string>& notifiedSet)
 {
     auto jstTimeW = utcToJstHHMM(targetDatetime);
     auto jstTime  = wideToUtf8(jstTimeW);
     writeLog("notify: " + jstTime + " (" + std::to_string(group.size()) + " event(s), "
-        + std::to_string(targetLeadMs / 60000) + "min before)");
-    // 音声スキップ判定：音声通知 OFF > マイク/カメラ使用中ミュート > 通常再生
+        + std::to_string(targetLeadMs / 1000) + "s before)");
+    // 音声スキップ判定：音声通知 OFF > 直前通知の消音 > マイク/カメラ使用中ミュート > 通常再生
     if (!g_soundEnabled) {
         writeLog("sound skipped (sound disabled)");
+    }
+    else if (!allowSound) {
+        writeLog("sound skipped (imminent sound disabled)");
     }
     else if (g_muteInMeeting && isMeetingActive()) {
         writeLog("sound skipped (mic/camera in use)");
@@ -4458,9 +4493,11 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
 
 // 発火対象を特定する：通知タイミングが到来しかつ未通知のイベントから最初の (datetime, leadMs) を返す
 // 見つからなければ targetDatetime を空のまま返す。
+// imminentLeadMs が 0 のときは直前通知を候補に含めない。
 static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
     const std::string& nowUtc, const std::set<std::string>& notifiedSet,
     const std::unordered_set<std::string>& mutedKeys, long long leadMs,
+    long long imminentLeadMs,
     std::string& targetDatetime, long long& targetLeadMs)
 {
     targetDatetime.clear();
@@ -4482,6 +4519,7 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
         if (tryLead(leadMs)) return;
         for (int m : e.reminderMinutes)
             if (tryLead(static_cast<long long>(m) * 60000)) return;
+        if (imminentLeadMs > 0 && tryLead(imminentLeadMs)) return;
     }
 }
 
@@ -4489,10 +4527,13 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
-// 設定されていれば、そのタイミングでも追加通知する（重複分数は 1 回のみ通知）。
-// notifiedSet のキーは "eventKey|開始日時@minutes" 形式で、同一イベントの異なるタイミングを
+// 設定されていれば、そのタイミングでも追加通知する。imminent_seconds が 0 でなければ
+// 開始直前のタイミングでも追加通知する（重複するリード時間は 1 回のみ通知）。
+// 起動直後などタイミング経過後に評価した場合、基本通知と直前通知は開始前である限り
+// 遡って発火する。両方が経過済みなら基本通知 1 回に集約する。
+// notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
 // 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
-// 全イベント × 全通知分数を走査して最小発火時間を求めてから wait_until で待機する。
+// 全イベント × 全通知タイミングを走査して最小発火時間を求めてから wait_until で待機する。
 static void notifyThreadFunc(const std::wstring& exeDir) {
     // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する
     try {
@@ -4528,8 +4569,8 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             auto nowUtc = getCurrentUtcISO();
             long long leadMs = localConfig.notifyLeadMs;
 
-            // 全イベント × 全通知分数を走査して最小発火待機時間を計算
-            // notifiedSet キーは "eventKey|開始日時@minutes" 形式
+            // 全イベント × 全通知タイミングを走査して最小発火待機時間を計算
+            // notifiedSet キーは "eventKey|開始日時@秒数" 形式
             long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
@@ -4538,21 +4579,40 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 if (diffMs <= 0) continue;
                 // 通知抑制中のイベントは minFireMs 計算から除外する
                 if (mutedKeys.count(eventKey(e))) continue;
-                // notify_minutes（ベースライン）+ reminders のすべてのタイミングをチェック
+                // notify_minutes（ベースライン）+ reminders + 直前通知のすべてのタイミングをチェック
                 auto checkLead = [&](long long leadMsVal) {
                     auto key = notifyKey(e, leadMsVal);
                     if (!notifiedSet.count(key))
                         minFireMs = (std::min)(minFireMs, diffMs - leadMsVal);
                 };
                 checkLead(leadMs);
-                // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす
+                // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす。
+                // ただし直前通知と同じリード時間の reminders は通知済みキーを共有するため、
+                // ここでマークすると直前通知まで消える。その場合はマークせず、直前通知
+                // 側の判定に委ねる（そこで基本通知へ集約されることもある）
                 for (int m : e.reminderMinutes) {
                     long long rmMs = static_cast<long long>(m) * 60000;
-                    if (diffMs - rmMs < 0) {
-                        notifiedSet.insert(notifyKey(e, static_cast<long long>(m) * 60000));
+                    if (diffMs - rmMs >= 0) {
+                        checkLead(rmMs);
+                    }
+                    else if (rmMs != localConfig.imminentLeadMs) {
+                        notifiedSet.insert(notifyKey(e, rmMs));
+                    }
+                }
+                // 直前通知は基本通知と同様、タイミングを過ぎていても開始前なら遡って発火させる。
+                // ただし基本通知も未通知のまま経過している場合は、同じ内容を連続 2 回出しても
+                // 意味がないため直前通知を通知済みとみなし、基本通知 1 回に集約する。
+                // 両者のリード時間が等しいときはキーが同一で、マークすると基本通知まで
+                // 消えるため除外する
+                if (localConfig.imminentLeadMs > 0) {
+                    bool baseOverdue = (diffMs - leadMs <= 0)
+                        && !notifiedSet.count(notifyKey(e, leadMs));
+                    if (baseOverdue && diffMs - localConfig.imminentLeadMs <= 0
+                        && localConfig.imminentLeadMs != leadMs) {
+                        notifiedSet.insert(notifyKey(e, localConfig.imminentLeadMs));
                     }
                     else {
-                        checkLead(rmMs);
+                        checkLead(localConfig.imminentLeadMs);
                     }
                 }
             }
@@ -4584,26 +4644,36 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
             std::string targetDatetime;
             long long   targetLeadMs = 0;
             selectFireTarget(localEvents, nowUtc, notifiedSet, mutedKeys, leadMs,
-                targetDatetime, targetLeadMs);
+                localConfig.imminentLeadMs, targetDatetime, targetLeadMs);
             if (targetDatetime.empty()) continue; // 発火対象なし（稀なケース）
 
             // 同 datetime かつ同 targetLeadMs のイベントをグループ化
+            // 直前通知だけのタイミングか否かで音声可否が変わるため、グループ化と同時に判定する。
+            // 直前通知が基本通知や reminders と同時刻に重なったときは基本通知側を優先し、
+            // imminent_sound = false でも音を鳴らす
             std::vector<const CalendarEvent*> group;
+            bool hasBaseTiming = false;
             for (const auto& e : localEvents) {
                 if (e.datetime != targetDatetime) continue;
                 // notify_minutes タイミングか、reminders に含まれるタイミングかをチェック
-                bool isTarget = (targetLeadMs == leadMs);
-                if (!isTarget) {
+                bool isBase = (targetLeadMs == leadMs);
+                if (!isBase) {
                     for (int m : e.reminderMinutes)
-                        if (static_cast<long long>(m) * 60000 == targetLeadMs) { isTarget = true; break; }
+                        if (static_cast<long long>(m) * 60000 == targetLeadMs) { isBase = true; break; }
                 }
-                if (!isTarget) continue;
+                bool isImminent = (localConfig.imminentLeadMs > 0
+                    && targetLeadMs == localConfig.imminentLeadMs);
+                if (!isBase && !isImminent) continue;
                 if (mutedKeys.count(eventKey(e))) continue;
                 auto key = notifyKey(e, targetLeadMs);
-                if (!notifiedSet.count(key)) group.push_back(&e);
+                if (notifiedSet.count(key)) continue;
+                group.push_back(&e);
+                if (isBase) hasBaseTiming = true;
             }
 
-            fireNotificationGroup(group, targetDatetime, targetLeadMs, localConfig, notifiedSet);
+            bool allowSound = hasBaseTiming || localConfig.imminentSound;
+            fireNotificationGroup(group, targetDatetime, targetLeadMs, allowSound,
+                localConfig, notifiedSet);
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
         }
