@@ -4914,6 +4914,8 @@ static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：トークンリフレッシュ → Calendar API ポーリング → 結果を通知スレッドへ受け渡し。
 // 中断は g_shutdownRequested の atomic フラグ経由（waitInterruptible が 100 ms 単位で監視）。
+// ポーリング本体はループ 1 周ごとに無条件に走り、起動直後も schedule と無関係に必ず 1 回取得する。
+// schedule はループ末尾の待機長としてのみ効き、1 時間あたりの取得回数を決める。
 static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは認証失効・接続エラーの Toast 表示経路（showErrorToast / notifyAuthRequired）を
@@ -4928,7 +4930,10 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     }
 
     int  lastJstDay          = -1;
-    bool pollImmediately     = true;  // 今回は schedule を待たず無条件に取得する（起動時・強制取得・日付変更で立つ）
+    // 取得契機の成立フラグ。起動時、強制取得、古さ検知、日付変更で真になり、ポーリング完走で偽に戻る。
+    // 真の回はクールダウンによる先送りの対象外とし、トリガーログの重複出力も抑止する。
+    // リトライで継続した回をまたいで持続するため、先送り済みの契機を取りこぼさない。
+    bool pollImmediately     = true;
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
     bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
     int  partialFailureStreak = 0;    // 部分失敗の連続回数（全カレンダー成功でリセット）
