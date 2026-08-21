@@ -2258,7 +2258,7 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
             if (!ReadFile(hFile, &chunkSize, 4, &nRead, nullptr) || nRead != 4) break;
 
             if (memcmp(id, "fmt ", 4) == 0) {
-                DWORD readSize = min(chunkSize, (DWORD)sizeof(WAVEFORMATEX));
+                DWORD readSize = (std::min)(chunkSize, (DWORD)sizeof(WAVEFORMATEX));
                 if (!ReadFile(hFile, &wavFmt, readSize, &nRead, nullptr) || nRead != readSize) {
                     writeLog("loadWavAndNormalize: failed to read fmt chunk");
                     goto cleanup;
@@ -2453,7 +2453,7 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
                 UINT32 padding = 0;
                 if (FAILED(client->GetCurrentPadding(&padding))) break;
                 UINT32 avail  = bufFrames - padding;
-                UINT32 frames = min(avail, toneFrames - written);
+                UINT32 frames = (std::min)(avail, toneFrames - written);
                 if (frames == 0) continue;
                 BYTE* buf = nullptr;
                 if (FAILED(render->GetBuffer(frames, &buf))) break;
@@ -2497,7 +2497,7 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
             UINT32 avail = bufFrames - padding;
             if (avail == 0) continue;
 
-            UINT32 frames = min(avail, totalFrames - sentFrames);
+            UINT32 frames = (std::min)(avail, totalFrames - sentFrames);
             if (frames == 0) {
                 // 全フレーム送信済み。残りバッファが再生されるまで待機（最大約 1 秒）
                 for (int i = 0; i < 100; i++) {
