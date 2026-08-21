@@ -37,16 +37,20 @@ jobs:
 
       - name: Build
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          ./build.ps1 -Version "${{ steps.version.outputs.version }}" -Release
+          ./build.ps1 -Version "$env:VERSION" -Release
 
       - name: Create zip
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           Compress-Archive `
             -Path out\gcalntfy.exe, gcalntfy.toml, src\sound.wav, src\app.ico `
-            -DestinationPath "out\gcalntfy-${{ steps.version.outputs.version }}-x64.zip" `
+            -DestinationPath "out\gcalntfy-$env:VERSION-x64.zip" `
             -Force
 
       - name: Upload to release
