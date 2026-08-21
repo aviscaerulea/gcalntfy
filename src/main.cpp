@@ -4588,15 +4588,16 @@ static void notifyThreadFunc(const std::wstring& exeDir) {
                 };
                 checkLead(leadMs);
                 // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす。
-                // ただし直前通知と同じリード時間の reminders は通知済みキーを共有するため、
-                // ここでマークすると直前通知まで消える。その場合はマークせず、直前通知
-                // 側の判定に委ねる（そこで基本通知へ集約されることもある）
+                // ただし基本通知や直前通知と同じリード時間の reminders は通知済みキーを共有する。
+                // ここでマークすると基本通知や直前通知まで消えるため、その場合はマークしない。
+                // 基本通知と一致する場合は基本通知側の遡及発火に委ね、直前通知と一致する場合は
+                // 直前通知側の判定に委ねる（そこで基本通知へ集約されることもある）
                 for (int m : e.reminderMinutes) {
                     long long rmMs = static_cast<long long>(m) * 60000;
                     if (diffMs - rmMs >= 0) {
                         checkLead(rmMs);
                     }
-                    else if (rmMs != localConfig.imminentLeadMs) {
+                    else if (rmMs != localConfig.imminentLeadMs && rmMs != leadMs) {
                         notifiedSet.insert(notifyKey(e, rmMs));
                     }
                 }
