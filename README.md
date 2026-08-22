@@ -74,7 +74,7 @@
 
 #### リリースの ZIP から
 
-[リリースページ](https://github.com/aviscaerulea/gcalntfy/releases/latest)から zip をダウンロードしてください。次に任意フォルダで展開してください。次に `gcalntfy.exe` を実行してください。
+[リリースページ](https://github.com/aviscaerulea/gcalntfy/releases/latest)から ZIP をダウンロードしてください。次に任意フォルダで展開してください。次に `gcalntfy.exe` を実行してください。
 
 #### Scoop から
 
@@ -97,7 +97,7 @@ gcalntfy
 
 ## 設定
 
-`gcalntfy.toml` を exe と同フォルダに配置してください。設定できる項目と意味は、同ファイルのコメントに記載しています。（変更の反映はアプリ再起動時）
+`gcalntfy.toml` を exe と同フォルダに配置してください。設定できる項目と意味は、同ファイルのコメントに記載しています（変更の反映はアプリ再起動時）。
 
 同フォルダに `gcalntfy.local.toml` を併置すると、そちらの記述をキー単位で優先適用します。変更したい項目だけをこちらに書いておけば、バージョンアップで `gcalntfy.toml` を入れ替えても設定を移し替えずに済みます。
 

@@ -74,7 +74,7 @@ Example notification when "Refresh now" succeeds:
 
 #### From the release ZIP
 
-Download the zip from the [releases page](https://github.com/aviscaerulea/gcalntfy/releases/latest). Extract it to any folder, then run `gcalntfy.exe`.
+Download the ZIP from the [releases page](https://github.com/aviscaerulea/gcalntfy/releases/latest). Extract it to any folder, then run `gcalntfy.exe`.
 
 #### From Scoop
 
