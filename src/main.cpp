@@ -4748,6 +4748,11 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // outAuthFailed: 全カレンダーが認証起因の失敗（リフレッシュ拒否・401 継続）に終わった場合のみ true。
 // 一部カレンダーのみの 401 は該当カレンダーをスキップする。共有解除等の個別権限問題を
 // トークン全体の失効と混同すると、正常なカレンダーまで巻き込んで通知を止めてしまうためだ。
+// シャットダウン要求（g_shutdownRequested）は各カレンダーの取得前と 401 リトライ前に確認する。
+// 要求時は残りを処理せず戻る。このとき outAllSuccess は false、outAuthFailed は末尾の集計を
+// 通らないため常に false、outAnySuccess と events には処理済みカレンダー分が残る。
+// 通信無応答時の HTTP 待ちがカレンダーの数だけ連なると、終了操作からプロセス終了まで
+// 数分かかるためだ。（進行中の httpGet 自体は打ち切れないため、短縮効果は開始前の確認分に限る）
 //
 // ※ ID プレフィックス付与（"<calId>/<eventId>"）はこの関数内で行う。
 // カレンダー ID をまたいだ ID 衝突防止のため、events 取得直後にカレンダー ID を
@@ -4770,6 +4775,12 @@ static void fetchAllCalendarEvents(
     size_t stillUnauthorizedCount = 0;
 
     for (const auto& calId : calendarIds) {
+        // 中断時の出力引数の状態は関数コメントを参照
+        if (g_shutdownRequested) {
+            outAllSuccess = false;
+            return;
+        }
+
         std::wstring calUrl = L"https://";
         calUrl += CALENDAR_API_HOST;
         calUrl += L"/calendar/v3/calendars/" + toWide(urlEncode(calId)) + L"/events";
@@ -4804,6 +4815,11 @@ static void fetchAllCalendarEvents(
                 }
                 outAllSuccess = false;
                 continue;
+            }
+            // リフレッシュ中にシャットダウン要求が入った場合はリトライせず中断する
+            if (g_shutdownRequested) {
+                outAllSuccess = false;
+                return;
             }
             {
                 std::lock_guard<std::mutex> lk(g_tokenMtx);
@@ -4914,7 +4930,8 @@ static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
 // メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：トークンリフレッシュ → Calendar API ポーリング → 結果を通知スレッドへ受け渡し。
-// 中断は g_shutdownRequested の atomic フラグ経由（waitInterruptible が 100 ms 単位で監視）。
+// 中断は g_shutdownRequested の atomic フラグ経由。waitInterruptible が 100 ms 単位で監視する
+// ほか、カレンダー取得中（fetchAllCalendarEvents 内）と取得直後にも確認して打ち切る。
 // 取得可否は schedule に条件づけられず、起動直後も schedule と無関係に 1 回取得する。
 // 認証フロー実行中の待機、クールダウンによる先送り、失敗時のリトライでは、その 1 周を取得なしで終える。
 // schedule はループ末尾の待機長としてのみ効き、1 時間あたりの取得回数を決める。
@@ -5040,6 +5057,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             fetchAllCalendarEvents(calendarIds, queryParams, events, anySuccess, allSuccess, authFailed);
             ULONGLONG elapsed = GetTickCount64() - t0;
+
+            // シャットダウン要求時はここで打ち切る。取得が完走していた場合も結果反映・
+            // キャッシュ保存・完了応答ごと省略する（終了間際の反映に価値はなく、中断で
+            // 戻った取得失敗を接続エラー Toast として誤通知しないことを優先する）
+            if (g_shutdownRequested) break;
 
             if (authFailed) {
                 // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
