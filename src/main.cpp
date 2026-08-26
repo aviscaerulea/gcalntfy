@@ -4,7 +4,8 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
- * 開始の imminent_seconds 秒前（デフォルト 60 秒）にも Toast 通知を出す（0 指定で無効、トレイメニューでも ON/OFF 可）。
+ * 開始の imminent_seconds 秒前（デフォルト 60 秒）にも Toast 通知を出す（0 指定で無効）。
+ * 発火の有無はトレイメニュー「直前通知を行う」で切り替える（デフォルト OFF）。
  * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
@@ -97,8 +98,9 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 // 直前通知のリード時間（imminent_seconds）のデフォルト（秒）と有効範囲。0 指定で無効
 // 基本通知（notify_minutes）の後、開始の直前で「まもなく始まる」と気づかせる 2 段目の通知。
 // 秒単位で刻むのは 1 分未満のリードを扱うためで、通知済み記録も秒粒度で持つ。
-// v2.14.0 ではデフォルト 0（無効）だったが、設定なしでも直前通知が効くよう 60 秒へ変更した。
-// 日常の ON/OFF はトレイメニュー「直前通知を行う」（g_imminentEnabled）が担う
+// v2.14.0 ではデフォルト 0（無効）だったが、TOML を編集せずトレイ操作だけで有効化できるよう
+// 60 秒へ変更した。直前通知を行うかはトレイメニューのトグル（g_imminentEnabled、
+// デフォルト OFF）で切り替える。トグルを ON にするまで直前通知は鳴らない
 static constexpr int DEFAULT_IMMINENT_SECONDS = 60;
 static constexpr int MIN_IMMINENT_SECONDS     = 0;
 static constexpr int MAX_IMMINENT_SECONDS     = 60;
@@ -233,9 +235,9 @@ static std::atomic<bool> g_showPastEvents{true};
 // ホバーで予定一覧を表示するかのトグル（レジストリ HoverPopup で永続化、デフォルト ON）
 static std::atomic<bool> g_hoverPopupEnabled{true};
 
-// 直前通知の ON/OFF トグル（レジストリ ImminentNotify で永続化、デフォルト ON）
+// 直前通知の ON/OFF トグル（レジストリ ImminentNotify で永続化、デフォルト OFF）
 // 実効は「トグル ON かつ TOML の imminent_seconds > 0」。OFF の間は直前通知を発火しない
-static std::atomic<bool> g_imminentEnabled{true};
+static std::atomic<bool> g_imminentEnabled{false};
 // TOML の imminent_seconds が正か（起動時に loadConfig の値を反映し以降不変）
 // TOML 側で無効なときにトレイメニュー項目をグレーアウトするための判定に使う
 static std::atomic<bool> g_imminentCfgEnabled{false};
@@ -5262,7 +5264,7 @@ int wmain() {
         g_muteInMeeting     = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
         g_showPastEvents    = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
         g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
-        g_imminentEnabled   = readRegDword(REG_IMMINENT_NOTIFY, 1u) != 0;
+        g_imminentEnabled   = readRegDword(REG_IMMINENT_NOTIFY, 0u) != 0;
 
         // toml のホバー遅延・クリック猶予を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
