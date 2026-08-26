@@ -4,7 +4,7 @@
  *
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
- * imminent_seconds を指定すると、開始直前にも Toast 通知を出す（デフォルト 0＝無効）。
+ * 開始の imminent_seconds 秒前（デフォルト 60 秒）にも Toast 通知を出す（0 指定で無効、トレイメニューでも ON/OFF 可）。
  * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
@@ -94,10 +94,12 @@ static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
 static constexpr int MIN_NOTIFY_MINUTES = 0;
 static constexpr int MAX_NOTIFY_MINUTES = 30;
 
-// 直前通知のリード時間（imminent_seconds）のデフォルト（秒）と有効範囲。0 で無効
+// 直前通知のリード時間（imminent_seconds）のデフォルト（秒）と有効範囲。0 指定で無効
 // 基本通知（notify_minutes）の後、開始の直前で「まもなく始まる」と気づかせる 2 段目の通知。
-// 秒単位で刻むのは 1 分未満のリードを扱うためで、通知済み記録も秒粒度で持つ
-static constexpr int DEFAULT_IMMINENT_SECONDS = 0;
+// 秒単位で刻むのは 1 分未満のリードを扱うためで、通知済み記録も秒粒度で持つ。
+// v2.14.0 ではデフォルト 0（無効）だったが、設定なしでも直前通知が効くよう 60 秒へ変更した。
+// 日常の ON/OFF はトレイメニュー「直前通知を行う」（g_imminentEnabled）が担う
+static constexpr int DEFAULT_IMMINENT_SECONDS = 60;
 static constexpr int MIN_IMMINENT_SECONDS     = 0;
 static constexpr int MAX_IMMINENT_SECONDS     = 60;
 
@@ -136,6 +138,7 @@ static constexpr UINT IDM_STARTUP             = 40010; // Windows スタート�
 static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定の即時再取得（今すぐ更新）
 static constexpr UINT IDM_SHOW_PAST           = 40012; // 予定一覧の過去予定表示トグル
 static constexpr UINT IDM_HOVER_POPUP         = 40013; // ホバーでの予定一覧表示トグル
+static constexpr UINT IDM_IMMINENT_NOTIFY     = 40014; // 直前通知の ON/OFF トグル
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
@@ -229,6 +232,13 @@ static std::atomic<bool> g_showPastEvents{true};
 
 // ホバーで予定一覧を表示するかのトグル（レジストリ HoverPopup で永続化、デフォルト ON）
 static std::atomic<bool> g_hoverPopupEnabled{true};
+
+// 直前通知の ON/OFF トグル（レジストリ ImminentNotify で永続化、デフォルト ON）
+// 実効は「トグル ON かつ TOML の imminent_seconds > 0」。OFF の間は直前通知を発火しない
+static std::atomic<bool> g_imminentEnabled{true};
+// TOML の imminent_seconds が正か（起動時に loadConfig の値を反映し以降不変）
+// TOML 側で無効なときにトレイメニュー項目をグレーアウトするための判定に使う
+static std::atomic<bool> g_imminentCfgEnabled{false};
 // ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
 static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
 // ホバー自動表示直後のクリック猶予（ms、0〜5000 にクランプ済み）。起動時に反映し以降不変
@@ -322,7 +332,7 @@ struct Config {
     std::vector<int>          schedule;          // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、最低 1）
     std::vector<std::wstring> duckTargets;        // 通知音再生中にミュートするプロセス名
     long long                 notifyLeadMs;       // 通知リード時間（ミリ秒、TOML では分で指定）
-    long long                 imminentLeadMs;     // 直前通知のリード時間（ミリ秒、TOML では秒で指定。0 で無効）
+    long long                 imminentLeadMs;     // 直前通知のリード時間（ミリ秒、TOML では秒で指定。0 で無効、デフォルト 60 秒）
     bool                      imminentSound;      // 直前通知で通知音を鳴らすか（デフォルト true）
     int                       urgentMinutes;      // 予定一覧の赤文字閾値（分。0 で無効、デフォルト 60）
     long long                 hoverDelayMs;       // ホバー表示までの遅延（ms、0〜5000、0 で即時、デフォルト 100）
@@ -1755,7 +1765,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         DEFAULT_NOTIFY_MINUTES, MIN_NOTIFY_MINUTES, MAX_NOTIFY_MINUTES);
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
 
-    // imminent_seconds（直前通知のリード時間、秒単位。デフォルト 0 で無効、0〜60 にクランプ）
+    // imminent_seconds（直前通知のリード時間、秒単位。デフォルト 60、0〜60 にクランプ、0 指定で無効）
     long long imminentSec = readConfigTopInt("imminent_seconds",
         DEFAULT_IMMINENT_SECONDS, MIN_IMMINENT_SECONDS, MAX_IMMINENT_SECONDS);
     cfg.imminentLeadMs = imminentSec * 1000LL;
@@ -1943,6 +1953,7 @@ static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_SHOW_PAST_EVENTS  = L"ShowPastEvents";
 static constexpr const wchar_t* REG_HOVER_POPUP       = L"HoverPopup";
+static constexpr const wchar_t* REG_IMMINENT_NOTIFY   = L"ImminentNotify";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -3941,6 +3952,11 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
 
+    // 直前通知トグル（レジストリ永続化。TOML の imminent_seconds = 0 で機能無効の間は非活性）
+    UINT imminentFlags = g_imminentCfgEnabled.load() ? 0u : (MF_DISABLED | MF_GRAYED);
+    AppendMenuW(hMenu, MF_STRING | imminentFlags | (g_imminentEnabled ? MF_CHECKED : MF_UNCHECKED),
+        IDM_IMMINENT_NOTIFY, L"直前通知を行う");
+
     // スタートアップ登録トグル（HKCU Run キー）
     AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
         IDM_STARTUP, L"スタートアップ登録");
@@ -4094,6 +4110,21 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_HOVER_POPUP) {
         g_hoverPopupEnabled.store(!g_hoverPopupEnabled.load());
         writeRegDword(REG_HOVER_POPUP, g_hoverPopupEnabled.load() ? 1u : 0u);
+        return;
+    }
+    if (id == IDM_IMMINENT_NOTIFY) {
+        // TOML 側で機能無効の間は非活性項目への誤クリックを無視する
+        if (g_imminentCfgEnabled.load()) {
+            g_imminentEnabled.store(!g_imminentEnabled.load());
+            writeRegDword(REG_IMMINENT_NOTIFY, g_imminentEnabled.load() ? 1u : 0u);
+            // 通知スレッドを直接起こしてトグルを即時反映する
+            // （OFF なら待機中の直前通知の発火を取り下げ、ON なら候補へ復帰させる）
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_eventsUpdated = true;
+            }
+            g_cv.notify_one();
+        }
         return;
     }
     if (id == IDM_POLL_NOW) {
@@ -4531,8 +4562,10 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
-// 設定されていれば、そのタイミングでも追加通知する。imminent_seconds が 0 でなければ
-// 開始直前のタイミングでも追加通知する（重複するリード時間は 1 回のみ通知）。
+// 設定されていれば、そのタイミングでも追加通知する。imminent_seconds が 0 でなく、かつ
+// トレイメニューの直前通知トグル（g_imminentEnabled）が ON なら、開始直前のタイミングでも
+// 追加通知する（重複するリード時間は 1 回のみ通知）。トグルは周回ごとに評価するため、
+// OFF への切り替えを待機中の直前通知にも即時反映する。
 // 起動直後などタイミング経過後に評価した場合、基本通知と直前通知は開始前である限り
 // 遡って発火する。両方が経過済みなら基本通知 1 回に集約する。
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
@@ -4572,6 +4605,8 @@ static void notifyThreadFunc() {
         while (!g_shutdownRequested) {
             auto nowUtc = getCurrentUtcISO();
             long long leadMs = localConfig.notifyLeadMs;
+            // 直前通知の実効リード時間。直前通知トグルが OFF の間は 0（無効）として扱う
+            long long imminentMs = g_imminentEnabled.load() ? localConfig.imminentLeadMs : 0;
 
             // 全イベント × 全通知タイミングを走査して最小発火待機時間を計算
             // notifiedSet キーは "eventKey|開始日時@秒数" 形式
@@ -4594,13 +4629,18 @@ static void notifyThreadFunc() {
                 // ただし基本通知や直前通知と同じリード時間の reminders は通知済みキーを共有する。
                 // ここでマークすると基本通知や直前通知まで消えるため、その場合はマークしない。
                 // 基本通知と一致する場合は基本通知側の遡及発火に委ね、直前通知と一致する場合は
-                // 直前通知側の判定に委ねる（そこで基本通知へ集約されることもある）
+                // 直前通知側の判定に委ねる（そこで基本通知へ集約されることもある）。
+                // 直前通知との一致判定は設定値でなく実効値（imminentMs）で行う。このため
+                // トグル OFF 中は設定値と一致する reminders もマークし、OFF の間に経過した
+                // タイミングは ON へ戻しても遡及発火しない。OFF 中の経過分を後から鳴らさない
+                // 意図した挙動で、設定値で判定すると OFF 中も未マークの経過済み reminders が
+                // 別の通知の発火を契機に遅れて鳴ってしまう
                 for (int m : e.reminderMinutes) {
                     long long rmMs = static_cast<long long>(m) * 60000;
                     if (diffMs - rmMs >= 0) {
                         checkLead(rmMs);
                     }
-                    else if (rmMs != localConfig.imminentLeadMs && rmMs != leadMs) {
+                    else if (rmMs != imminentMs && rmMs != leadMs) {
                         notifiedSet.insert(notifyKey(e, rmMs));
                     }
                 }
@@ -4609,15 +4649,15 @@ static void notifyThreadFunc() {
                 // 意味がないため直前通知を通知済みとみなし、基本通知 1 回に集約する。
                 // 両者のリード時間が等しいときはキーが同一で、マークすると基本通知まで
                 // 消えるため除外する
-                if (localConfig.imminentLeadMs > 0) {
+                if (imminentMs > 0) {
                     bool baseOverdue = (diffMs - leadMs <= 0)
                         && !notifiedSet.count(notifyKey(e, leadMs));
-                    if (baseOverdue && diffMs - localConfig.imminentLeadMs <= 0
-                        && localConfig.imminentLeadMs != leadMs) {
-                        notifiedSet.insert(notifyKey(e, localConfig.imminentLeadMs));
+                    if (baseOverdue && diffMs - imminentMs <= 0
+                        && imminentMs != leadMs) {
+                        notifiedSet.insert(notifyKey(e, imminentMs));
                     }
                     else {
-                        checkLead(localConfig.imminentLeadMs);
+                        checkLead(imminentMs);
                     }
                 }
             }
@@ -4649,7 +4689,7 @@ static void notifyThreadFunc() {
             std::string targetDatetime;
             long long   targetLeadMs = 0;
             selectFireTarget(localEvents, nowUtc, notifiedSet, mutedKeys, leadMs,
-                localConfig.imminentLeadMs, targetDatetime, targetLeadMs);
+                imminentMs, targetDatetime, targetLeadMs);
             if (targetDatetime.empty()) continue; // 発火対象なし（稀なケース）
 
             // 同 datetime かつ同 targetLeadMs のイベントをグループ化
@@ -4666,8 +4706,8 @@ static void notifyThreadFunc() {
                     for (int m : e.reminderMinutes)
                         if (static_cast<long long>(m) * 60000 == targetLeadMs) { isBase = true; break; }
                 }
-                bool isImminent = (localConfig.imminentLeadMs > 0
-                    && targetLeadMs == localConfig.imminentLeadMs);
+                bool isImminent = (imminentMs > 0
+                    && targetLeadMs == imminentMs);
                 if (!isBase && !isImminent) continue;
                 if (mutedKeys.count(eventKey(e))) continue;
                 auto key = notifyKey(e, targetLeadMs);
@@ -5222,10 +5262,14 @@ int wmain() {
         g_muteInMeeting     = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
         g_showPastEvents    = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
         g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
+        g_imminentEnabled   = readRegDword(REG_IMMINENT_NOTIFY, 1u) != 0;
 
         // toml のホバー遅延・クリック猶予を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
         g_hoverClickGuardMs.store(static_cast<DWORD>(cfg.hoverClickGuardMs));
+
+        // toml の直前通知が有効か（0 指定で無効）をメニューのグレーアウト判定用に確定
+        g_imminentCfgEnabled.store(cfg.imminentLeadMs > 0);
 
         writeLog("started");
         logSchedule(cfg.schedule);

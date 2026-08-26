@@ -19,6 +19,7 @@ A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you 
 - Event notifications: polls Google Calendar and notifies you via Windows notification before events start or when they change (notifications before an event also play a sound)
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
+  - Imminent notification: notifying again just before an event starts can be toggled on or off
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
   - Notification suppression (stopping notifications): right-clicking an event stops notifications for it and shows it with a strikethrough
@@ -39,7 +40,7 @@ Right-clicking the tray icon opens the tray menu, which provides various setting
 | Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
 | Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
-| Just before an event starts (disabled by default) | Yes | Yes | Only when the imminent notification is enabled (up to 60 seconds ahead; its sound can be turned off in the configuration) |
+| Just before an event starts (default 60 seconds ahead) | Yes | Yes | Only when "Imminent notification" is ON in the tray menu (ON by default; the lead time can be adjusted to 0-60 seconds and the sound can be turned off in the configuration) |
 | At the notification time set in Google Calendar | Yes | Yes | Only when the individual event has a popup notification set (calendar-wide default notifications are not covered) |
 | When a change, cancellation, or addition is found | Yes | No | When an event's start time differs from the previous check, or an event was added or removed (changes affecting only events more than one hour past their start time are not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
