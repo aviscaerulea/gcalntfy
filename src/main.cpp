@@ -1712,16 +1712,23 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
 //
 // local.toml のキーが優先（キー単位でオーバーライド）。
 // schedule は local があれば local 全体を使用、なければ base を使用。
+// 配列項目（schedule / duck_targets / ext_calendar_ids）は値の中身でなくキーの有無で
+// 採否を決める。local に空配列を書けば base の値を打ち消して無効化できる。
 static Config loadConfig(const std::wstring& exeDir) {
     auto base  = loadToml(exeDir + L"\\gcalntfy.toml");
     auto local = loadToml(exeDir + L"\\gcalntfy.local.toml");
     if (local) writeLog("Loaded gcalntfy.local.toml (override active)");
 
     // duck_targets 配列の読み込み（local 優先、なければ base）
-    auto readDuckTargets = [&](const std::optional<toml::table>& tbl) -> std::vector<std::wstring> {
-        if (!tbl) return {};
+    //
+    // テーブルが無い、または duck_targets キーが配列でない場合は nullopt を返す。
+    // キー不在（nullopt）と空配列を区別することで、local 側に空配列を書いた場合に
+    // base へフォールバックせず「無効化の明示指定」として扱える。（readSchedule と同じ方式）
+    auto readDuckTargets = [&](const std::optional<toml::table>& tbl)
+        -> std::optional<std::vector<std::wstring>> {
+        if (!tbl) return std::nullopt;
         const auto* arr = (*tbl)["duck_targets"].as_array();
-        if (!arr) return {};
+        if (!arr) return std::nullopt;
         std::vector<std::wstring> targets;
         for (const auto& el : *arr) {
             if (auto s = el.value<std::string>()) targets.push_back(toWide(*s));
@@ -1730,10 +1737,15 @@ static Config loadConfig(const std::wstring& exeDir) {
     };
 
     // ext_calendar_ids 配列の読み込み（local 優先、なければ base）
-    auto readExtCalendarIds = [&](const std::optional<toml::table>& tbl) -> std::vector<std::string> {
-        if (!tbl) return {};
+    //
+    // テーブルが無い、または ext_calendar_ids キーが配列でない場合は nullopt を返す。
+    // キー不在（nullopt）と空配列を区別することで、local 側に空配列を書いた場合に
+    // base へフォールバックせず「無効化の明示指定」として扱える。（readSchedule と同じ方式）
+    auto readExtCalendarIds = [&](const std::optional<toml::table>& tbl)
+        -> std::optional<std::vector<std::string>> {
+        if (!tbl) return std::nullopt;
         const auto* arr = (*tbl)["ext_calendar_ids"].as_array();
-        if (!arr) return {};
+        if (!arr) return std::nullopt;
         std::vector<std::string> ids;
         for (const auto& el : *arr) {
             if (auto s = el.value<std::string>()) ids.push_back(*s);
@@ -1752,11 +1764,19 @@ static Config loadConfig(const std::wstring& exeDir) {
         cfg.schedule.resize(24, 1);
     }
 
-    cfg.duckTargets = readDuckTargets(local);
-    if (cfg.duckTargets.empty()) cfg.duckTargets = readDuckTargets(base);
+    if (auto v = readDuckTargets(local)) {
+        cfg.duckTargets = std::move(*v);
+    }
+    else if (auto v = readDuckTargets(base)) {
+        cfg.duckTargets = std::move(*v);
+    }
 
-    cfg.extCalendarIds = readExtCalendarIds(local);
-    if (cfg.extCalendarIds.empty()) cfg.extCalendarIds = readExtCalendarIds(base);
+    if (auto v = readExtCalendarIds(local)) {
+        cfg.extCalendarIds = std::move(*v);
+    }
+    else if (auto v = readExtCalendarIds(base)) {
+        cfg.extCalendarIds = std::move(*v);
+    }
 
     // トップレベル整数キー読み込みヘルパー
     // local 優先、なければ base、いずれも無ければ def を採用し、[lo, hi] にクランプする

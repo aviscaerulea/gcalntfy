@@ -48,12 +48,14 @@ schedule = [1, 1, 1, 1, 1, 1, 1, 2, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 3, 2, 1, 1,
 # ダッキング対象プロセス
 # 通知音再生中にミュートするプロセス名の配列。
 # コメントアウトまたは空配列でダッキング無効。
+# gcalntfy.local.toml に空配列を書くと、こちらの値を打ち消して無効化する。
 # duck_targets = ["chrome.exe", "msedge.exe"]
 
 # 追加ポーリング対象カレンダー ID
 # primary カレンダーに加えて、追加でポーリングするカレンダー ID の配列。
 # カレンダー ID は Google Calendar の「設定」→「カレンダーの統合」で確認できる。
 # コメントアウトまたは空配列で追加カレンダーなし（primary のみ）。
+# gcalntfy.local.toml に空配列を書くと、こちらの値を打ち消して追加カレンダーなしにする。
 # ext_calendar_ids = ["abc123@group.calendar.google.com"]
 
 # ガードトーン設定
