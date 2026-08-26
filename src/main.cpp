@@ -5367,7 +5367,12 @@ int wmain() {
         }
 
         // メッセージループ終了 → シャットダウン処理開始
-        g_shutdownRequested = true;
+        // 停止フラグは g_mtx の保持下で立てる。通知スレッドは条件変数の述語でこのフラグを見るため、
+        // ロックなしで立てると述語評価と待機列登録の間に割り込んだ通知を取り逃し、join が返らなくなる
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_shutdownRequested = true;
+        }
 
         // NIC 変化監視を解除してからスレッドを停止（コールバック発火を先に止める）
         // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
@@ -5397,7 +5402,11 @@ int wmain() {
         writeLog("unexpected initialization error");
         // joinable なスレッドを残したまま破棄すると std::terminate になるため、
         // 停止要求を立ててから合流させ、NIC 監視コールバックも解除してから戻る
-        g_shutdownRequested = true;
+        // 停止フラグは正常終了経路と同じく g_mtx の保持下で立てる（通知取りこぼし防止）
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_shutdownRequested = true;
+        }
         if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
         g_cv.notify_one();
         if (pollThread.joinable()) pollThread.join();
