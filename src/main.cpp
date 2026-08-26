@@ -1332,6 +1332,8 @@ static std::string normalizeToUtcIso(const std::string& dt) {
 // "error" フィールドがある場合は errorMsg に "API error" をセット
 // パースエラーの場合は errorMsg に "JSON parse error" をセット
 // "items" フィールドがない応答は予定 0 件の正常応答とみなし、空の結果を errorMsg なしで返す
+// この 0 件とみなす扱いは HTTP 成功ステータスの応答であることを前提とする。
+// 呼び出し側がステータスを検査し、成功以外の応答をここへ渡さない責務を負う
 static ParseResult parseCalendarEvents(const std::string& json) {
     ParseResult result;
     try {
@@ -4926,6 +4928,18 @@ static void fetchAllCalendarEvents(
         if (body.empty()) {
             writeLog("poll: calendar " + calId + " failed"
                 + (httpStatus != 0 ? " (status " + std::to_string(httpStatus) + ")" : ""));
+            outAllSuccess = false;
+            continue;
+        }
+
+        // 成功以外のステータスは、本文を解釈せずこのカレンダーの取得失敗として扱う。
+        // パース側は items キーのない応答を「予定 0 件の正常応答」とみなすため、
+        // 成功ステータスであることをここで保証しないと、items も error も持たない
+        // エラー応答が 0 件の成功として通り、変更検知が全予定の消失と誤認する
+        // （偽のキャンセル通知とキャッシュの空上書きを招く）。
+        if (httpStatus != 200) {
+            writeLog("poll: calendar " + calId + " unexpected status "
+                + std::to_string(httpStatus));
             outAllSuccess = false;
             continue;
         }
