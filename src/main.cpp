@@ -261,7 +261,9 @@ static std::atomic<bool> g_forcePoll{false};
 // 要求を消費したポーリングは、完了時点が分かるよう成否を Toast で応答する
 static std::atomic<bool> g_pollNowRequested{false};
 
-// 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
+// 前回ポーリング試行の開始時刻（GetTickCount64、連続ポーリング抑制・古さ判定用）
+// 成否を問わず試行の開始時点で更新する。成功時のみの更新にすると、失敗が 1 時間続いた時点で
+// 古さ判定が毎周回成立し、クールダウンとリトライ待ちがともに効かなくなるためだ
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
 // 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。ポーリング成功時に 0 リセット）
@@ -4949,9 +4951,13 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     }
 
     int  lastJstDay          = -1;
-    // 取得契機の成立フラグ。起動時、即時ポーリング要求、古さ判定、日付変更で真になり、ポーリング完走で偽に戻る。
-    // 真の回はクールダウンによる先送りの対象外とし、その回に成立した契機のトリガーログを出さない。
-    // リトライで継続した回をまたいで持続するため、先送り済みの契機を取りこぼさない。
+    // 初回取得フラグ。起動時に真で始まり、初回のポーリング試行の開始時点で偽に戻る
+    // （成否は問わない。以降真に戻ることはない）。
+    // 真の間はクールダウンによる先送りとトリガーログを抑止し、無条件に初回取得へ進む。
+    // 偽に戻したあとの契機は取りこぼさない（即時ポーリング要求は先送りとして持ち越され、
+    // 古さ判定は周回ごとに再評価されるため）。
+    // 失敗リトライ中も偽のままとする。真のまま持続させると、失敗継続中の即時ポーリング要求が
+    // クールダウンの先送りにかからず、API への間隔を置かない連続呼び出しを許すためだ。
     bool pollImmediately     = true;
     bool baselineEstablished = false; // 変更検知ベースラインが確立済みか
     bool deferredForce       = false; // クールダウンで先送りした即時ポーリング要求
@@ -5002,22 +5008,27 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 if (pollNow)             writeLog("poll now triggered (tray menu)");
                 else if (forceTriggered) writeLog("force poll triggered");
                 if (stale) writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
-                pollImmediately = true;
             }
 
             SYSTEMTIME utcNow;
             GetSystemTime(&utcNow);
             auto jstNow = utcToJst(utcNow);
 
-            // 日付変更：取得契機の成立フラグを立て、変更検知ベースラインを未確立へ戻す
+            // 日付変更：変更検知ベースラインを未確立へ戻す
             // notifiedSet は通知スレッドが自然失効で管理する
+            // 取得の前倒しは不要（ここへ到達した周回は必ず取得を試行するため）
             if (static_cast<int>(jstNow.wDay) != lastJstDay) {
                 lastJstDay          = static_cast<int>(jstNow.wDay);
-                pollImmediately     = true;
                 baselineEstablished = false;
             }
 
             int pollsPerHour = cfg.schedule[jstNow.wHour];
+
+            // 成否を問わず試行開始を記録し、初回取得フラグを偽に戻す。
+            // この記録が連続ポーリング抑制と古さ判定の基準時刻を失敗経路でも進め、
+            // 失敗継続中の間隔を置かない連続呼び出しを防ぐ
+            g_lastPollTick.store(GetTickCount64());
+            pollImmediately = false;
 
             // アクセストークン確保（非対話）。認証失敗時もブラウザは自動起動しない。
             {
@@ -5124,9 +5135,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 showToastSafe(L"更新完了", upcomingCountText(countUpcomingTodayEvents(events)));
             }
 
-            pollImmediately     = false;
             baselineEstablished = true;
-            g_lastPollTick.store(GetTickCount64());
             waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
         }
         catch (...) {
