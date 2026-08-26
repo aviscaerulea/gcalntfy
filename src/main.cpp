@@ -279,6 +279,8 @@ static std::atomic<bool> g_pollNowRequested{false};
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
 // 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。ポーリング成功時に 0 リセット）
+// 0 は「未表示」を表す番兵であり、経過時間としては解釈しない。（GetTickCount64 は OS 起動基準
+// のため、0 を時刻として引き算するとクールダウン判定が OS 起動からの経過時間になってしまう）
 static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
@@ -2813,13 +2815,18 @@ static void showToastSafe(const std::wstring& title, const std::wstring& body)
 // エラー Toast 表示（クールダウン制御付き）
 //
 // 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
+// 未表示状態（初期値および成功時リセット後）は抑制せず必ず表示する。
 // force=true は抑制を無視して必ず表示する。（ユーザ操作への応答など、沈黙すると
 // 操作の結果が分からなくなる用途に限って使う）
 // 抑制の起点は表示した時刻で更新する。（force での表示も起点になる）
 static void showErrorToast(const std::wstring& title, const std::wstring& body, bool force = false)
 {
     ULONGLONG now = GetTickCount64();
-    if (!force && now - g_lastErrorToastTime.load() < ERROR_TOAST_COOLDOWN_MS) return;
+    ULONGLONG last = g_lastErrorToastTime.load();
+    // last == 0 は未表示を表す。経過時間の計算に混ぜると GetTickCount64 が OS 起動基準のため
+    // 「OS 起動から 30 分以内は常にクールダウン中」と誤判定し、起動直後の通信エラーを一度も
+    // 通知できなくなる。未表示なら抑制せず必ず表示する
+    if (!force && last != 0 && now - last < ERROR_TOAST_COOLDOWN_MS) return;
     g_lastErrorToastTime.store(now);
     showToastSafe(title, body);
 }
