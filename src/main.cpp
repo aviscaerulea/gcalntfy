@@ -1420,7 +1420,11 @@ static ParseResult parseCalendarEvents(const std::string& json) {
                 }
             }
 
-            if (!e.datetime.empty() && !e.content.empty()) result.events.push_back(std::move(e));
+            // タイトル未設定の予定を破棄しない
+            // 破棄すると通知・一覧・件数・変更検知のすべてから無言で消え、ユーザが予定の存在に
+            // 気付けなくなる。表示上の識別子として代替名を与え、採用可否は開始日時の有無だけで決める
+            if (e.content.empty()) e.content = "（無題）";
+            if (!e.datetime.empty()) result.events.push_back(std::move(e));
         }
     }
     catch (winrt::hresult_error const& e) {
@@ -1588,7 +1592,9 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
             }
             // allDay の復元（旧キャッシュ互換：キーなし → false）
             e.allDay = obj.GetNamedBoolean(L"allDay", false);
-            if (!e.datetime.empty() && !e.content.empty()) events.push_back(std::move(e));
+            // タイトル未設定の予定は代替名を与えて保持する（API 応答パース側と同一仕様）
+            if (e.content.empty()) e.content = "（無題）";
+            if (!e.datetime.empty()) events.push_back(std::move(e));
         }
 
         // 全イベントが JST 当日より前の日付なら破棄（当日の開始済み予定は一覧表示に使うため保持）
