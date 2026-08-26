@@ -106,7 +106,7 @@ Only the first launch requires linking your Google account. A Windows notificati
 
 Place `gcalntfy.toml` in the same folder as the executable. The available settings and their meanings are documented in the comments of that file. (Changes take effect after restarting the app.)
 
-If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. Keeping only the settings you want to change there means you do not have to migrate them when a new version replaces `gcalntfy.toml`.
+If you also place `gcalntfy.local.toml` alongside it, its entries take priority on a per-key basis. Keeping only the settings you want to change there means you do not have to migrate them when a new version replaces `gcalntfy.toml`. For array settings, writing an empty array cancels out the value specified in `gcalntfy.toml`.
 
 The notification sound uses the `sound.wav` included in the distribution. To use a different sound, replace that file in the same folder as the executable with a 16-bit PCM WAV.
 
