@@ -1811,8 +1811,10 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.imminentSound = readConfigTopBool("imminent_sound", true);
 
     // urgent_minutes（予定一覧の赤文字閾値、分単位。デフォルト 60、0 で無効、負値は 0 にクランプ）
+    // 上限は int の最大値とする。格納先が int のため、これを超える値を通すと縮小変換で
+    // 負値になり、赤文字表示が全予定で無効化される
     cfg.urgentMinutes = static_cast<int>(readConfigTopInt("urgent_minutes",
-        DEFAULT_URGENT_MINUTES, 0, (std::numeric_limits<long long>::max)()));
+        DEFAULT_URGENT_MINUTES, 0, (std::numeric_limits<int>::max)()));
 
     // hover_delay_ms（ホバーで予定一覧を表示するまでの遅延、ms 単位。デフォルト 100、0〜5000 にクランプ、0 で即時）
     cfg.hoverDelayMs = readConfigTopInt("hover_delay_ms",
