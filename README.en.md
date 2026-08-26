@@ -16,7 +16,7 @@ A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you 
 
 ## Features
 
-- Event notifications: polls Google Calendar and notifies you via Windows notification before events start or when they change (notifications before an event also play a sound)
+- Event notifications: notifies you via Windows notification before events start or when they change (with sound before an event starts)
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
   - Imminent notification: notifying again just before an event starts can be toggled on or off
@@ -85,6 +85,12 @@ Install via [Scoop](https://scoop.sh/):
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install gcalntfy
 ```
+
+#### Uninstallation
+
+Settings and credentials are stored in the registry under `HKCU\SOFTWARE\gcalntfy`. Delete this key after uninstalling if you no longer need them.
+
+If you uninstalled with auto start left ON, delete the `gcalntfy` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ## Usage
 
