@@ -1717,7 +1717,9 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
 // local.toml のキーが優先（キー単位でオーバーライド）。
 // schedule は local があれば local 全体を使用、なければ base を使用。
 // 配列項目（schedule / duck_targets / ext_calendar_ids）は値の中身でなくキーの有無で
-// 採否を決める。local に空配列を書けば base の値を打ち消して無効化できる。
+// 採否を決めるため、local に空配列を書けば base の値を打ち消せる。
+// 打ち消した結果は項目で異なり、duck_targets と ext_calendar_ids は空のまま機能が無効になるが、
+// schedule は既定値（毎時 1 回）に戻る。ポーリング回数は 0 回（停止）を表現できない。
 static Config loadConfig(const std::wstring& exeDir) {
     auto base  = loadToml(exeDir + L"\\gcalntfy.toml");
     auto local = loadToml(exeDir + L"\\gcalntfy.local.toml");
