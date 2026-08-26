@@ -1329,6 +1329,7 @@ static std::string normalizeToUtcIso(const std::string& dt) {
 // Calendar API v3 JSON レスポンスを CalendarEvent 配列に変換する
 // "error" フィールドがある場合は errorMsg に "API error" をセット
 // パースエラーの場合は errorMsg に "JSON parse error" をセット
+// "items" フィールドがない応答は予定 0 件の正常応答とみなし、空の結果を errorMsg なしで返す
 static ParseResult parseCalendarEvents(const std::string& json) {
     ParseResult result;
     try {
@@ -1338,6 +1339,12 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             result.errorMsg = "API error";
             return result;
         }
+
+        // items キーの欠落は「取得窓に予定が 0 件」を意味する正常応答として扱う
+        // 取得クエリが fields=items(...) を指定するため、0 件のカレンダーの応答本体は {} になり
+        // items キー自体が現れない。GetNamedArray の 1 引数版はキー不在で例外を投げるため、
+        // 前置判定なしでは catch 節へ落ちて取得失敗と誤判定される
+        if (!obj.HasKey(L"items")) return result;
 
         auto arr = obj.GetNamedArray(L"items");
         for (auto item : arr) {
