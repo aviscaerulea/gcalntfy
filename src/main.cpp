@@ -136,7 +136,7 @@ static constexpr UINT IDM_SOUND_ENABLED       = 40005;
 static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
-static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 当日ページを開く
+static constexpr UINT IDM_OPEN_CALENDAR_TODAY = 40009; // Google Calendar 週表示ページを開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定の即時再取得（今すぐ更新）
 static constexpr UINT IDM_SHOW_PAST           = 40012; // 予定一覧の過去予定表示トグル
@@ -3537,7 +3537,7 @@ static void paintListWindow(HWND hWnd) {
 
 // 一覧ポップアップのウィンドウプロシージャ
 // 非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。マウス専用。
-// 予定行の左クリック＝予定ページを開いて閉じる。フッター・0 件行＝当日ページを開いて閉じる。
+// 予定行の左クリック＝予定ページを開いて閉じる。フッター・0 件行＝週表示ページを開いて閉じる。
 // 予定行の右クリック＝通知抑制のトグルで、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -3590,7 +3590,7 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         else {
-            // フッター・0 件行は Google Calendar の当日ページを開く（既存処理を共用）
+            // フッター・0 件行は Google Calendar の週表示ページを開く（既存処理を共用）
             handleTrayCommand(IDM_OPEN_CALENDAR_TODAY);
         }
         // 予定ページを開いたら一覧は役目を終える
@@ -4163,7 +4163,7 @@ static std::wstring getCurrentLogTarget() {
 
 // WM_COMMAND ディスパッチ
 // 右クリックメニューの選択（IDM_*）を処理する。
-// 一覧ポップアップのフッター・0 件行のクリックも、当日ページを開くためにここを共用する。
+// 一覧ポップアップのフッター・0 件行のクリックも、週表示ページを開くためにここを共用する。
 static void handleTrayCommand(UINT id) {
     if (id == IDM_EXIT) {
         g_shutdownRequested = true;
