@@ -4066,6 +4066,9 @@ static void showTrayContextMenu(HWND hWnd) {
     forceForeground(hWnd);
     auto pos = computeTrayPopupPos(pt);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
+    // 通知アイコンのメニューは TrackPopupMenu 直後にオーナーへダミーメッセージを送らないと、
+    // メニュー外クリックで閉じずに残る（Win32 の既知の要求。forceForeground と対で必要）
+    PostMessage(hWnd, WM_NULL, 0, 0);
     DestroyMenu(hMenu);
     g_popupShowing.store(false);
     updateTrayTooltip(hWnd);
