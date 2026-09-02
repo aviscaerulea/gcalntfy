@@ -2437,6 +2437,17 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
     phase = std::fmod(phase, 2.0 * PI);
 }
 
+// 通知音再生 1 回分の見積もり時間（ミリ秒）
+//
+// 本体 WAV の再生長 + ガードトーン 2 回（リードイン・リードアウト）+ 10 秒の余裕。
+// playWavToWasapi の打ち切り期限と launchSound の前回スレッド待機上限が同じ根拠を
+// 共有するための単一の算出点。totalFrames はチャンネル数で割った後のフレーム数。
+static ULONGLONG estimateSoundDurationMs(const Config& cfg, UINT32 totalFrames,
+    const WAVEFORMATEX& wavFmt)
+{
+    return totalFrames * 1000ULL / wavFmt.nSamplesPerSec + 2ULL * cfg.guardToneMs + 10000;
+}
+
 // ノーマライズ済み PCM データを WASAPI 共有モードで再生する
 //
 // 再生フロー（cfg.guardToneMs > 0 の場合）：
@@ -2455,11 +2466,9 @@ static bool playWavToWasapi(const Config& cfg, const std::vector<int16_t>& sampl
     // 再生全体の打ち切り期限
     // デバイスがフレームを消費しなくなる異常（padding が減らないまま停滞）では、
     // 各供給ループが 200ms 待機の avail==0 continue で永久スピンし、スレッドが
-    // プロセス終了まで残存する。想定再生時間（ガードトーン 2 回 + 本体）に
-    // 10 秒の余裕を加えた時刻を超えたら異常として中断する。
+    // プロセス終了まで残存する。見積もり時間（余裕込み）を超えたら異常として中断する。
     const ULONGLONG playDeadline = GetTickCount64()
-        + totalFrames * 1000ULL / wavFmt.nSamplesPerSec
-        + 2ULL * cfg.guardToneMs + 10000;
+        + estimateSoundDurationMs(cfg, totalFrames, wavFmt);
 
     bool   ok     = false;
     HANDLE hEvent = nullptr;
@@ -2652,13 +2661,20 @@ static void launchSound(const Config& cfg) {
     // 前回スレッドの完了を待ってから新スレッドを起動する
     // 旧スレッドが再生中に新スレッドを起動すると、旧スレッドの unduck と新スレッドの duck が競合し、
     // 新スレッド再生中に他プロセスが意図せずミュート解除される問題が起きる。
+    // 待機上限は再生 1 回分の見積もり時間（estimateSoundDurationMs）に揃える。固定値だと
+    // guard.tone_ms を大きく設定した構成で正常な再生時間が上限を超え、後続の通知音が
+    // 無条件にスキップされるため。上限超過は playWavToWasapi 側の打ち切りと同じく異常とみなす。
     // タイムアウト時はハンドルを保持したまま今回の再生を諦める（強制終了するとスレッド固有 COM/WASAPI
     // リソースが宙に浮くため）。次回 launchSound 呼び出し時に再度 join を試みる。
     // 待機ループは 1 秒単位で g_shutdownRequested を監視し、シャットダウン要求があれば即時放棄する。
     // WAIT_OBJECT_0 以外（WAIT_FAILED 等）は異常終了として再生を見送る。
     if (g_soundThread) {
+        const int maxWaitSec = static_cast<int>(
+            (estimateSoundDurationMs(cfg,
+                static_cast<UINT32>(g_wavCache.samples.size()) / g_wavCache.fmt.nChannels,
+                g_wavCache.fmt) + 999) / 1000);
         DWORD waitResult = WAIT_TIMEOUT;
-        for (int waited = 0; waited < 10; ++waited) {
+        for (int waited = 0; waited < maxWaitSec; ++waited) {
             if (g_shutdownRequested.load()) {
                 writeLog("launchSound: shutdown requested while waiting previous thread, skipping this play");
                 return;
@@ -2667,7 +2683,8 @@ static void launchSound(const Config& cfg) {
             if (waitResult != WAIT_TIMEOUT) break;
         }
         if (waitResult == WAIT_TIMEOUT) {
-            writeLog("launchSound: previous sound thread did not finish within 10s, skipping this play");
+            writeLog("launchSound: previous sound thread did not finish within "
+                + std::to_string(maxWaitSec) + "s, skipping this play");
             return;
         }
         if (waitResult != WAIT_OBJECT_0) {
