@@ -71,6 +71,7 @@
 #include <mutex>
 #include <thread>
 #include <cstdio>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -100,10 +101,25 @@ static constexpr int MAX_NOTIFY_MINUTES = 30;
 // 秒単位で刻むのは 1 分未満のリードを扱うためで、通知済み記録も秒粒度で持つ。
 // v2.14.0 ではデフォルト 0（無効）だったが、TOML を編集せずトレイ操作だけで有効化できるよう
 // 60 秒へ変更した。直前通知を行うかはトレイメニューのトグル（g_imminentEnabled、
-// デフォルト OFF）で切り替える。トグルを ON にするまで直前通知は鳴らない
+// デフォルト OFF）で切り替える。トグルを ON にするまで直前通知は鳴らない。
+// 子項目「リモート会議のみ」（g_imminentRemoteOnly、デフォルト ON）が ON の間はリモート会議の
+// 予定に限定する
 static constexpr int DEFAULT_IMMINENT_SECONDS = 60;
 static constexpr int MIN_IMMINENT_SECONDS     = 0;
 static constexpr int MAX_IMMINENT_SECONDS     = 60;
+
+// リモート会議と判定する URL のホスト名（部分一致、サブドメインを含む）
+// hangoutLink、conferenceData の各 entryPoint の uri、location、description のすべてを
+// 同じテーブルで走査する単一方式とする。conferenceData に他プロバイダ（Webex 等）が
+// 入っていてもこのテーブルにないホストはリモート会議と扱わない。
+// 招待文に別会議の URL を引用した予定を誤検出しうるが、Outlook 由来の Teams 招待や
+// 手貼りの Zoom URL を拾うことを優先して割り切る
+static constexpr const char* REMOTE_MEETING_HOSTS[] = {
+    "meet.google.com", "teams.microsoft.com", "teams.live.com", "zoom.us",
+};
+
+// リモート会議の予定の表示名に付ける接頭辞（予定一覧と Toast 通知の両方で使う）
+static constexpr const char* REMOTE_MEETING_PREFIX = "👥 ";
 
 // 予定一覧の赤文字閾値（urgent_minutes）のデフォルト（分）。0 で機能無効
 static constexpr int DEFAULT_URGENT_MINUTES = 60;
@@ -339,6 +355,7 @@ struct CalendarEvent {
     std::string      permalink;
     std::vector<int> reminderMinutes; // イベント個別の追加通知分数（popup のみ。空=追加通知なし）
     bool             allDay = false;  // 終日予定（開始が日付のみ）。予定一覧の表示対象から除外する
+    bool             remote = false;  // リモート会議（Meet、Teams、Zoom の URL を持つ予定）。一覧・通知の 👥 接頭辞と直前通知の限定に使う
 };
 
 // parseCalendarEvents の戻り値
@@ -1344,6 +1361,23 @@ static std::string normalizeToUtcIso(const std::string& dt) {
     return buf;
 }
 
+// 文字列にリモート会議のホスト名が含まれるかを返す
+// 大文字小文字を区別しない（ASCII 範囲のみ小文字化して比較する）
+static bool containsRemoteMeetingHost(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const char* host : REMOTE_MEETING_HOSTS)
+        if (text.find(host) != std::string::npos) return true;
+    return false;
+}
+
+// 予定の表示名を返す（一覧・Toast 共通）
+// リモート会議なら件名の先頭に REMOTE_MEETING_PREFIX を付ける。
+// 通知抑制キーやキャッシュには使わない（eventKey は生の content を使う）
+static std::string displayTitle(const CalendarEvent& e) {
+    return e.remote ? std::string(REMOTE_MEETING_PREFIX) + e.content : e.content;
+}
+
 // Calendar API v3 JSON レスポンスを CalendarEvent 配列に変換する
 // "error" フィールドがある場合は errorMsg に "API error" をセット
 // パースエラーの場合は errorMsg に "JSON parse error" をセット
@@ -1425,6 +1459,22 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 
             e.content   = winrt::to_string(ev.GetNamedString(L"summary",  L""));
             e.permalink = winrt::to_string(ev.GetNamedString(L"htmlLink", L""));
+
+            // リモート会議の判定：hangoutLink、location、description、conferenceData の
+            // 各 entryPoint の uri を 1 本の文字列に連結して REMOTE_MEETING_HOSTS で走査する
+            {
+                std::string urlText = winrt::to_string(ev.GetNamedString(L"hangoutLink", L""))
+                    + "\n" + winrt::to_string(ev.GetNamedString(L"location", L""))
+                    + "\n" + winrt::to_string(ev.GetNamedString(L"description", L""));
+                if (ev.HasKey(L"conferenceData")) {
+                    auto conf = ev.GetNamedObject(L"conferenceData");
+                    if (conf.HasKey(L"entryPoints")) {
+                        for (auto ep : conf.GetNamedArray(L"entryPoints"))
+                            urlText += "\n" + winrt::to_string(ep.GetObject().GetNamedString(L"uri", L""));
+                    }
+                }
+                e.remote = containsRemoteMeetingHost(urlText);
+            }
 
             // reminders.overrides の popup エントリを通知分数として収集（useDefault は無視）
             if (ev.HasKey(L"reminders")) {
@@ -1572,6 +1622,7 @@ static void saveCacheFile(const std::wstring& dir, const std::vector<CalendarEve
             for (int m : e.reminderMinutes) remArr.Append(JsonValue::CreateNumberValue(m));
             obj.Insert(L"reminderMinutes", remArr);
             obj.Insert(L"allDay", JsonValue::CreateBooleanValue(e.allDay));
+            obj.Insert(L"remote", JsonValue::CreateBooleanValue(e.remote));
             arr.Append(obj);
         }
         auto json = winrt::to_string(arr.Stringify());
@@ -1612,6 +1663,8 @@ static std::vector<CalendarEvent> loadCacheFile(const std::wstring& dir) {
             }
             // allDay の復元（旧キャッシュ互換：キーなし → false）
             e.allDay = obj.GetNamedBoolean(L"allDay", false);
+            // remote の復元（旧キャッシュ互換：キーなし → false）
+            e.remote = obj.GetNamedBoolean(L"remote", false);
             // タイトル未設定の予定は代替名を与えて保持する（API 応答パース側と同一仕様）
             if (e.content.empty()) e.content = "（無題）";
             if (!e.datetime.empty()) events.push_back(std::move(e));
@@ -3689,7 +3742,9 @@ static void showListPopup(HWND trayWnd) {
         auto date  = jst.substr(0, 10);
         bool muted = mutedSnapshot.count(key) != 0;
         // "HH:MM タイトル" 形式（左余白は行パディングが確保するためプレフィックス不要）
-        std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + ev.content);
+        // リモート会議は displayTitle が "👥 " を件名の先頭に付ける（時刻列の揃えは崩さない。
+        // GDI 描画のため絵文字は単色グリフで出る）。
+        std::wstring label = toWide((jst.size() >= 16 ? jst.substr(11, 5) : "??:??") + " " + displayTitle(ev));
         // 今後の予定にはタイトル末尾へ開始までの残り時間「（n時間n分後）」を付ける。
         // ポップアップを開くたびに現在時刻で再計算される。1 時間未満は「（n分後）」、
         // ちょうど n 時間なら「（n時間後）」と 0 分を省略する。過去予定には付けない。
@@ -4523,7 +4578,7 @@ static std::vector<EventChange> collectEventChanges(
             if (!e.allDay && e.datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::Added,
                                {}, e.datetime,
-                               e.content, e.permalink});
+                               displayTitle(e), e.permalink});
         }
         else if (it->second->datetime != e.datetime) {
             // 変更前後とも猶予を過ぎた開始済みの日時変更は通知しない。どちらかが未来か猶予内なら
@@ -4532,7 +4587,7 @@ static std::vector<EventChange> collectEventChanges(
             if (!e.allDay && it->second->datetime <= staleUtc && e.datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::TimeChanged,
                                it->second->datetime, e.datetime,
-                               e.content, e.permalink});
+                               displayTitle(e), e.permalink});
         }
     }
 
@@ -4542,7 +4597,7 @@ static std::vector<EventChange> collectEventChanges(
             if (old->datetime <= staleUtc) continue;
             changes.push_back({EventChangeType::Cancelled,
                                old->datetime, {},
-                               old->content, old->permalink});
+                               displayTitle(*old), old->permalink});
         }
     }
 
@@ -4643,7 +4698,7 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
     for (const auto* ev : group) {
         // Toast 失敗の例外がスレッド関数を貫通すると std::terminate するため捕捉して継続する
         try {
-            showToast(jstTimeW, toWide(ev->content), toWide(ev->permalink));
+            showToast(jstTimeW, toWide(displayTitle(*ev)), toWide(ev->permalink));
         }
         catch (...) {
             writeLog("fireNotificationGroup: toast failed for " + ev->content);
@@ -4895,12 +4950,13 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
     auto tomorrowEndUtc = jstToUtc(tomorrowEndJst);
     auto endUtc = systemTimeToIso(tomorrowEndUtc) + ".000Z";
 
-    // description は focusTime イベントがタスク由来か集中タイムかの判別に使う。
-    // （parseCalendarEvents 参照。tasks.google.com/task/ の URL 有無で判定）
+    // description は focusTime イベントがタスク由来か集中タイムかの判別と、リモート会議の
+    // 判定に使う（parseCalendarEvents 参照）。
+    // hangoutLink、location、conferenceData の entryPoints(uri) はリモート会議の判定専用
     // maxResults は 250（API のデフォルト値）とする。取得窓が当日 0 時起点になり過去予定も
     // 枠を消費するため、従来の 50 のままでは以降の予定が押し出されて通知が漏れる
     std::wstring queryParams = L"?singleEvents=true&orderBy=startTime&maxResults=250";
-    queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders,description)";
+    queryParams += L"&fields=items(id,summary,start,htmlLink,eventType,status,attendees(self,responseStatus),reminders,description,hangoutLink,location,conferenceData(entryPoints(uri)))";
     queryParams += L"&timeMin=" + toWide(urlEncode(startUtc));
     queryParams += L"&timeMax=" + toWide(urlEncode(endUtc));
     return queryParams;

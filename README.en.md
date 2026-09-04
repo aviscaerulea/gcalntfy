@@ -20,6 +20,7 @@ A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you 
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
   - Imminent notification: notifying again just before an event starts can be toggled on or off
+  - Remote meetings: events with a Meet, Teams, or Zoom URL are shown with 👥 at the start of the title (also in notifications)
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
   - Notification suppression (stopping notifications): right-clicking an event stops notifications for it and shows it with a strikethrough
