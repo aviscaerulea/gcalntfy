@@ -5,7 +5,8 @@
  * exe 同フォルダの gcalntfy.toml（または .local.toml）から設定を読み込み、
  * schedule に従って自律的にポーリングし、次の予定を notify_minutes 分前（デフォルト 5 分）に Toast 通知で知らせる。
  * 開始の imminent_seconds 秒前（デフォルト 60 秒）にも Toast 通知を出す（0 指定で無効）。
- * 発火の有無はトレイメニュー「直前通知を行う」で切り替える（デフォルト OFF）。
+ * 発火の有無はトレイメニュー「直前通知を行う」で切り替える（デフォルト OFF）。子項目「リモート会議のみ」
+ * （デフォルト ON）の間は Meet、Teams、Zoom の URL を持つ予定に限って直前通知する。
  * schedule は 0 時〜23 時の 24 要素配列（回/時、最低 1）。
  * 通知済みイベントは Google Calendar イベント id で記憶して重複防止する（id 未取得時は datetime+content にフォールバック）。
  *
@@ -158,6 +159,7 @@ static constexpr UINT IDM_POLL_NOW            = 40011; // カレンダー予定�
 static constexpr UINT IDM_SHOW_PAST           = 40012; // 予定一覧の過去予定表示トグル
 static constexpr UINT IDM_HOVER_POPUP         = 40013; // ホバーでの予定一覧表示トグル
 static constexpr UINT IDM_IMMINENT_NOTIFY     = 40014; // 直前通知の ON/OFF トグル
+static constexpr UINT IDM_IMMINENT_REMOTE_ONLY = 40015; // 直前通知をリモート会議に限定するトグル（直前通知の子項目）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/gcalntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/gcalntfy/releases";
@@ -265,6 +267,11 @@ static std::atomic<bool> g_imminentEnabled{false};
 // TOML の imminent_seconds が正か（起動時に loadConfig の値を反映し以降不変）
 // TOML 側で無効なときにトレイメニュー項目をグレーアウトするための判定に使う
 static std::atomic<bool> g_imminentCfgEnabled{false};
+// 直前通知をリモート会議（CalendarEvent::remote）の予定に限定するか
+// （レジストリ ImminentRemoteOnly で永続化、デフォルト ON）
+// 「直前通知を行う」の子項目で、親 OFF または TOML の imminent_seconds = 0 の間は非活性。
+// ON の間、リモート会議でない予定は直前通知の候補から外す（実効リード時間 0 と同じ扱い）
+static std::atomic<bool> g_imminentRemoteOnly{true};
 // ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
 static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
 // ホバー自動表示直後のクリック猶予（ms、0〜5000 にクランプ済み）。起動時に反映し以降不変
@@ -2067,6 +2074,7 @@ static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_SHOW_PAST_EVENTS  = L"ShowPastEvents";
 static constexpr const wchar_t* REG_HOVER_POPUP       = L"HoverPopup";
 static constexpr const wchar_t* REG_IMMINENT_NOTIFY   = L"ImminentNotify";
+static constexpr const wchar_t* REG_IMMINENT_REMOTE_ONLY = L"ImminentRemoteOnly";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -4118,6 +4126,12 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | imminentFlags | (g_imminentEnabled ? MF_CHECKED : MF_UNCHECKED),
         IDM_IMMINENT_NOTIFY, L"直前通知を行う");
 
+    // 子項目：直前通知をリモート会議に限定するトグル（親が OFF または TOML 無効なら非活性）
+    UINT remoteOnlyFlags = (g_imminentCfgEnabled.load() && g_imminentEnabled.load())
+        ? 0u : (MF_DISABLED | MF_GRAYED);
+    AppendMenuW(hMenu, MF_STRING | remoteOnlyFlags | (g_imminentRemoteOnly ? MF_CHECKED : MF_UNCHECKED),
+        IDM_IMMINENT_REMOTE_ONLY, L"　　リモート会議のみ");
+
     // スタートアップ登録トグル（HKCU Run キー）
     AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
         IDM_STARTUP, L"スタートアップ登録");
@@ -4281,6 +4295,20 @@ static void handleTrayCommand(UINT id) {
             writeRegDword(REG_IMMINENT_NOTIFY, g_imminentEnabled.load() ? 1u : 0u);
             // 通知スレッドを直接起こしてトグルを即時反映する
             // （OFF なら待機中の直前通知の発火を取り下げ、ON なら候補へ復帰させる）
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_eventsUpdated = true;
+            }
+            g_cv.notify_one();
+        }
+        return;
+    }
+    if (id == IDM_IMMINENT_REMOTE_ONLY) {
+        // 親 OFF または TOML 無効の間は非活性項目への誤クリックを無視する
+        if (g_imminentCfgEnabled.load() && g_imminentEnabled.load()) {
+            g_imminentRemoteOnly.store(!g_imminentRemoteOnly.load());
+            writeRegDword(REG_IMMINENT_REMOTE_ONLY, g_imminentRemoteOnly.load() ? 1u : 0u);
+            // 通知スレッドを直接起こして限定の切り替えを即時反映する（親トグルと同じ経路）
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 g_eventsUpdated = true;
@@ -4707,13 +4735,21 @@ static void fireNotificationGroup(const std::vector<const CalendarEvent*>& group
     }
 }
 
+// 予定ごとの直前通知の実効リード時間を返す
+// imminentMs は周回ごとの実効値（トグル OFF なら 0）。リモート会議のみの限定が ON で、
+// 予定がリモート会議でなければ 0（その予定では直前通知なし）を返す
+static inline long long effectiveImminentMs(const CalendarEvent& e, long long imminentMs, bool remoteOnly) {
+    return (remoteOnly && !e.remote) ? 0 : imminentMs;
+}
+
 // 発火対象を特定する：通知タイミングが到来しかつ未通知のイベントから最初の (datetime, leadMs) を返す
 // 見つからなければ targetDatetime を空のまま返す。
 // imminentLeadMs が 0 のときは直前通知を候補に含めない。
+// remoteOnly が true のときリモート会議でない予定は直前通知を候補に含めない。
 static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
     const std::string& nowUtc, const std::set<std::string>& notifiedSet,
     const std::unordered_set<std::string>& mutedKeys, long long leadMs,
-    long long imminentLeadMs,
+    long long imminentLeadMs, bool remoteOnly,
     std::string& targetDatetime, long long& targetLeadMs)
 {
     targetDatetime.clear();
@@ -4735,7 +4771,8 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
         if (tryLead(leadMs)) return;
         for (int m : e.reminderMinutes)
             if (tryLead(static_cast<long long>(m) * 60000)) return;
-        if (imminentLeadMs > 0 && tryLead(imminentLeadMs)) return;
+        long long evImminentMs = effectiveImminentMs(e, imminentLeadMs, remoteOnly);
+        if (evImminentMs > 0 && tryLead(evImminentMs)) return;
     }
 }
 
@@ -4747,6 +4784,8 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
 // トレイメニューの直前通知トグル（g_imminentEnabled）が ON なら、開始直前のタイミングでも
 // 追加通知する（重複するリード時間は 1 回のみ通知）。トグルは周回ごとに評価するため、
 // OFF への切り替えを待機中の直前通知にも即時反映する。
+// トレイメニューの子項目「リモート会議のみ」が ON の間は、リモート会議（CalendarEvent::remote）
+// でない予定に直前通知を出さない（予定ごとの実効リード時間を 0 として扱う）。
 // 起動直後などタイミング経過後に評価した場合、基本通知と直前通知は開始前である限り
 // 遡って発火する。両方が経過済みなら基本通知 1 回に集約する。
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
@@ -4788,6 +4827,8 @@ static void notifyThreadFunc() {
             long long leadMs = localConfig.notifyLeadMs;
             // 直前通知の実効リード時間。直前通知トグルが OFF の間は 0（無効）として扱う
             long long imminentMs = g_imminentEnabled.load() ? localConfig.imminentLeadMs : 0;
+            // 直前通知をリモート会議に限定するか。周回ごとに評価し、子項目の切り替えを即時反映する
+            bool remoteOnly = g_imminentRemoteOnly.load();
 
             // 全イベント × 全通知タイミングを走査して最小発火待機時間を計算
             // notifiedSet キーは "eventKey|開始日時@秒数" 形式
@@ -4799,6 +4840,8 @@ static void notifyThreadFunc() {
                 if (diffMs <= 0) continue;
                 // 通知抑制中のイベントは minFireMs 計算から除外する
                 if (mutedKeys.count(eventKey(e))) continue;
+                // この予定の直前通知の実効リード時間（リモート限定で非リモートなら 0）
+                long long evImminentMs = effectiveImminentMs(e, imminentMs, remoteOnly);
                 // notify_minutes（ベースライン）+ reminders + 直前通知のすべてのタイミングをチェック
                 auto checkLead = [&](long long leadMsVal) {
                     auto key = notifyKey(e, leadMsVal);
@@ -4821,7 +4864,7 @@ static void notifyThreadFunc() {
                     if (diffMs - rmMs >= 0) {
                         checkLead(rmMs);
                     }
-                    else if (rmMs != imminentMs && rmMs != leadMs) {
+                    else if (rmMs != evImminentMs && rmMs != leadMs) {
                         notifiedSet.insert(notifyKey(e, rmMs));
                     }
                 }
@@ -4830,15 +4873,15 @@ static void notifyThreadFunc() {
                 // 意味がないため直前通知を通知済みとみなし、基本通知 1 回に集約する。
                 // 両者のリード時間が等しいときはキーが同一で、マークすると基本通知まで
                 // 消えるため除外する
-                if (imminentMs > 0) {
+                if (evImminentMs > 0) {
                     bool baseOverdue = (diffMs - leadMs <= 0)
                         && !notifiedSet.count(notifyKey(e, leadMs));
-                    if (baseOverdue && diffMs - imminentMs <= 0
-                        && imminentMs != leadMs) {
-                        notifiedSet.insert(notifyKey(e, imminentMs));
+                    if (baseOverdue && diffMs - evImminentMs <= 0
+                        && evImminentMs != leadMs) {
+                        notifiedSet.insert(notifyKey(e, evImminentMs));
                     }
                     else {
-                        checkLead(imminentMs);
+                        checkLead(evImminentMs);
                     }
                 }
             }
@@ -4870,7 +4913,7 @@ static void notifyThreadFunc() {
             std::string targetDatetime;
             long long   targetLeadMs = 0;
             selectFireTarget(localEvents, nowUtc, notifiedSet, mutedKeys, leadMs,
-                imminentMs, targetDatetime, targetLeadMs);
+                imminentMs, remoteOnly, targetDatetime, targetLeadMs);
             if (targetDatetime.empty()) continue; // 発火対象なし（稀なケース）
 
             // 同 datetime かつ同 targetLeadMs のイベントをグループ化
@@ -4887,8 +4930,9 @@ static void notifyThreadFunc() {
                     for (int m : e.reminderMinutes)
                         if (static_cast<long long>(m) * 60000 == targetLeadMs) { isBase = true; break; }
                 }
-                bool isImminent = (imminentMs > 0
-                    && targetLeadMs == imminentMs);
+                long long evImminentMs = effectiveImminentMs(e, imminentMs, remoteOnly);
+                bool isImminent = (evImminentMs > 0
+                    && targetLeadMs == evImminentMs);
                 if (!isBase && !isImminent) continue;
                 if (mutedKeys.count(eventKey(e))) continue;
                 auto key = notifyKey(e, targetLeadMs);
@@ -5457,6 +5501,7 @@ int wmain() {
         g_showPastEvents    = readRegDword(REG_SHOW_PAST_EVENTS, 1u) != 0;
         g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
         g_imminentEnabled   = readRegDword(REG_IMMINENT_NOTIFY, 0u) != 0;
+        g_imminentRemoteOnly = readRegDword(REG_IMMINENT_REMOTE_ONLY, 1u) != 0;
 
         // toml のホバー遅延・クリック猶予を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));

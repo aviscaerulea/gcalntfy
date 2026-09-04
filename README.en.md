@@ -19,7 +19,7 @@ A sister tool, [redntfy](https://github.com/aviscaerulea/redntfy), notifies you 
 - Event notifications: notifies you via Windows notification before events start or when they change (with sound before an event starts)
 - System tray: view the event list and change settings from the tray icon
   - Past events: display can be toggled on or off
-  - Imminent notification: notifying again just before an event starts can be toggled on or off
+  - Imminent notification: notifying again just before an event starts can be toggled on or off (can also be limited to remote meetings)
   - Remote meetings: events with a Meet, Teams, or Zoom URL are shown with 👥 at the start of the title (also in notifications)
   - Next event: shown in bold (turns red when within the configured time)
   - Browser display: clicking an event or the footer opens it in the browser
@@ -41,7 +41,7 @@ Right-clicking the tray icon opens the tray menu, which provides various setting
 | Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
 | Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
-| Just before an event starts (default 60 seconds ahead) | Yes | Yes | Only when "Imminent notification" is ON in the tray menu (OFF by default; the lead time can be adjusted to 0-60 seconds and the sound can be turned off in the configuration) |
+| Just before an event starts (default 60 seconds ahead) | Yes | Yes | Only when "Imminent notification" is ON in the tray menu (OFF by default; the lead time can be adjusted to 0-60 seconds and the sound can be turned off in the configuration). While the sub-item "Remote meetings only" is ON (default), limited to events with a Meet, Teams, or Zoom URL |
 | At the notification time set in Google Calendar | Yes | Yes | Only when the individual event has a popup notification set (calendar-wide default notifications are not covered) |
 | When a change, cancellation, or addition is found | Yes | No | When an event's start time differs from the previous check, or an event was added or removed (changes affecting only events more than one hour past their start time are not notified) |
 | After running "Refresh now" | Yes | No | Only when run from the tray menu (shows the number of events remaining today on success, or the reason on failure) |
