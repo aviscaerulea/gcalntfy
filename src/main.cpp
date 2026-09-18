@@ -361,7 +361,7 @@ struct CalendarEvent {
     std::string      content;
     std::string      permalink;
     std::vector<int> reminderMinutes; // イベント個別の追加通知分数（popup のみ。空=追加通知なし）
-    bool             allDay = false;  // 終日予定（開始が日付のみ）。予定一覧の表示対象から除外する
+    bool             allDay = false;  // 終日予定（開始が日付のみ）。予定一覧の表示と開始前通知の対象から除外する
     bool             remote = false;  // リモート会議（Meet、Teams、Zoom の URL を持つ予定）。一覧・通知の 👥 接頭辞と直前通知の限定に使う
 };
 
@@ -4776,9 +4776,21 @@ static void selectFireTarget(const std::vector<CalendarEvent>& localEvents,
     }
 }
 
+// 通知スレッドが扱う予定リストを g_pendingEvents から作る（g_mtx 保持中に呼ぶ）。
+// 終日予定は JST 0 時開始へ正規化しているため、そのまま通知対象にすると取得窓に入る翌日分を
+// 深夜 0 時前に通知してしまう（直前通知が有効なら 2 連発）。予定一覧の非表示と揃えて通知対象から
+// 除外する。変更検知（追加・キャンセル）は g_pendingEvents 全件を突合するため影響を受けない。
+static std::vector<CalendarEvent> notifyTargetEvents() {
+    std::vector<CalendarEvent> out;
+    for (const auto& e : g_pendingEvents)
+        if (!e.allDay) out.push_back(e);
+    return out;
+}
+
 // 通知スレッド：メインスレッドから予定リストを受け取り、通知を実行する
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
+// 予定リストは notifyTargetEvents で終日予定を除いたものを使う（終日予定は開始前通知の対象外）。
 // notify_minutes 前を基本通知タイミングとし、イベントの reminders.overrides に popup が
 // 設定されていれば、そのタイミングでも追加通知する。imminent_seconds が 0 でなく、かつ
 // トレイメニューの直前通知トグル（g_imminentEnabled）が ON なら、開始直前のタイミングでも
@@ -4813,7 +4825,7 @@ static void notifyThreadFunc() {
             std::unique_lock<std::mutex> lk(g_mtx);
             g_cv.wait(lk, [] { return g_eventsUpdated || g_shutdownRequested.load(); });
             if (g_shutdownRequested) break;
-            localEvents     = g_pendingEvents;
+            localEvents     = notifyTargetEvents();
             localConfig     = g_currentConfig;
             g_eventsUpdated = false;
             for (const auto& kv : g_mutedEvents)
@@ -4895,7 +4907,7 @@ static void notifyThreadFunc() {
                 g_cv.wait_until(lk, wakeAt,
                     [] { return g_eventsUpdated || g_shutdownRequested.load(); });
                 if (g_eventsUpdated) {
-                    localEvents     = g_pendingEvents;
+                    localEvents     = notifyTargetEvents();
                     localConfig     = g_currentConfig;
                     leadMs          = localConfig.notifyLeadMs;
                     g_eventsUpdated = false;
