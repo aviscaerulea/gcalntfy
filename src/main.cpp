@@ -4660,18 +4660,17 @@ struct EventChange {
 // 終日予定は JST 0 時開始に正規化され当日分が常に開始済み扱いになるため、変更後が終日の
 // 追加・日時変更は除外せず通知する。（キャンセルの除外は終日予定にも適用される）
 // Added 検知は取得窓への新規進入を検知するものであり、ユーザが Calendar
-// に実際に追加した予定との区別は行わない。（ベースライン未確立の回は変更検知を行わず起動直後の誤検知を抑制）
+// に実際に追加した予定との区別は行わない。（起動直後の誤検知は呼び出し元がベースライン
+// 未確立の回に本関数を呼ばないことで抑制する。oldEvents が空でも本関数は通常どおり突合し、
+// 前回 0 件からの新規出現を Added として検知する）
 // このため、一度消えた予定の再出現（作り直し、再招待、窓外からの復帰）も Added とする。
 // 変更検知は抑制状態を参照しない。抑制の意図をアプリは知り得ず、変更や再出現で参加できる
 // ようになる場合があるためだ。抑制は開始前通知の側だけに適用する。
 // id が空のイベントは比較対象から除外する。
-// oldEvents が空の場合は空のベクタを返す（変更検知の開始前状態）。
 static std::vector<EventChange> collectEventChanges(
     const std::vector<CalendarEvent>& oldEvents,
     const std::vector<CalendarEvent>& newEvents)
 {
-    if (oldEvents.empty()) return {};
-
     std::unordered_map<std::string, const CalendarEvent*> oldMap;
     for (const auto& e : oldEvents) {
         if (!e.id.empty()) oldMap[e.id] = &e;
