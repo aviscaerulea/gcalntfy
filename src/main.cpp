@@ -4596,10 +4596,18 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         PostQuitMessage(0);
         return 0;
     }
-    // スリープ復帰・ロック解除：即時ポーリングをトリガー
+    // スリープ復帰・ロック解除：即時ポーリングをトリガーし、通知スレッドの待機もやり直させる
+    // 通知スレッドの wait_until は相対タイムアウト（SleepConditionVariableSRW）で実装され、
+    // スリープ中の経過時間を数えない。ポーリングが失敗し続けると待機のやり直しの契機がなく、
+    // 開始前通知が遅れるか開始済みとして消えるため、ここで直接起こして現在時刻で再計算させる。
     if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
         (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
         g_forcePoll.store(true);
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_eventsUpdated = true;
+        }
+        g_cv.notify_one();
         writeLog(msg == WM_POWERBROADCAST ? "resume from sleep" : "session unlock");
         return msg == WM_POWERBROADCAST ? TRUE : 0;
     }
@@ -4890,6 +4898,8 @@ static std::vector<CalendarEvent> notifyTargetEvents() {
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
 // 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
 // 全イベント × 全通知タイミングを走査して最小発火時間を求めてから wait_until で待機する。
+// wait_until はスリープ中の経過時間を数えないため、スリープ復帰・ロック解除時はメインスレッドが
+// g_eventsUpdated を立てて起こし、現在時刻で待機時間を再計算させる。
 static void notifyThreadFunc() {
     // 初期化失敗の例外がスレッド関数を脱出すると std::terminate するため捕捉して安全に終了する
     try {
