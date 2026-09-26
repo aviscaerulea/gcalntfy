@@ -993,13 +993,38 @@ static std::string extractQueryValue(const std::string& req, const std::string& 
     return req.substr(pos, end - pos);
 }
 
+// 認証完了応答
+// トークン交換まで成功したときにブラウザへ返し、タブのクローズを促す。
+// 認可コードの受信時点では返さない（交換の失敗を画面へ反映できなくなるため）。
+static const char* const AUTH_RESPONSE_OK =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Connection: close\r\n\r\n"
+    "<html><body><p>認証完了。このタブは閉じてください。</p></body></html>";
+
+// トークン交換失敗応答
+// 認可コードは受け取れたがトークン交換に失敗した（ネットワーク不通、invalid_grant、
+// 応答の解析失敗など）ときにこちらを返し、認証完了と誤認させない。
+static const char* const AUTH_RESPONSE_EXCHANGE_FAILED =
+    "HTTP/1.1 500 Internal Server Error\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Connection: close\r\n\r\n"
+    "<html><body><p>認証を完了できませんでした。再度お試しください。</p></body></html>";
+
 // ループバックサーバで認証コードを待ち受ける（120 秒タイムアウト）
 // select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
 // \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
+// code を返すときはブラウザへ応答せず、client ソケットを開いたまま outClient へ渡す。
+// ブラウザへの最終応答（完了・交換失敗）はトークン交換の結果を見てから呼び出し元が送り、
+// 呼び出し元が closesocket する。失敗時（空文字列を返すとき）は本関数がエラー応答を送って
+// client を閉じ、outClient は INVALID_SOCKET とする。
 // expectedState が非空の場合、受信した state と一致しなければ空文字列を返す（CSRF 対策）。
 // コールバックに code が含まれない場合（同意画面の拒否など）は 400 応答を返し、空文字列を返す。
 // シャットダウン要求時は 1 秒以内にループから抜けて空文字列を返す（プロセス停止を阻害しないため）。
-static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState) {
+static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState,
+    SOCKET& outClient)
+{
+    outClient = INVALID_SOCKET;
     // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
     // 1 秒ごとに g_shutdownRequested を確認し、必要なら早期に脱出する。
     // タイムアウトは「ちょうど AUTH_CODE_TIMEOUT_SEC 経過後」の判定で打ち切る
@@ -1063,14 +1088,6 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         return {};
     }
 
-    // 認証完了応答
-    // 完成後の HTML をブラウザに返してタブのクローズを促す。
-    static const char* RESPONSE_OK =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
-        "Connection: close\r\n\r\n"
-        "<html><body><p>認証完了。このタブは閉じてください。</p></body></html>";
-
     // state ミスマッチ応答
     // ユーザに認証完了と誤認させないため、state 検証失敗時はこちらを返す。
     static const char* RESPONSE_STATE_MISMATCH =
@@ -1104,7 +1121,7 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         }
     }
 
-    // code がなければ認証は成立しない（拒否時は error パラメータが付く）。成功応答を返さない
+    // code がなければ認証は成立しない（拒否時は error パラメータが付く）。ここで失敗応答を返して閉じる
     auto code = extractQueryValue(requestLine, "code");
     if (code.empty()) {
         writeLog("OAuth callback without code (error=" + extractQueryValue(requestLine, "error") + ")");
@@ -1113,9 +1130,8 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         return {};
     }
 
-    send(client, RESPONSE_OK, static_cast<int>(strlen(RESPONSE_OK)), 0);
-    closesocket(client);
-
+    // ブラウザへの応答はトークン交換の結果で変わるため、ここでは送らず開いたまま呼び出し元へ渡す
+    outClient = client;
     return code;
 }
 
@@ -1263,6 +1279,7 @@ static RefreshResult tryRefreshAccessToken() {
 //
 // ユーザアクション（Toast クリック・未認証時のトレイ左クリック）からのみ起動される。
 // ループバックサーバを起動し、ブラウザで Google 認証画面を開いて authorization code を待ち受ける。
+// code 受信後のブラウザへの応答は、トークン交換の成否を見てからここで送る（交換失敗を画面へ反映するため）。
 // 二重起動は起動側（launchInteractiveAuth）の CAS で防止する。別スレッドで実行される想定。
 // 成功時：g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
 static void startInteractiveAuth() {
@@ -1300,12 +1317,19 @@ static void startInteractiveAuth() {
             else {
                 openBrowserForAuth(port, codeVerifier, stateValue);
 
-                auto authCode = waitForAuthCode(serverSocket, stateValue);
+                SOCKET client = INVALID_SOCKET;
+                auto authCode = waitForAuthCode(serverSocket, stateValue, client);
                 if (authCode.empty()) {
+                    // 失敗応答の送信と client の closesocket は waitForAuthCode 側で済んでいる
                     writeLog("OAuth auth code not received (timeout/state mismatch/denied)");
                 }
-                else if (exchangeCodeForTokens(authCode, port, codeVerifier)) {
-                    succeeded = true;
+                else {
+                    // client は開いたまま受け取っている。交換結果に応じた応答を送ってから必ず閉じる
+                    // （この分岐の途中で抜ける経路を作らないこと。exchangeCodeForTokens は例外を伝播しない）
+                    succeeded = exchangeCodeForTokens(authCode, port, codeVerifier);
+                    const char* response = succeeded ? AUTH_RESPONSE_OK : AUTH_RESPONSE_EXCHANGE_FAILED;
+                    send(client, response, static_cast<int>(strlen(response)), 0);
+                    closesocket(client);
                 }
             }
             closesocket(serverSocket);
