@@ -5538,6 +5538,10 @@ int wmain() {
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
+    // ShellExecute で起動するブラウザやエディタは JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK により
+    // 自動的に Job の外へ出す。BREAKAWAY_OK（非 SILENT）は CREATE_BREAKAWAY_FROM_JOB を明示した
+    // 子プロセスにしか効かず、ShellExecute は明示しないため、旧インスタンスの終了や
+    // トレイの「終了」で外部アプリまで道連れに強制終了されていた。
     HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
@@ -5556,7 +5560,7 @@ int wmain() {
     if (hJob) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
         jeli.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
             writeLog("warning: failed to set job object limits");
         }
