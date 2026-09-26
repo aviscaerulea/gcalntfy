@@ -997,6 +997,7 @@ static std::string extractQueryValue(const std::string& req, const std::string& 
 // select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
 // \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
 // expectedState が非空の場合、受信した state と一致しなければ空文字列を返す（CSRF 対策）。
+// コールバックに code が含まれない場合（同意画面の拒否など）は 400 応答を返し、空文字列を返す。
 // シャットダウン要求時は 1 秒以内にループから抜けて空文字列を返す（プロセス停止を阻害しないため）。
 static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState) {
     // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
@@ -1078,6 +1079,15 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         "Connection: close\r\n\r\n"
         "<html><body><p>認証情報が一致しません。再度お試しください。</p></body></html>";
 
+    // 認証コード欠落応答
+    // 同意画面の拒否（?error=access_denied）など code を含まないコールバックにこちらを返し、
+    // 認証完了と誤認させない。
+    static const char* RESPONSE_NO_CODE =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body><p>認証を完了できませんでした（許可されなかったか、認証コードを受け取れませんでした）。再度お試しください。</p></body></html>";
+
     // クエリ抽出範囲の Request-Line 限定
     // ヘッダ部の Referer 等に細工された code=/state= の誤マッチを防ぐため、
     // 最初の "\r\n" 以前のみを抽出対象とする（"\r\n\r\n" を含む前提のため必ず見つかる）。
@@ -1094,10 +1104,19 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
         }
     }
 
+    // code がなければ認証は成立しない（拒否時は error パラメータが付く）。成功応答を返さない
+    auto code = extractQueryValue(requestLine, "code");
+    if (code.empty()) {
+        writeLog("OAuth callback without code (error=" + extractQueryValue(requestLine, "error") + ")");
+        send(client, RESPONSE_NO_CODE, static_cast<int>(strlen(RESPONSE_NO_CODE)), 0);
+        closesocket(client);
+        return {};
+    }
+
     send(client, RESPONSE_OK, static_cast<int>(strlen(RESPONSE_OK)), 0);
     closesocket(client);
 
-    return extractQueryValue(requestLine, "code");
+    return code;
 }
 
 // トークンレスポンス JSON からアクセストークンと有効期限を更新する
@@ -1283,7 +1302,7 @@ static void startInteractiveAuth() {
 
                 auto authCode = waitForAuthCode(serverSocket, stateValue);
                 if (authCode.empty()) {
-                    writeLog("OAuth auth code not received (timeout/state mismatch)");
+                    writeLog("OAuth auth code not received (timeout/state mismatch/denied)");
                 }
                 else if (exchangeCodeForTokens(authCode, port, codeVerifier)) {
                     succeeded = true;
