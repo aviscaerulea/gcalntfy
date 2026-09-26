@@ -146,6 +146,10 @@ static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
 static constexpr UINT WM_AUTH_REQUESTED  = WM_USER + 3;  // ユーザ操作による認証フロー起動要求
 
+// ポーリング成功後の一覧組み直し依頼（表示中の一覧だけを同じ位置で組み直す）
+// ツールチップ更新とは責務が異なるため WM_UPDATE_TOOLTIP を流用しない
+static constexpr UINT WM_LIST_REFRESH    = WM_USER + 4;
+
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
@@ -3534,6 +3538,7 @@ static HWND g_listWnd = nullptr;                 // 初回表示時に生成し�
 static std::vector<ListRowLayout> g_listLayout;  // トレイ WndProc スレッド専用
 static std::wstring g_listFooterText;            // フッター行の文言（0 件時は未使用）
 static int g_listHotRow = -1;                    // ホット行（g_listLayout の添字。-1 = なし）
+static POINT g_listAnchor = {};                  // 表示位置の基準（新規表示時のカーソル座標。組み直しで再利用）
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
@@ -3728,7 +3733,10 @@ static HWND ensureListWindow() {
 // 終日予定は表示しない。
 // 行の左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
-static void showListPopup(HWND trayWnd) {
+// refresh は表示中の一覧を最新の状態で組み直す指定だ。
+// 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
+// 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
+static void showListPopup(HWND trayWnd, bool refresh = false) {
     std::vector<CalendarEvent> events;
     std::unordered_map<std::string, std::string> mutedSnapshot;
     int urgentMinutes;
@@ -3803,7 +3811,13 @@ static void showListPopup(HWND trayWnd) {
 
     // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
     POINT cursor;
-    GetCursorPos(&cursor);
+    if (refresh) {
+        cursor = g_listAnchor;
+    }
+    else {
+        GetCursorPos(&cursor);
+        g_listAnchor = cursor;
+    }
     MONITORINFO mi = { sizeof(mi) };
     const bool haveMi =
         GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi) != FALSE;
@@ -3915,6 +3929,18 @@ static void showListPopup(HWND trayWnd) {
     // SWP_NOACTIVATE でフォーカスを奪わずに表示する
     SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(hWnd, nullptr, FALSE);
+
+    // 組み直しではホット行をカーソル位置から復元し、離脱監視は引き継ぐ。
+    // （-1 のままだと次のマウス移動までハイライトが消え、猶予を戻すと離脱判定が遅れる）
+    if (refresh) {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hWnd, &pt);
+        RECT client;
+        GetClientRect(hWnd, &client);
+        g_listHotRow = PtInRect(&client, pt) ? listRowHitTest(pt.y) : -1;
+        return;
+    }
 
     g_popupShowing.store(true);
     // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
@@ -4469,6 +4495,11 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
     if (msg == WM_UPDATE_TOOLTIP) {
         updateTrayTooltip(hWnd);
+        return 0;
+    }
+    // ポーリング成功後の組み直し依頼（閉じている一覧は次に開いた時点で組み立てるため何もしない）
+    if (msg == WM_LIST_REFRESH) {
+        if (isListPopupVisible()) showListPopup(hWnd, true);
         return 0;
     }
     if (msg == WM_AUTH_REQUESTED) {
@@ -5188,7 +5219,7 @@ static void fetchAllCalendarEvents(
 //
 // 取得したイベントを通知スレッドへ受け渡し、当日分について
 // ベースラインからの差分を検出して Toast 通知する。
-// キャッシュファイル更新とトレイのツールチップ更新もここで実行する。
+// キャッシュファイル更新、トレイのツールチップ更新、表示中の一覧の組み直し依頼もここで実行する。
 static void deliverPollResults(
     const std::wstring& exeDir,
     std::vector<CalendarEvent> events,
@@ -5227,6 +5258,8 @@ static void deliverPollResults(
     notifyEventChanges(todayChanges);
     saveCacheFile(exeDir, events);
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+    // 一覧が表示中なら最新の状態で組み直させる
+    if (g_hWnd) PostMessage(g_hWnd, WM_LIST_REFRESH, 0, 0);
 }
 
 // 「今すぐ更新」への失敗応答を返す
