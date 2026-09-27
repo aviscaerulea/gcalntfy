@@ -3249,7 +3249,7 @@ static void addTrayIcon(HWND hWnd) {
 
 // バッジ付きトレイアイコンの生成
 // ベースアイコンの右下に赤い円バッジを合成した HICON を返す。
-// 32bpp DIBSection にピクセルを直接書き込むことで alpha=255 を確実に設定する。
+// 32bpp DIBSection にピクセルを直接書き込み、バッジ部分の alpha を明示的に設定する（円の内部は不透明、縁はアンチエイリアスの被覆率で下地へ source-over 合成した値）。
 // GDI Ellipse では alpha バイトが 0 のままになり DWM 合成で透明化されるため使わない。
 // 呼び出し側が DestroyIcon で解放する責務を持つ。失敗時は nullptr を返し、
 // 呼び出し側がログを残してベースアイコンへ切り替える。
