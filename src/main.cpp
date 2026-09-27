@@ -5382,7 +5382,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
         return;
     }
 
-    int  lastJstDay          = -1;
+    // 前回周回の JST 年月日（YYYYMMDD 形式の整数。-1 は未設定）
+    int  lastJstDate         = -1;
     // 初回取得フラグ。起動時に真で始まり、初回のポーリング試行の開始時点で偽に戻る
     // （成否は問わない。以降真に戻ることはない）。
     // 真の間はクールダウンによる先送りとトリガーログを抑止し、無条件に初回取得へ進む。
@@ -5447,10 +5448,12 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             auto jstNow = utcToJst(utcNow);
 
             // 日付変更：変更検知ベースラインを未確立へ戻す
+            // 年月日をまとめた値で比べる。日番号だけで比べると、ちょうど月単位のスリープ明けで日付変更を見逃すため
             // notifiedSet は通知スレッドが自然失効で管理する
             // 取得の前倒しは不要（ここへ到達した周回は必ず取得を試行するため）
-            if (static_cast<int>(jstNow.wDay) != lastJstDay) {
-                lastJstDay          = static_cast<int>(jstNow.wDay);
+            int jstDate = jstNow.wYear * 10000 + jstNow.wMonth * 100 + jstNow.wDay;
+            if (jstDate != lastJstDate) {
+                lastJstDate         = jstDate;
                 baselineEstablished = false;
             }
 
