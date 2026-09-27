@@ -1252,6 +1252,8 @@ enum class RefreshResult { Ok, NetworkError, AuthRequired };
 // リフレッシュトークンでアクセストークンを更新する
 //
 // 戻り値：Ok / NetworkError / AuthRequired（呼び出し側で使い分ける）
+// 応答に新しい refresh_token が含まれる場合はレジストリの値を置き換える（RFC 6749 §6。
+// ローテーションされた旧トークンを使い続けると失効して再認証を要求されるため）。含まれない場合は何もしない
 static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
     std::string body =
         "grant_type=refresh_token"
@@ -1278,6 +1280,15 @@ static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
     try {
         auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
         if (!applyTokenResponse(obj)) return RefreshResult::AuthRequired;
+
+        // ローテーションされた refresh_token を保存する（空文字列は無視）
+        if (obj.HasKey(L"refresh_token")) {
+            std::wstring rt = obj.GetNamedString(L"refresh_token", L"").c_str();
+            if (!rt.empty()) {
+                writeRefreshToken(rt);
+                writeLog("refresh_token rotated, saved to registry");
+            }
+        }
 
         writeLog("access token refreshed");
         return RefreshResult::Ok;
