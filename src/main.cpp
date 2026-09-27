@@ -142,6 +142,11 @@ static constexpr long long MAX_HOVER_CLICK_GUARD_MS     = 5000;
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
+// 多重起動制御で旧プロセスの終了完了を待つ上限と確認間隔（ミリ秒）
+// TerminateJobObject は終了を開始するだけで完了を待たないため、Job 内の生存プロセス数が 0 になるまで確認を繰り返す
+static constexpr DWORD JOB_TERMINATE_WAIT_MS = 3000;
+static constexpr DWORD JOB_TERMINATE_POLL_MS = 50;
+
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
@@ -5654,8 +5659,11 @@ int wmain() {
     CreateDirectoryW(g_logDir.c_str(), nullptr);
 
     // 多重起動制御（新プロセス優先）
-    // 名前付き Job Object で旧プロセスをまとめて終了させる。
+    // 名前付き Job Object で旧プロセスをまとめて終了させ、旧プロセスの終了完了を待ってから
+    // 同じ Job に自プロセスを入れる（Job は作り直さない）。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
+    // Job に入らないまま起動すると、次回起動時に TerminateJobObject で終了できず多重常駐になる。
+    // そのため終了待ちが JOB_TERMINATE_WAIT_MS で打ち切られた場合に限り、警告を残して Job に入らず続行する。
     // ShellExecute で起動するブラウザやエディタは JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK により
     // 自動的に Job の外へ出す。BREAKAWAY_OK（非 SILENT）は CREATE_BREAKAWAY_FROM_JOB を明示した
     // 子プロセスにしか効かず、ShellExecute は明示しないため、旧インスタンスの終了や
@@ -5664,12 +5672,23 @@ int wmain() {
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
         TerminateJobObject(hJob, 0);
-        CloseHandle(hJob);
-        // カーネルが Job Object 名を解放するまで待機
-        Sleep(100);
-        hJob = CreateJobObjectW(nullptr, L"Local\\gcalntfy_job");
-        // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
-        if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 旧プロセスの終了完了を待つ（Job 内の生存プロセス数が 0 になるまで JOB_TERMINATE_POLL_MS 間隔で確認）
+        // 生存数の取得に失敗した場合は終了を確認できないため、打ち切りと同じ扱いにする
+        bool previousExited = false;
+        for (DWORD waited = 0; waited < JOB_TERMINATE_WAIT_MS; waited += JOB_TERMINATE_POLL_MS) {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info = {};
+            if (!QueryInformationJobObject(hJob, JobObjectBasicAccountingInformation,
+                    &info, sizeof(info), nullptr)) {
+                writeLog("warning: QueryInformationJobObject failed: " + std::to_string(GetLastError()));
+                break;
+            }
+            if (info.ActiveProcesses == 0) {
+                previousExited = true;
+                break;
+            }
+            Sleep(JOB_TERMINATE_POLL_MS);
+        }
+        if (!previousExited) {
             writeLog("warning: previous instance still alive");
             CloseHandle(hJob);
             hJob = nullptr;
