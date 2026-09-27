@@ -3124,7 +3124,8 @@ static void addTrayIcon(HWND hWnd) {
 // ベースアイコンの右下に赤い円バッジを合成した HICON を返す。
 // 32bpp DIBSection にピクセルを直接書き込むことで alpha=255 を確実に設定する。
 // GDI Ellipse では alpha バイトが 0 のままになり DWM 合成で透明化されるため使わない。
-// 呼び出し側が DestroyIcon で解放する責務を持つ。失敗時は nullptr を返す。
+// 呼び出し側が DestroyIcon で解放する責務を持つ。失敗時は nullptr を返し、
+// 呼び出し側がログを残してベースアイコンへ切り替える。
 static HICON createBadgedIcon() {
     int cx = GetSystemMetrics(SM_CXSMICON);
     int cy = GetSystemMetrics(SM_CYSMICON);
@@ -3235,6 +3236,7 @@ static HICON createBadgedIcon() {
 
 // トレイアイコンのバッジ切り替え
 // hasUpcoming が g_trayBadgeActive（前回状態）と同じなら NIM_MODIFY をスキップする。
+// バッジ生成に失敗した場合はログを残してベースアイコンを表示する。
 static void updateTrayIcon(HWND hWnd, bool hasUpcoming) {
     if (hasUpcoming == g_trayBadgeActive) return;
     g_trayBadgeActive = hasUpcoming;
@@ -3247,6 +3249,8 @@ static void updateTrayIcon(HWND hWnd, bool hasUpcoming) {
     // 破棄責務はバッジ合成に成功した自前生成ハンドルにのみ生じる。
     // フォールバックの LoadIconW はプロセス共有のハンドルを返し、DestroyIcon の対象外だ。
     HICON ownedIcon = hasUpcoming ? createBadgedIcon() : nullptr;
+    // 生成失敗は GDI 枯渇の兆候のため、ベースアイコンへ切り替える前にログへ残す
+    if (hasUpcoming && !ownedIcon) writeLog("tray: createBadgedIcon failed, falling back to base icon");
     nid.hIcon = ownedIcon
         ? ownedIcon
         : LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
