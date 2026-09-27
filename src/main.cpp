@@ -4676,6 +4676,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 // 非表示トップレベルウィンドウを作成してトレイメッセージ受信に使用する
 // HWND_MESSAGE ではなく nullptr 親（トップレベル）にすることで WM_POWERBROADCAST を受信できる
+// 生成に失敗した場合はログを残して nullptr を返し、呼び出し側は起動を中止する
+// （トレイも終了メニューもない不可視プロセスになるため）
 static HWND createTrayWindow() {
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
@@ -4683,8 +4685,10 @@ static HWND createTrayWindow() {
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"gcalntfy_tray";
     RegisterClassExW(&wc);
-    return CreateWindowExW(0, L"gcalntfy_tray", nullptr, 0,
+    HWND hWnd = CreateWindowExW(0, L"gcalntfy_tray", nullptr, 0,
         0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hWnd) writeLog("tray: CreateWindowExW failed: " + std::to_string(GetLastError()));
+    return hWnd;
 }
 
 // ==================== 予定変更検知 ====================
@@ -5650,6 +5654,9 @@ int wmain() {
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
         g_hWnd = createTrayWindow();
+        // トレイ用ウィンドウがなければ終了手段のない不可視プロセスになるため起動を中止する。
+        // この時点ではスレッド未起動・トレイ未登録のため後始末は不要（戻り値 1 は例外時の 2 と区別する）
+        if (!g_hWnd) return 1;
         WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
 
         // NIC 変化（Wi-Fi 接続/切断、LAN 抜き差し等）の監視を登録
