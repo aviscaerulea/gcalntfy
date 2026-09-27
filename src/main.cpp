@@ -5078,7 +5078,9 @@ static std::vector<CalendarEvent> notifyTargetEvents() {
 // でない予定に直前通知を出さない（予定ごとの実効リード時間を 0 として扱う）。
 // 起動直後などタイミング経過後に評価した場合、基本通知と直前通知は開始前である限り
 // 遡って発火する。両方が経過済みなら基本通知 1 回に集約する。
-// 起動直後などに既に経過していた reminders は鳴らさないが、連続発火による遅れは経過とみなさない。
+// 起動直後などに既に経過していた reminders は鳴らさないが、連続発火による遅れは経過とみなさない
+// （reminders の経過判定だけ直前に発火した周回の基準時刻で行い、開始済みの除外と待機時間の計算は
+// 毎周回取り直す現在時刻で行う）。
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
 // 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
 // 全イベント × 全通知タイミングを走査して最小発火時間を求めてから wait_until で待機する。
@@ -5114,15 +5116,21 @@ static void notifyThreadFunc() {
         }
         pruneNotifiedSet(notifiedSet, localEvents);
 
-        // 直前の周回で発火したときの基準時刻（発火しなかった周回の後は空）
+        // 直前の周回で発火したときの reminders 判定用の基準時刻（発火しなかった周回の後は空）
         std::string lastFiredUtc;
         // 直近未通知イベントを順次通知する内側ループ
         while (!g_shutdownRequested) {
-            // 基準時刻。通知した直後の周回はその通知の基準時刻を引き継ぐ。
+            // 現在時刻。開始済みの除外、待機時間の計算、発火対象の特定はすべてこの時刻で行う。
+            // 発火直後の周回でも取り直す。取り直さないと、発火処理（通知音スレッドの終了待ちで
+            // 数秒ブロックしうる）の間に進んだ時間の分だけ次の通知の待機が長くなり、その間に
+            // 開始した予定を開始前として扱って開始後に通知してしまう
+            std::string nowUtc = getCurrentUtcISO();
+            // reminders の経過判定にだけ使う基準時刻。通知した直後の周回はその通知の基準時刻を引き継ぐ。
             // 開始日時の異なる予定の通知が同時刻に重なると 1 周回に 1 グループずつ順に発火するが、
-            // 時刻を取り直すと発火処理にかかった時間の分だけ後続の reminders が経過済みとみなされて
-            // 消えるため。引き継ぎは 1 周回限りで、待機後や予定リスト更新後は現在時刻に戻す
-            std::string nowUtc = lastFiredUtc.empty() ? getCurrentUtcISO() : lastFiredUtc;
+            // 現在時刻で判定すると発火処理にかかった時間の分だけ後続の reminders が経過済みとみなされて
+            // 消えるため。引き継ぎは 1 周回限りで、待機後や予定リスト更新後は現在時刻に戻す。
+            // reminders の経過判定以外の判定には使わない
+            std::string reminderBaseUtc = lastFiredUtc.empty() ? nowUtc : lastFiredUtc;
             lastFiredUtc.clear();
             long long leadMs = localConfig.notifyLeadMs;
             // 直前通知の実効リード時間。直前通知トグルが OFF の間は 0（無効）として扱う
@@ -5150,8 +5158,10 @@ static void notifyThreadFunc() {
                 };
                 checkLead(leadMs);
                 // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす。
-                // 直前の周回で通知した場合は同じ基準時刻で判定するので、発火処理にかかった時間のせいで
+                // 経過判定だけは reminders 判定用の基準時刻で行う。直前の周回で通知した場合は
+                // その通知と同じ基準時刻になるので、発火処理にかかった時間のせいで
                 // 同時刻に重なった別予定の reminders が経過済みと誤判定されることはない。
+                // 待機時間の計算（checkLead）は現在時刻の diffMs で行い、経過済みなら即時発火する。
                 // ただし基本通知や直前通知と同じリード時間の reminders は通知済みキーを共有する。
                 // ここでマークすると基本通知や直前通知まで消えるため、その場合はマークしない。
                 // 基本通知と一致する場合は基本通知側の遡及発火に委ね、直前通知と一致する場合は
@@ -5161,9 +5171,10 @@ static void notifyThreadFunc() {
                 // タイミングは ON へ戻しても遡及発火しない。OFF 中の経過分を後から鳴らさない
                 // 意図した挙動で、設定値で判定すると OFF 中も未マークの経過済み reminders が
                 // 別の通知の発火を契機に遅れて鳴ってしまう
+                long long reminderDiffMs = calcDiffMs(e.datetime, reminderBaseUtc);
                 for (int m : e.reminderMinutes) {
                     long long rmMs = static_cast<long long>(m) * 60000;
-                    if (diffMs - rmMs >= 0) {
+                    if (reminderDiffMs - rmMs >= 0) {
                         checkLead(rmMs);
                     }
                     else if (rmMs != evImminentMs && rmMs != leadMs) {
@@ -5208,7 +5219,8 @@ static void notifyThreadFunc() {
                     continue;
                 }
                 if (g_shutdownRequested) break;
-                nowUtc = getCurrentUtcISO();
+                nowUtc          = getCurrentUtcISO();
+                reminderBaseUtc = nowUtc;
             }
 
             // 発火対象の (datetime, leadMsVal) を特定
@@ -5246,7 +5258,7 @@ static void notifyThreadFunc() {
             bool allowSound = hasBaseTiming || localConfig.imminentSound;
             fireNotificationGroup(group, targetDatetime, targetLeadMs, allowSound,
                 localConfig, notifiedSet);
-            lastFiredUtc = nowUtc;
+            lastFiredUtc = reminderBaseUtc;
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
         }
