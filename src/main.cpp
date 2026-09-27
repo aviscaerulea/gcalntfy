@@ -4268,6 +4268,8 @@ static void checkForUpdates() {
 }
 
 // 更新通知メニュー項目のサイズを計算する
+// メニュー用フォントで「gcalntfy v現行版 → 最新版」の寸法を測り、幅に左右余白 32px、高さに上下余白 6px を加える。
+// DC を取得できない場合は固定値（幅 200、高さ 20）に退避する。戻り値は常に TRUE。
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     std::wstring prefix = std::wstring(L"gcalntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
