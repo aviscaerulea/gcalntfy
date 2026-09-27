@@ -2391,7 +2391,8 @@ static void normalizeLoudness(std::vector<int16_t>& samples, int channels,
 // WAV ファイルを読み込み、ラウドネスノーマライズを適用して g_wavCache に格納する
 //
 // 起動時（設定読み込み後）に 1 回だけ呼び出す。以降の再生は g_wavCache を使い回す。
-// 16bit PCM WAV のみ対応。ファイルが存在しない場合は g_wavCache.valid = false のまま。
+// 16bit PCM WAV のみ対応。ファイルが存在しない場合と、形式不正・読み込み失敗時は
+// g_wavCache.valid = false のまま（通知音なしで動作する）。
 static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
     g_wavCache = WavCache{};  // リセット
 
@@ -2473,7 +2474,16 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                 // 奇数サイズの WAV で ReadFile がバッファ境界外を要求しないよう int16_t に整列
                 DWORD totalBytes = chunkSize & ~1u;
                 samples.resize(totalBytes / sizeof(int16_t));
-                ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr);
+                // 読み込み失敗（FALSE または 0 バイト）は無音の通知音を採用しないよう中断する。
+                // 途中までの短い読み込みはファイル末尾の切り詰めとみなし、読めた分を採用する
+                if (!ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr) || nRead == 0) {
+                    writeLog("loadWavAndNormalize: failed to read data chunk");
+                    goto cleanup;
+                }
+                if (nRead < totalBytes) {
+                    writeLog("loadWavAndNormalize: data chunk truncated ("
+                        + std::to_string(nRead) + "/" + std::to_string(totalBytes) + " bytes)");
+                }
                 samples.resize(nRead / sizeof(int16_t));
                 hasData = true;
             }
