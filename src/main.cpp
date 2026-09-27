@@ -675,46 +675,44 @@ static void logSchedule(const std::vector<int>& schedule) {
     writeLog(s);
 }
 
-// 次のポーリング予定時刻（時・分）を計算する共通ロジック
-// 60/pollsPerHour 分間隔で正時 :00 起点。次の境界が 60 分以上に達したら翌時 00 分へ繰り上げる。
-// 基準時刻は JST（schedule 配列の時間帯選択と同じ基準に揃える。端末ローカル時刻は使わない）。
+// 次のポーリング境界（分）を計算する共通ロジック
+// 60/pollsPerHour 分間隔で正時 :00 起点。jstNow の時の 0 分から数えた次の境界の分を返す
+// （intervalMin〜60。60 は翌時 00 分を意味し、繰り上げは呼び出し側が行う。60 を超える値は
+// 60 に丸めるため、60 で割り切れない間隔では最後の区間だけ短くなる）。
+// 基準時刻は引数で受け取る JST 時刻（schedule 配列の時間帯選択と同じ基準に揃える。端末ローカル時刻は使わない）。
 // 設定ロード側で [1, 60] にクランプ済みだが、ヘルパー単体での除算ゼロを防ぐためガードする。
-static void calcNextPollTime(int pollsPerHour, int& outHour, int& outMin) {
+static int calcNextPollTime(int pollsPerHour, const SYSTEMTIME& jstNow) {
     if (pollsPerHour <= 0) pollsPerHour = 1;
+    int intervalMin = 60 / pollsPerHour;
+    int nextMin = intervalMin * (jstNow.wMinute / intervalMin + 1);
+    return (std::min)(nextMin, 60);
+}
+
+// 次のポーリング予定時刻を "HH:MM" 形式で返す（基準時刻は JST。60 分は翌時 00 分へ繰り上げる）
+static std::string nextPollTimeStr(int pollsPerHour) {
     SYSTEMTIME utcNow;
     GetSystemTime(&utcNow);
     SYSTEMTIME now = utcToJst(utcNow);
-    int intervalMin = 60 / pollsPerHour;
-    int nextMin = intervalMin * (now.wMinute / intervalMin + 1);
+    int nextMin  = calcNextPollTime(pollsPerHour, now);
     int nextHour = now.wHour;
     if (nextMin >= 60) {
         nextMin  = 0;
         nextHour = (now.wHour + 1) % 24;
     }
-    outHour = nextHour;
-    outMin  = nextMin;
-}
-
-// 次のポーリング予定時刻を "HH:MM" 形式で返す
-static std::string nextPollTimeStr(int pollsPerHour) {
-    int h = 0, m = 0;
-    calcNextPollTime(pollsPerHour, h, m);
     char buf[6];
-    sprintf_s(buf, sizeof(buf), "%02d:%02d", h, m);
+    sprintf_s(buf, sizeof(buf), "%02d:%02d", nextHour, nextMin);
     return buf;
 }
 
 // 次のポーリング予定時刻までのスリープ時間（ms）を計算
-// 正時 :00 起点で 60/pollsPerHour 分間隔の次の予定分までの残り時間を返す（基準時刻は JST）
+// 正時 :00 起点で 60/pollsPerHour 分間隔の次の予定分までの残り時間を返す（基準時刻は JST）。
+// 境界の分は現在時の 0 分から数えた値（翌時 00 分は 60）のため、現在の分との差がそのまま残り時間になる
 static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
     SYSTEMTIME utcNow;
     GetSystemTime(&utcNow);
     SYSTEMTIME now = utcToJst(utcNow);
-    int nextHour = 0, nextMin = 0;
-    calcNextPollTime(pollsPerHour, nextHour, nextMin);
-    // 翌時 00 分への繰り上がりは「現在時の 60 分時点」として扱う
-    int targetMinFromNowHour = (nextHour == now.wHour) ? nextMin : 60;
-    long long sleepMs = (long long)(targetMinFromNowHour - now.wMinute) * 60000LL
+    int nextMin = calcNextPollTime(pollsPerHour, now);
+    long long sleepMs = (long long)(nextMin - now.wMinute) * 60000LL
                         - (long long)now.wSecond * 1000LL
                         - (long long)now.wMilliseconds;
     if (sleepMs < 1000) sleepMs = 1000;
