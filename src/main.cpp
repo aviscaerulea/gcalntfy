@@ -292,14 +292,14 @@ static std::atomic<DWORD> g_hoverClickGuardMs{static_cast<DWORD>(DEFAULT_HOVER_C
 // 一覧ポップアップの開閉制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
 // g_listOutsideTicks：カーソルがアイコン・一覧矩形の外に居た連続 tick 数
 // g_hoverShownAt：ホバーで自動表示した時刻（GetTickCount64）。左クリック表示とクローズで
-//   0 に戻す。（不変条件：非 0 はホバー起点の一覧が表示中のときだけ）
+//   0 に戻す（不変条件：非 0 はホバー起点の一覧が表示中のときだけ）。
 // g_iconHovered：カーソルがアイコン上に留まっていると OS が通知中か。NIN_POPUPOPEN で
-//   立て、NIN_POPUPCLOSE で下ろす。離脱監視の「アイコン上」判定に使う。（DPI 非対応
+//   立て、NIN_POPUPCLOSE で下ろす。離脱監視の「アイコン上」判定に使う（DPI 非対応
 //   プロセスではカーソル座標とアイコン矩形の突き合わせが高 DPI で成立しないため、
-//   OS の判定を正とする）
+//   OS の判定を正とする）。
 // g_hoverSuppressed：明示クローズ後、カーソルがアイコンを離れる（NIN_POPUPCLOSE）まで
-//   ホバー再表示を抑止するフラグ。（NIN_POPUPOPEN の再送条件は文書化されておらず、
-//   閉じた直後の微動で再送されても開き直さないための備え）
+//   ホバー再表示を抑止するフラグ（NIN_POPUPOPEN の再送条件は文書化されておらず、
+//   閉じた直後の微動で再送されても開き直さないための備え）。
 // g_trayV4：NIM_SETVERSION(NOTIFYICON_VERSION_4) の成否。失敗時は旧方式（生マウス
 //   メッセージ）のコールバックが届くため、右クリック・左クリックの判定を旧方式へ切り替える
 static int       g_listOutsideTicks  = 0;
@@ -330,8 +330,8 @@ static std::atomic<bool> g_pollNowRequested{false};
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
 // 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。ポーリング成功時に 0 リセット）
-// 0 は「未表示」を表す番兵であり、経過時間としては解釈しない。（GetTickCount64 は OS 起動基準
-// のため、0 を時刻として引き算するとクールダウン判定が OS 起動からの経過時間になってしまう）
+// 0 は「未表示」を表す番兵であり、経過時間としては解釈しない（GetTickCount64 は OS 起動基準
+// のため、0 を時刻として引き算するとクールダウン判定が OS 起動からの経過時間になってしまう）。
 static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
@@ -1513,7 +1513,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
             //
             // eventType="focusTime" は Calendar UI の「集中タイム（サイレント モード）」予定と、
             // Google Tasks から Calendar に同期されたタスク（繰り返さないもののみ。繰り返しタスクは
-            // Events.List に一切現れない）の双方で共通して返る。（実機検証済み 2026-07-07）
+            // Events.List に一切現れない）の双方で共通して返る（実機検証済み 2026-07-07）。
             // focusTimeProperties は両者に同一内容で付与されるため区別に使えない。
             // タスク由来のイベントのみ description に Google 生成の固定案内文が入り、その中に
             // "tasks.google.com/task/" という URL が含まれる（言語非依存の判別材料。UI 言語が
@@ -1616,7 +1616,7 @@ static ParseResult parseCalendarEvents(const std::string& json) {
 // JSON 配列ファイルを読み込んで JsonArray を返す
 // 前段の共通処理：CreateFileW → GetFileSize（0 バイトと 1MB 超は不正扱い）→ ReadFile → JsonArray::Parse
 // ファイル未存在は「不在」を示す nullopt。読み込み・パース失敗も nullopt。
-// logTag はエラー出力用の識別子。（"cache" / "muted" 等）
+// logTag はエラー出力用の識別子（"cache" / "muted" 等）。
 static std::optional<winrt::Windows::Data::Json::JsonArray>
 readJsonArrayFile(const std::wstring& path, const char* logTag)
 {
@@ -1903,7 +1903,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     //
     // テーブルが無い、または duck_targets キーが配列でない場合は nullopt を返す。
     // キー不在（nullopt）と空配列を区別することで、local 側に空配列を書いた場合に
-    // base へフォールバックせず「無効化の明示指定」として扱える。（readSchedule と同じ方式）
+    // base へフォールバックせず「無効化の明示指定」として扱える（readSchedule と同じ方式）。
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl)
         -> std::optional<std::vector<std::wstring>> {
         if (!tbl) return std::nullopt;
@@ -1920,7 +1920,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     //
     // テーブルが無い、または ext_calendar_ids キーが配列でない場合は nullopt を返す。
     // キー不在（nullopt）と空配列を区別することで、local 側に空配列を書いた場合に
-    // base へフォールバックせず「無効化の明示指定」として扱える。（readSchedule と同じ方式）
+    // base へフォールバックせず「無効化の明示指定」として扱える（readSchedule と同じ方式）。
     auto readExtCalendarIds = [&](const std::optional<toml::table>& tbl)
         -> std::optional<std::vector<std::string>> {
         if (!tbl) return std::nullopt;
@@ -3090,9 +3090,9 @@ static void showToastSafe(const std::wstring& title, const std::wstring& body)
 //
 // 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
 // 未表示状態（初期値および成功時リセット後）は抑制せず必ず表示する。
-// force=true は抑制を無視して必ず表示する。（ユーザ操作への応答など、沈黙すると
-// 操作の結果が分からなくなる用途に限って使う）
-// 抑制の起点は表示した時刻で更新する。（force での表示も起点になる）
+// force=true は抑制を無視して必ず表示する（ユーザ操作への応答など、沈黙すると
+// 操作の結果が分からなくなる用途に限って使う）。
+// 抑制の起点は表示した時刻で更新する（force での表示も起点になる）。
 static void showErrorToast(const std::wstring& title, const std::wstring& body, bool force = false)
 {
     ULONGLONG now = GetTickCount64();
@@ -3217,9 +3217,9 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 //
 // v4 では OS が標準ツールチップを既定で抑止する。szTip の「読み込み中...」は旧方式
 // フォールバック時にだけ見える。標準ツールチップの表示指定（NIF_SHOWTIP）は未認証時の
-// 認証案内にだけ付ける。（NIN_POPUPOPEN は本来ツールチップの代替 UI を出すための通知で、
-// NIF_SHOWTIP との併用時の挙動は文書化されていない。表示指定は一覧ポップアップを出さない
-// 未認証時に限定し、両者の衝突を避ける。updateTrayTooltip を参照）
+// 認証案内にだけ付ける（NIN_POPUPOPEN は本来ツールチップの代替 UI を出すための通知で、
+// NIF_SHOWTIP との併用時の挙動は文書化されていない）。表示指定は一覧ポップアップを出さない
+// 未認証時に限定し、両者の衝突を避ける。updateTrayTooltip を参照。
 //
 // 副作用：ツールチップ定期更新タイマーを開始する。タスクバー再生成時の再呼び出しでは
 // 同じタイマー ID で張り直しになるため、多重登録にはならない。
@@ -3413,7 +3413,7 @@ static int countUpcomingTodayEvents(const std::vector<CalendarEvent>& events) {
 }
 
 // 当日の以降予定件数の表示文言を組み立てる
-// 0 件は NO_UPCOMING_EVENTS の文言に落とす。（一覧のフッターと完了通知で表記を揃える）
+// 0 件は NO_UPCOMING_EVENTS の文言に落とす（一覧のフッターと完了通知で表記を揃える）。
 // 件数ツールチップの全廃により、現在の利用先は「今すぐ更新」の完了通知のみ。
 static std::wstring upcomingCountText(int count) {
     if (count <= 0) return NO_UPCOMING_EVENTS;
@@ -3422,10 +3422,10 @@ static std::wstring upcomingCountText(int count) {
 
 // トレイアイコンの状態表示（ツールチップ・バッジ）を更新する
 // 件数ツールチップは全廃済みで、通常時は空ツールチップの維持とバッジ（以降予定あり）の更新のみを
-// 行う。（件数は一覧ポップアップのフッターが、以降予定の有無はバッジが担う。ツールチップを出すと
-// 同じホバー操作で一覧と重なって衝突する）
-// 未認証時のみ例外として、認証案内のツールチップを表示する。（ホバー表示自体が無反応のため
-// 一覧とは衝突しない）
+// 行う（件数は一覧ポップアップのフッターが、以降予定の有無はバッジが担う）。ツールチップを出すと
+// 同じホバー操作で一覧と重なって衝突するためだ。
+// 未認証時のみ例外として、認証案内のツールチップを表示する（ホバー表示自体が無反応のため
+// 一覧とは衝突しない）。
 // ポップアップ表示中は更新しない。
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
@@ -3451,8 +3451,8 @@ static void updateTrayTooltip(HWND hWnd) {
         events = g_pendingEvents;
     }
     int count = countUpcomingTodayEvents(events);
-    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る。（ツールチップなしを維持する。
-    // NIF_SHOWTIP は付けず、認証済みでは標準ツールチップを抑止したままにする）
+    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る（ツールチップなしを維持する）。
+    // NIF_SHOWTIP は付けず、認証済みでは標準ツールチップを抑止したままにする。
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -3478,7 +3478,7 @@ static void removeTrayIcon(HWND hWnd) {
 // Google Calendar API の id フィールドを優先使用し、未取得時は datetime+content にフォールバックする。
 // 通知抑制リストのキーとして使うほか、通知済み判定キー（notifyBaseKey が開始日時を連結して
 // 生成する）の構成要素になる。id が取得できている限り、タイトル編集や日時変更でキーは
-// 変わらない。（フォールバック時は日時とタイトルがキーそのものになるため、この限りではない）
+// 変わらない（フォールバック時は日時とタイトルがキーそのものになるため、この限りではない）。
 static inline std::string eventKey(const CalendarEvent& e) {
     return e.id.empty() ? (e.datetime + "|" + e.content) : e.id;
 }
@@ -3629,7 +3629,7 @@ static SIZE measureScheduleRow(HDC hdc, const ScheduleItem& item) {
 // hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、past フラグが立つ項目は
 // 非ホット時にグレー文字、soon フラグが立つ項目は非ホット時に赤文字で描画する。next フラグが
 // 立つ項目はホット・抑制状態にかかわらず太字で描画する。muted フラグが立つ項目には
-// DrawTextW 後に 2px の取消線を手動で重ね描画する。（取消線の色は文字色に追従する）
+// DrawTextW 後に 2px の取消線を手動で重ね描画する（取消線の色は文字色に追従する）。
 static void drawScheduleRow(HDC hdc, const RECT& rcItem, const ScheduleItem& item, bool hot) {
     FillRect(hdc, &rcItem,
         reinterpret_cast<HBRUSH>(
@@ -3638,7 +3638,7 @@ static void drawScheduleRow(HDC hdc, const RECT& rcItem, const ScheduleItem& ite
     RECT textRect  = rcItem;
     textRect.left += LIST_ROW_PADDING;
     SetBkMode(hdc, TRANSPARENT);
-    // 過去予定は非ホット時のみグレー化する。（ホット中はハイライト背景での視認性を優先）
+    // 過去予定は非ホット時のみグレー化する（ホット中はハイライト背景での視認性を優先）。
     // グレーは COLOR_GRAYTEXT のままでは濃いため、メニュー背景色を 1/3 混ぜて一段薄くする。
     // 固定 RGB でなくシステム配色から導出するので、ハイコントラスト等の配色変更にも追従する。
     // （GetSysColor はライト・ダークモード切替には追従せず、常にライト系の値を返す）
@@ -3655,7 +3655,7 @@ static void drawScheduleRow(HDC hdc, const RECT& rcItem, const ScheduleItem& ite
     }
     else if (item.soon) {
         // 開始まで urgent_minutes 分未満の切迫予定はやや暗い赤で強調する。
-        // 赤に相当するシステム色はないため固定 RGB とする。（純赤はライト背景で眩しい）
+        // 赤に相当するシステム色はないため固定 RGB とする（純赤はライト背景で眩しい）。
         textColor = RGB(200, 0, 0);
     }
     else {
@@ -3700,7 +3700,7 @@ static void drawScheduleRow(HDC hdc, const RECT& rcItem, const ScheduleItem& ite
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
 // アイコン左クリックのトグル・行クリックで予定ページを開いたとき。起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
-// 無視する。（詳細は handleTrayLeftClick を参照）
+// 無視する（詳細は handleTrayLeftClick を参照）。
 
 // 一覧ポップアップのウィンドウクラス名（自前クラスのため他プロセスからは参照されない）
 static constexpr wchar_t LIST_WND_CLASS[] = L"gcalntfy_list";
@@ -3708,7 +3708,7 @@ static constexpr wchar_t LIST_WND_CLASS[] = L"gcalntfy_list";
 // 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
 // 2 箇所で食い違うと枠サイズと実ウィンドウのレイアウトがずれるため 1 箇所に集約する。
 // WS_POPUP | WS_BORDER：メニュー相当の枠付きポップアップ。
-// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない。（本ウィンドウの核）
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核）。
 // WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない。
 // WS_EX_TOPMOST：タスクバー近傍でも手前に出す。
 static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER;
@@ -3922,7 +3922,7 @@ static HWND ensureListWindow() {
 
 // 予定一覧ポップアップの表示（ホバー・左クリック共通）
 // g_pendingEvents から当日（JST）のイベントを開始済みの過去分も含めて抽出して表示する。
-// 過去分はグレー表示で残し、当日の過去予定への導線とする。（トレイメニューの過去予定表示設定が OFF なら除外）
+// 過去分はグレー表示で残し、当日の過去予定への導線とする（トレイメニューの過去予定表示設定が OFF なら除外）。
 // 終日予定は表示しない。
 // 行の左クリックで予定ページを開き、右クリックで通知抑制をトグルする。
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
@@ -3958,7 +3958,7 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
         auto jst = utcIsoToJst(ev.datetime);
         if (jst.substr(0, 10) != today) continue;
         bool past = jst < nowJst;
-        // 過去予定の表示はトレイメニューのトグル設定に従う。（OFF なら除外して従来表示に戻す）
+        // 過去予定の表示はトレイメニューのトグル設定に従う（OFF なら除外して従来表示に戻す）。
         if (past && !showPast) continue;
         if (!past) ++upcomingCount;
         auto key   = eventKey(ev);
@@ -3971,7 +3971,7 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
         // 今後の予定にはタイトル末尾へ開始までの残り時間「（n時間n分後）」を付ける。
         // ポップアップを開くたびに現在時刻で再計算される。1 時間未満は「（n分後）」、
         // ちょうど n 時間なら「（n時間後）」と 0 分を省略する。過去予定には付けない。
-        // 当日フィルタ通過後のため日付は同一であり、時・分の差だけで求まる。（秒は切り捨て）
+        // 当日フィルタ通過後のため日付は同一であり、時・分の差だけで求まる（秒は切り捨て）。
         bool soon = false;
         if (!past && jst.size() >= 16) {
             int diffMin = (std::stoi(jst.substr(11, 2)) * 60 + std::stoi(jst.substr(14, 2)))
@@ -4002,7 +4002,7 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
     g_listFooterText.clear();
     g_listHotRow = -1;
 
-    // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
+    // カーソル位置のモニタ作業領域を先に取得する（行の打ち切り判定と位置クランプの両方に使う）。
     POINT cursor;
     if (refresh) {
         cursor = g_listAnchor;
@@ -4055,7 +4055,7 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
         pushRow(ListRowKind::Empty, textRowHeight, 0);
     }
     else {
-        // 全予定行の高さを先に測る。（打ち切り範囲を決めてからレイアウトを組むため）
+        // 全予定行の高さを先に測る（打ち切り範囲を決めてからレイアウトを組むため）。
         std::vector<SIZE> sizes;
         sizes.reserve(todayEvents.size());
         for (const auto& te : todayEvents) sizes.push_back(measureScheduleRow(hdc, te));
@@ -4153,8 +4153,8 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
     g_popupShowing.store(true);
     // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
     g_listOutsideTicks = -LIST_SHOW_GRACE_TICKS;
-    // 離脱監視の開始。失敗時は表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
-    // 監視なしでは出しっぱなしになるため）
+    // 離脱監視の開始。失敗時は表示を諦めて閉じる（閉じる手段が離脱かクリックしかなく、
+    // 監視なしでは出しっぱなしになるため）。
     if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
         writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
         ShowWindow(hWnd, SW_HIDE);
@@ -4165,13 +4165,13 @@ static void showListPopup(HWND trayWnd, bool refresh = false) {
 // 一覧ポップアップを閉じる（離脱・トグル・行クリックの共通経路）
 // カーソルがまだアイコン上にある閉じ操作では、ホバー再表示を抑止する
 // （g_hoverSuppressed。NIN_POPUPCLOSE で解除）。閉じた直後の微動で NIN_POPUPOPEN が
-// 再送されても開き直さないための備えだ。（再送条件は文書化されていない）
+// 再送されても開き直さないための備えだ（再送条件は文書化されていない）。
 static void hideListPopup(HWND trayWnd) {
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
     g_popupShowing.store(false);
     g_listHotRow = -1;
-    // ホバー起点の記録を破棄する。（クリック猶予は表示中の一覧にだけ効かせる。
-    // 残すと右クリックメニュー表示中など後続の g_popupShowing = true で猶予が誤発動する）
+    // ホバー起点の記録を破棄する（クリック猶予は表示中の一覧にだけ効かせる）。
+    // 残すと右クリックメニュー表示中など後続の g_popupShowing = true で猶予が誤発動する。
     g_hoverShownAt = 0;
     g_hoverSuppressed = g_iconHovered;
     KillTimer(trayWnd, IDT_LIST_WATCH);
@@ -4338,12 +4338,12 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
 
 // トレイ右クリックメニューの構築と表示
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
-// その場で構築する。（チェック状態は呼び出し時の最新値を反映）
+// その場で構築する（チェック状態は呼び出し時の最新値を反映）。
 // 副作用：一覧ポップアップが出ていれば閉じ、表示中フラグを立てて
 // ツールチップ・バッジ更新を抑止する。メニュー終了時に両方とも戻す。
 static void showTrayContextMenu(HWND hWnd) {
-    // 一覧ポップアップが出ていれば先に閉じる。（メニューと重なるのを防ぎ、メニュー終了時の
-    // g_popupShowing.store(false) が可視の一覧とフラグを食い違わせるのも防ぐ）
+    // 一覧ポップアップが出ていれば先に閉じる（メニューと重なるのを防ぎ、メニュー終了時の
+    // g_popupShowing.store(false) が可視の一覧とフラグを食い違わせるのも防ぐ）。
     if (isListPopupVisible()) hideListPopup(hWnd);
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
@@ -4462,9 +4462,9 @@ static void handleTrayHover(HWND hWnd) {
     if (!g_iconHovered)              return;
 
     showListPopup(hWnd);
-    // ホバー起点の時刻を記録する。（左クリックの「閉じる」猶予判定用）
+    // ホバー起点の時刻を記録する（左クリックの「閉じる」猶予判定用）。
     // 表示が成立したときだけ記録し、不変条件「非 0 はホバー起点の一覧が表示中のときだけ」を
-    // 保つ。（クローズ側の hideListPopup が 0 に戻す）
+    // 保つ（クローズ側の hideListPopup が 0 に戻す）。
     if (g_popupShowing.load()) g_hoverShownAt = GetTickCount64();
 }
 
@@ -4629,8 +4629,8 @@ static void toggleScheduleItemMute(size_t itemIndex) {
         }
     }
     item.muted = nowMuted;
-    // 当該行だけを再描画する。（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
-    // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）
+    // 当該行だけを再描画する（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
+    // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）。
     if (g_listWnd) {
         for (const auto& row : g_listLayout) {
             if (row.kind == ListRowKind::Event && row.index == itemIndex) {
@@ -4659,15 +4659,15 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         // NOTIFYICON_VERSION_4 のコールバック形式：LOWORD(lParam) がイベント種別、
         // HIWORD(lParam) がアイコン ID（単一アイコンのため未使用）、wParam がアンカー座標。
         // v4 では OS が WM_LBUTTONUP を NIN_SELECT に、WM_RBUTTONUP を WM_CONTEXTMENU に
-        // 置き換えて送る。（置き換え対象外の WM_MOUSEMOVE 等は生のまま届くが使わない）
+        // 置き換えて送る（置き換え対象外の WM_MOUSEMOVE 等は生のまま届くが使わない）。
         // NIM_SETVERSION 失敗時（g_trayV4 = false）は置き換えのない旧方式となるため、
         // クリック判定を WM_LBUTTONUP / WM_RBUTTONUP へ切り替える。ホバー通知は届かず、
         // 一覧は左クリックでのみ開ける。
         // WM_CONTEXTMENU は旧方式でもキーボード操作（アプリケーションキー等）で届くため、
-        // 方式によらず受ける。（メニュー位置がカーソル基準になる点は旧来からの挙動）
-        // キーボード選択（NIN_KEYSELECT）は扱わない。（一覧の表示位置と離脱監視がカーソル
-        // 位置基準のため、カーソルがトレイ外にあるキーボード操作では正しく機能しない。
-        // 旧方式でも無反応であり、挙動を維持する）
+        // 方式によらず受ける（メニュー位置がカーソル基準になる点は旧来からの挙動）。
+        // キーボード選択（NIN_KEYSELECT）は扱わない（一覧の表示位置と離脱監視がカーソル
+        // 位置基準のため、カーソルがトレイ外にあるキーボード操作では正しく機能しない）。
+        // 旧方式でも無反応であり、挙動を維持する。
         const UINT event = LOWORD(lParam);
         if (event == WM_CONTEXTMENU || (!g_trayV4 && event == WM_RBUTTONUP)) {
             KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 保留中のホバートリガーを取消（クリック優先）
@@ -4697,8 +4697,8 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         else if (event == NIN_POPUPCLOSE) {
             // カーソルがアイコンを離れた。遅延中の表示予約と明示クローズ後の再表示抑止を
-            // 解除する。表示済みの一覧はここでは閉じない。（アイコンから一覧へカーソルを
-            // 移す途中でも届くため、閉じ判定は IDT_LIST_WATCH の離脱監視に任せる）
+            // 解除する。表示済みの一覧はここでは閉じない（アイコンから一覧へカーソルを
+            // 移す途中でも届くため、閉じ判定は IDT_LIST_WATCH の離脱監視に任せる）。
             g_iconHovered     = false;
             g_hoverSuppressed = false;
             KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -4849,11 +4849,11 @@ struct EventChange {
 // 除外の適用は次のとおり。追加は猶予超過なら除外する。日時変更は変更前後とも猶予超過なら
 // 除外する。キャンセルは猶予超過の消失を除外する。
 // 終日予定は JST 0 時開始に正規化され当日分が常に開始済み扱いになるため、変更後が終日の
-// 追加・日時変更は除外せず通知する。（キャンセルの除外は終日予定にも適用される）
+// 追加・日時変更は除外せず通知する（キャンセルの除外は終日予定にも適用される）。
 // Added 検知は取得窓への新規進入を検知するものであり、ユーザが Calendar
-// に実際に追加した予定との区別は行わない。（起動直後の誤検知は呼び出し元がベースライン
-// 未確立の回に本関数を呼ばないことで抑制する。oldEvents が空でも本関数は通常どおり突合し、
-// 前回 0 件からの新規出現を Added として検知する）
+// に実際に追加した予定との区別は行わない（起動直後の誤検知は呼び出し元がベースライン
+// 未確立の回に本関数を呼ばないことで抑制する）。oldEvents が空でも本関数は通常どおり突合し、
+// 前回 0 件からの新規出現を Added として検知する。
 // このため、一度消えた予定の再出現（作り直し、再招待、窓外からの復帰）も Added とする。
 // 変更検知は抑制状態を参照しない。抑制の意図をアプリは知り得ず、変更や再出現で参加できる
 // ようになる場合があるためだ。抑制は開始前通知の側だけに適用する。
@@ -5135,8 +5135,8 @@ static void notifyThreadFunc() {
             long long minFireMs = LLONG_MAX;
             for (const auto& e : localEvents) {
                 long long diffMs = calcDiffMs(e.datetime, nowUtc);
-                // 開始済みイベントは通知対象外。（発火経路はすべて開始前の予定のみを扱うため、
-                // 通知済みマークの先回り登録も不要）
+                // 開始済みイベントは通知対象外（発火経路はすべて開始前の予定のみを扱うため、
+                // 通知済みマークの先回り登録も不要）。
                 if (diffMs <= 0) continue;
                 // 通知抑制中のイベントは minFireMs 計算から除外する
                 if (mutedKeys.count(eventKey(e))) continue;
@@ -5323,7 +5323,7 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // 要求時は残りを処理せず戻る。このとき outAllSuccess は false、outAuthFailed は末尾の集計を
 // 通らないため常に false、outAnySuccess と events には処理済みカレンダー分が残る。
 // 通信無応答時の HTTP 待ちがカレンダーの数だけ連なると、終了操作からプロセス終了まで
-// 数分かかるためだ。（進行中の httpGet 自体は打ち切れないため、短縮効果は開始前の確認分に限る）
+// 数分かかるためだ（進行中の httpGet 自体は打ち切れないため、短縮効果は開始前の確認分に限る）。
 //
 // ※ ID プレフィックス付与（"<calId>/<eventId>"）はこの関数内で行う。
 // カレンダー ID をまたいだ ID 衝突防止のため、events 取得直後にカレンダー ID を
@@ -5502,7 +5502,7 @@ static void deliverPollResults(
 //
 // pending が false なら何もしない。true なら失敗理由を 1 枚の Toast で伝えて応答済みにする。
 // ユーザ操作への応答は沈黙させられないため、エラー Toast のクールダウン抑制を無視する。
-// 戻り値：応答を表示したか。（true なら呼び出し元は同内容の汎用エラー通知を省く）
+// 戻り値：応答を表示したか（true なら呼び出し元は同内容の汎用エラー通知を省く）。
 static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
     if (!pending) return false;
     pending = false;
@@ -5684,7 +5684,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 誤キャンセル通知・キャッシュ劣化・一覧からの一時消失として現れるため
             // ただし失敗が閾値を超えて続く場合は恒常的な原因（カレンダー削除・設定誤り等）の
             // 可能性が高く、更新停止が沈黙したまま固定化しないよう Toast で警告する。
-            // 手動更新は 1 回目の失敗でも応答を返す。（更新されなかった事実が閾値まで伝わらないため）
+            // 手動更新は 1 回目の失敗でも応答を返す（更新されなかった事実が閾値まで伝わらないため）。
             // 応答済みなら閾値超過の警告は省き、代わりに応答の文言で恒常障害を伝える。
             if (!allSuccess) {
                 partialFailureStreak++;
