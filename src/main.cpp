@@ -93,8 +93,9 @@
 static const wchar_t* APP_AUMID = L"com.gcalntfy";
 
 // 通知リード時間のデフォルト（分）と有効範囲
+// 最小 1 分。開始済みの予定は通知対象外のため、0 分前（開始時刻ちょうど）では発火しない
 static constexpr int DEFAULT_NOTIFY_MINUTES = 5;
-static constexpr int MIN_NOTIFY_MINUTES = 0;
+static constexpr int MIN_NOTIFY_MINUTES = 1;
 static constexpr int MAX_NOTIFY_MINUTES = 30;
 
 // 直前通知のリード時間（imminent_seconds）のデフォルト（秒）と有効範囲。0 指定で無効
@@ -1956,7 +1957,8 @@ static Config loadConfig(const std::wstring& exeDir) {
         return def;
     };
 
-    // notify_minutes（通知リード時間、分単位。デフォルト 5 分、0〜30 にクランプ）
+    // notify_minutes（通知リード時間、分単位。デフォルト 5 分、1〜30 にクランプ。
+    // 開始済みの予定は通知対象外のため、0 分前（開始時刻ちょうど）では発火しない）
     long long notifyMin = readConfigTopInt("notify_minutes",
         DEFAULT_NOTIFY_MINUTES, MIN_NOTIFY_MINUTES, MAX_NOTIFY_MINUTES);
     cfg.notifyLeadMs = notifyMin * 60LL * 1000LL;
