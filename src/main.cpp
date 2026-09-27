@@ -359,7 +359,7 @@ static std::atomic<ULONGLONG> g_lastAuthToastTime{0};
 static std::thread g_authThread;
 
 // 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
-static void showToast(const std::wstring& timeJST, const std::wstring& title,
+static void showToast(const std::wstring& line1, const std::wstring& title,
                       const std::wstring& permalink, bool silent = true);
 static std::wstring readRefreshToken();
 static void writeRefreshToken(const std::wstring& value);
@@ -3032,16 +3032,17 @@ static void dispatchToastXml(std::wstring xml, const std::wstring& permalink) {
 //
 // OS に通知を登録して即 return する（コールバック待機なし）。
 // アプリアイコン（exe 同フォルダの app.ico）・Calendar を開くボタンを含むリッチな通知を表示する。
+// line1 は 1 行目の文字列（予定通知では開始時刻、その他は見出し）。
 // silent=true（デフォルト）: OS 通知音を無効化する。
 // silent=false: <audio> タグを省略し OS 標準通知音を鳴らす。
-static void showToast(const std::wstring& timeJST, const std::wstring& title,
+static void showToast(const std::wstring& line1, const std::wstring& title,
                       const std::wstring& permalink, bool silent)
 {
     std::wstring xml =
         L"<toast>"
         L"<visual><binding template=\"ToastGeneric\">"
         + buildIconTag() +
-        L"<text>" + escapeXml(timeJST) + L"</text>"
+        L"<text>" + escapeXml(line1) + L"</text>"
         L"<text>" + escapeXml(title)   + L"</text>"
         L"</binding></visual>"
         + (silent ? L"<audio silent=\"true\"/>" : L"");
@@ -3071,7 +3072,7 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
 //
 // バックグラウンドスレッドからの通知用。WinRT 例外がスレッド関数を脱出すると
 // ポーリングループの中断や std::terminate を招くため、ここで捕捉してログに残す。
-// showToast の第 1 引数（時刻欄）に見出しを流用し、ボタンは付けない。
+// showToast の 1 行目に見出しを渡し、ボタンは付けない。
 static void showToastSafe(const std::wstring& title, const std::wstring& body)
 {
     try {
