@@ -2036,6 +2036,7 @@ static Config loadConfig(const std::wstring& exeDir) {
 // ==================== 時刻ユーティリティ ====================
 
 // ISO 8601 UTC 文字列 "YYYY-MM-DDTHH:MM:SS...Z" を ULARGE_INTEGER（100 ナノ秒単位）に変換する
+// パース失敗時は 0（1601-01-01 相当）を返す
 static ULARGE_INTEGER parseIsoToUli(const std::string& iso) {
     SYSTEMTIME st;
     if (!parseIsoToSystemTime(iso, st)) {
@@ -2045,6 +2046,8 @@ static ULARGE_INTEGER parseIsoToUli(const std::string& iso) {
 }
 
 // 2 つの UTC ISO 8601 文字列の差をミリ秒で返す（isoTarget - isoNow、負の場合は 0）
+// isoTarget のパース失敗時は 0 を返し、isoNow だけがパース失敗した場合は差が過大になる
+// （呼び出し元は現在時刻を正しい形式で渡す前提）
 static long long calcDiffMs(const std::string& isoTarget, const std::string& isoNow) {
     auto target = parseIsoToUli(isoTarget);
     auto now    = parseIsoToUli(isoNow);
@@ -4179,6 +4182,7 @@ static void hideListPopup(HWND trayWnd) {
 
 // バージョン文字列から数値の MAJOR.MINOR.PATCH を抽出する
 // "v2.7.4" / "2.7.4-dirty" / "2.7.4-5-gHASH" のいずれにも対応する
+// MAJOR.MINOR.PATCH の 3 数値を取れない場合は false を返し、出力引数は変更しない
 static bool parseVersion(const std::wstring& ver, int& major, int& minor, int& patch) {
     std::wstring s = ver;
     if (!s.empty() && (s[0] == L'v' || s[0] == L'V')) s = s.substr(1);
@@ -4191,6 +4195,7 @@ static bool parseVersion(const std::wstring& ver, int& major, int& minor, int& p
 }
 
 // a が b より新しいバージョンなら true を返す
+// どちらかのバージョン文字列をパースできない場合は false（新版なし扱い）を返す
 static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
     int aMaj, aMin, aPat, bMaj, bMin, bPat;
     if (!parseVersion(a, aMaj, aMin, aPat)) return false;
