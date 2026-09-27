@@ -50,6 +50,7 @@
 #include <audiopolicy.h>
 #include <audioclient.h>
 #include <bcrypt.h>
+#include <dpapi.h>
 
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
@@ -83,6 +84,7 @@
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 #include "resource.h"
@@ -253,7 +255,7 @@ static constexpr size_t PKCE_VERIFIER_BYTES = 64;
 // OAuth state パラメータの乱数バイト数（CSRF 耐性のため十分なエントロピー）
 static constexpr size_t OAUTH_STATE_BYTES = 32;
 
-// レジストリ値名（refresh token）
+// レジストリ値名（refresh token。DPAPI で暗号化した REG_BINARY。旧版の平文 REG_SZ は読み出し時に移行する）
 static constexpr const wchar_t* REG_REFRESH_TOKEN = L"RefreshToken";
 
 // シャットダウンフラグ（メインスレッド・WndProc・通知スレッドから参照）
@@ -359,8 +361,8 @@ static std::thread g_authThread;
 // 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
 static void showToast(const std::wstring& timeJST, const std::wstring& title,
                       const std::wstring& permalink, bool silent = true);
-static std::wstring readRegString(const wchar_t* valueName);
-static void writeRegString(const wchar_t* valueName, const std::wstring& value);
+static std::wstring readRefreshToken();
+static void writeRefreshToken(const std::wstring& value);
 static void notifyAuthRequired();
 
 // ==================== データ構造 ====================
@@ -1195,7 +1197,7 @@ static bool applyTokenResponse(const winrt::Windows::Data::Json::JsonObject& obj
 }
 
 // 認証コードをアクセストークン・リフレッシュトークンに交換する
-// 成功時：g_accessToken / g_tokenExpiry を更新し、refresh_token をレジストリに保存
+// 成功時：g_accessToken / g_tokenExpiry を更新し、refresh_token を暗号化してレジストリに保存
 static bool exchangeCodeForTokens(const std::string& authCode,
     int redirectPort, const std::string& codeVerifier)
 {
@@ -1225,7 +1227,7 @@ static bool exchangeCodeForTokens(const std::string& authCode,
 
         if (obj.HasKey(L"refresh_token")) {
             std::wstring rt = obj.GetNamedString(L"refresh_token", L"").c_str();
-            writeRegString(REG_REFRESH_TOKEN, rt);
+            writeRefreshToken(rt);
             writeLog("refresh_token saved to registry");
         }
         else {
@@ -1290,8 +1292,8 @@ static RefreshResult refreshAccessToken(const std::wstring& refreshToken) {
 //
 // Toast もブラウザも起動しない。ポーリングループから呼び出される。
 // 1. 有効期限内（5 分マージン）なら即 Ok
-// 2. レジストリの refresh_token でリフレッシュを試みる
-// 3. refresh_token がなければ AuthRequired
+// 2. レジストリの refresh_token（暗号化保存）を復号してリフレッシュを試みる
+// 3. refresh_token がない、または復号できなければ AuthRequired
 static RefreshResult tryRefreshAccessToken() {
     // 有効期限確認（5 分のマージンを持たせる）
     {
@@ -1307,7 +1309,7 @@ static RefreshResult tryRefreshAccessToken() {
         }
     }
 
-    auto refreshToken = readRegString(REG_REFRESH_TOKEN);
+    auto refreshToken = readRefreshToken();
     if (refreshToken.empty()) return RefreshResult::AuthRequired;
 
     return refreshAccessToken(refreshToken);
@@ -2221,6 +2223,68 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value) 
             reinterpret_cast<const BYTE*>(value.c_str()), byteSize) != ERROR_SUCCESS)
         writeLog("registry write failed: " + wideToUtf8(valueName));
     RegCloseKey(hKey);
+}
+
+// refresh_token をレジストリへ暗号化して保存する
+// DPAPI（CurrentUser スコープ、entropy なし、CRYPTPROTECT_UI_FORBIDDEN）で UTF-8 バイト列を暗号化し、
+// REG_REFRESH_TOKEN 値に REG_BINARY で書き込む。同一 Windows ユーザのプロファイルでのみ復号できる。
+// 暗号化またはレジストリ書き込みに失敗した場合はログを残して保存しない（平文で保存するフォールバックは持たない）
+static void writeRefreshToken(const std::wstring& value) {
+    std::string utf8 = wideToUtf8(value);
+    DATA_BLOB in = {};
+    in.pbData = reinterpret_cast<BYTE*>(utf8.data());
+    in.cbData = static_cast<DWORD>(utf8.size());
+    DATA_BLOB out = {};
+    if (!CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        writeLog("refresh_token: CryptProtectData failed: " + std::to_string(GetLastError()));
+        return;
+    }
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, nullptr,
+            0, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+        writeLog("registry key create failed: " + wideToUtf8(REG_REFRESH_TOKEN));
+        LocalFree(out.pbData);
+        return;
+    }
+    if (RegSetValueExW(hKey, REG_REFRESH_TOKEN, 0, REG_BINARY, out.pbData, out.cbData) != ERROR_SUCCESS)
+        writeLog("registry write failed: " + wideToUtf8(REG_REFRESH_TOKEN));
+    RegCloseKey(hKey);
+    LocalFree(out.pbData);
+}
+
+// refresh_token をレジストリから復号して読み出す
+// REG_REFRESH_TOKEN 値を REG_BINARY として読み、DPAPI で復号して返す。
+// 値が存在しない、または復号に失敗した場合（別ユーザ・別 PC のプロファイルで保存した値など）は
+// 空文字列を返し、呼び出し側は AuthRequired として再認証させる。
+// 旧版が平文 REG_SZ で保存した値は、読み出し時にその場で暗号化形式へ書き換えてから平文を返す（移行）
+static std::wstring readRefreshToken() {
+    DWORD type = 0, size = 0;
+    LONG rc = RegGetValueW(HKEY_CURRENT_USER, REG_KEY_PATH, REG_REFRESH_TOKEN,
+        RRF_RT_REG_BINARY, &type, nullptr, &size);
+    if (rc == ERROR_UNSUPPORTED_TYPE) {
+        // 旧版の平文 REG_SZ：暗号化形式へ移行して平文を返す
+        auto plain = readRegString(REG_REFRESH_TOKEN);
+        if (plain.empty()) return {};
+        writeRefreshToken(plain);
+        writeLog("refresh_token migrated to encrypted storage");
+        return plain;
+    }
+    if (rc != ERROR_SUCCESS || size == 0) return {};
+    std::vector<BYTE> blob(size);
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY_PATH, REG_REFRESH_TOKEN,
+            RRF_RT_REG_BINARY, &type, blob.data(), &size) != ERROR_SUCCESS)
+        return {};
+    DATA_BLOB in = {};
+    in.pbData = blob.data();
+    in.cbData = size;
+    DATA_BLOB out = {};
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        writeLog("refresh_token: CryptUnprotectData failed: " + std::to_string(GetLastError()));
+        return {};
+    }
+    std::string utf8(reinterpret_cast<const char*>(out.pbData), out.cbData);
+    LocalFree(out.pbData);
+    return toWide(utf8);
 }
 
 // スタートアップ登録の有無判定
