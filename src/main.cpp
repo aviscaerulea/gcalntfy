@@ -4938,6 +4938,7 @@ static std::vector<CalendarEvent> notifyTargetEvents() {
 // でない予定に直前通知を出さない（予定ごとの実効リード時間を 0 として扱う）。
 // 起動直後などタイミング経過後に評価した場合、基本通知と直前通知は開始前である限り
 // 遡って発火する。両方が経過済みなら基本通知 1 回に集約する。
+// 起動直後などに既に経過していた reminders は鳴らさないが、連続発火による遅れは経過とみなさない。
 // notifiedSet のキーは "eventKey|開始日時@秒数" 形式で、同一イベントの異なるタイミングを
 // 区別する。開始日時を含むため、予定の日時変更で記録が無効化され新時刻で再通知される。
 // 全イベント × 全通知タイミングを走査して最小発火時間を求めてから wait_until で待機する。
@@ -4973,9 +4974,16 @@ static void notifyThreadFunc() {
         }
         pruneNotifiedSet(notifiedSet, localEvents);
 
+        // 直前の周回で発火したときの基準時刻（発火しなかった周回の後は空）
+        std::string lastFiredUtc;
         // 直近未通知イベントを順次通知する内側ループ
         while (!g_shutdownRequested) {
-            auto nowUtc = getCurrentUtcISO();
+            // 基準時刻。通知した直後の周回はその通知の基準時刻を引き継ぐ。
+            // 開始日時の異なる予定の通知が同時刻に重なると 1 周回に 1 グループずつ順に発火するが、
+            // 時刻を取り直すと発火処理にかかった時間の分だけ後続の reminders が経過済みとみなされて
+            // 消えるため。引き継ぎは 1 周回限りで、待機後や予定リスト更新後は現在時刻に戻す
+            std::string nowUtc = lastFiredUtc.empty() ? getCurrentUtcISO() : lastFiredUtc;
+            lastFiredUtc.clear();
             long long leadMs = localConfig.notifyLeadMs;
             // 直前通知の実効リード時間。直前通知トグルが OFF の間は 0（無効）として扱う
             long long imminentMs = g_imminentEnabled.load() ? localConfig.imminentLeadMs : 0;
@@ -5002,6 +5010,8 @@ static void notifyThreadFunc() {
                 };
                 checkLead(leadMs);
                 // 遡及発火を防ぐため、通知タイミング経過済みの reminders は通知済みとみなす。
+                // 直前の周回で通知した場合は同じ基準時刻で判定するので、発火処理にかかった時間のせいで
+                // 同時刻に重なった別予定の reminders が経過済みと誤判定されることはない。
                 // ただし基本通知や直前通知と同じリード時間の reminders は通知済みキーを共有する。
                 // ここでマークすると基本通知や直前通知まで消えるため、その場合はマークしない。
                 // 基本通知と一致する場合は基本通知側の遡及発火に委ね、直前通知と一致する場合は
@@ -5096,6 +5106,7 @@ static void notifyThreadFunc() {
             bool allowSound = hasBaseTiming || localConfig.imminentSound;
             fireNotificationGroup(group, targetDatetime, targetLeadMs, allowSound,
                 localConfig, notifiedSet);
+            lastFiredUtc = nowUtc;
             g_forcePoll.store(true);
             writeLog("notification fired, requesting poll");
         }
