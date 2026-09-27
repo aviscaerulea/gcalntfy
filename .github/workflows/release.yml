@@ -16,6 +16,8 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
 
+      # タグ名はリリース作成者が自由に付けられる値のため、run に ${{ }} で直接埋め込まず env 経由で渡す（式インジェクション対策）。
+      # 以降のステップの TAG、VERSION も同じ理由で env 経由とする。
       - name: Extract version
         id: version
         shell: bash
