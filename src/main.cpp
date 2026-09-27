@@ -415,7 +415,7 @@ struct WavCache {
 };
 static WavCache g_wavCache;
 
-// メインスレッド→通知スレッド：予定リスト・設定の受け渡し（g_mtx で保護）
+// メイン・ポーリングスレッド→通知スレッド：予定リスト・設定の受け渡し（g_mtx で保護）
 static std::mutex              g_mtx;
 static std::condition_variable g_cv;
 static std::vector<CalendarEvent> g_pendingEvents;
@@ -5057,7 +5057,7 @@ static std::vector<CalendarEvent> notifyTargetEvents() {
     return out;
 }
 
-// 通知スレッド：メインスレッドから予定リストを受け取り、通知を実行する
+// 通知スレッド：ポーリングスレッドから予定リストを受け取り、通知を実行する
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // 予定リストは notifyTargetEvents で終日予定を除いたものを使う（終日予定は開始前通知の対象外）。
