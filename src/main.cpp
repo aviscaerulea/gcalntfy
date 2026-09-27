@@ -5065,7 +5065,7 @@ static std::vector<CalendarEvent> notifyTargetEvents() {
     return out;
 }
 
-// 通知スレッド：ポーリングスレッドから予定リストを受け取り、通知を実行する
+// 通知スレッド：メイン・ポーリングスレッドから予定リストを受け取り、通知を実行する
 //
 // MTA で COM/WinRT を初期化し（winrt::init_apartment は既定で MTA）、g_cv で予定リスト更新を待機する。
 // 予定リストは notifyTargetEvents で終日予定を除いたものを使う（終日予定は開始前通知の対象外）。
