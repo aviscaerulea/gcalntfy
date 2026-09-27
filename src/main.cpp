@@ -1012,7 +1012,7 @@ static const char* const AUTH_RESPONSE_EXCHANGE_FAILED =
     "<html><body><p>認証を完了できませんでした。再度お試しください。</p></body></html>";
 
 // ループバックサーバで認証コードを待ち受ける（120 秒タイムアウト）
-// select() で accept タイムアウトを制御し、client ソケットで recv タイムアウトを設定する。
+// accept と recv の両方を select() の 1 秒単位で待ち、recv は無通信 10 秒で打ち切る。
 // \r\n\r\n 受信まで recv をループし、auth_code を抽出して返す（失敗時は空文字列）。
 // code を返すときはブラウザへ応答せず、client ソケットを開いたまま outClient へ渡す。
 // ブラウザへの最終応答（完了・交換失敗）はトークン交換の結果を見てから呼び出し元が送り、
@@ -1020,7 +1020,8 @@ static const char* const AUTH_RESPONSE_EXCHANGE_FAILED =
 // client を閉じ、outClient は INVALID_SOCKET とする。
 // expectedState が非空の場合、受信した state と一致しなければ空文字列を返す（CSRF 対策）。
 // コールバックに code が含まれない場合（同意画面の拒否など）は 400 応答を返し、空文字列を返す。
-// シャットダウン要求時は 1 秒以内にループから抜けて空文字列を返す（プロセス停止を阻害しないため）。
+// シャットダウン要求時は accept 待ち・recv 待ちのどちらでも 1 秒以内にループから抜けて
+// 空文字列を返す（プロセス停止を阻害しないため）。
 static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expectedState,
     SOCKET& outClient)
 {
@@ -1046,8 +1047,11 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     SOCKET client = accept(serverSocket, nullptr, nullptr);
     if (client == INVALID_SOCKET) return {};
 
-    // recv タイムアウトは client ソケットに設定する
-    DWORD recvTimeout = 10000;
+    // recv は下の読み出しループで select の 1 秒単位に待ち、無通信が RECV_IDLE_TIMEOUT_SEC 秒に
+    // 達したら打ち切る。SO_RCVTIMEO は select が読み取り可能と判定したのに recv がブロックした
+    // 場合の保険として同じ秒数で残す
+    constexpr int RECV_IDLE_TIMEOUT_SEC = 10;
+    DWORD recvTimeout = RECV_IDLE_TIMEOUT_SEC * 1000;
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
@@ -1061,10 +1065,40 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
 
     std::string req;
     // HTTP リクエスト読み出しループ
+    // 各 recv の前に accept と同じ形の select（1 秒）で待ち、無通信のまま 1 秒経つたびに
+    // g_shutdownRequested を確認する。シャットダウン要求時は応答を送らずに閉じる。
+    // 無通信が RECV_IDLE_TIMEOUT_SEC 秒に達したら recv 失敗と同じ扱いで打ち切る。
     // recv の戻り値：正値=受信バイト数、0=ピア close、SOCKET_ERROR(-1)=エラー
     // ループ離脱後、"\r\n\r\n" が未受信なら不完全リクエスト検知で弾かれる（後段を参照）。
     char chunk[1024];
+    int idleSec = 0;
     while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(client, &readSet);
+        timeval tv = { 1, 0 };
+        int ready = select(0, &readSet, nullptr, nullptr, &tv);
+        if (ready == 0) {
+            if (g_shutdownRequested.load()) {
+                writeLog("waitForAuthCode: shutdown requested while receiving");
+                closesocket(client);
+                return {};
+            }
+            if (++idleSec >= RECV_IDLE_TIMEOUT_SEC) {
+                writeLog("waitForAuthCode: recv idle timeout");
+                send(client, RESPONSE_RECV_ERROR, static_cast<int>(strlen(RESPONSE_RECV_ERROR)), 0);
+                closesocket(client);
+                return {};
+            }
+            continue;
+        }
+        if (ready < 0) {
+            writeLog("waitForAuthCode: select failed, WSA error " + std::to_string(WSAGetLastError()));
+            send(client, RESPONSE_RECV_ERROR, static_cast<int>(strlen(RESPONSE_RECV_ERROR)), 0);
+            closesocket(client);
+            return {};
+        }
+        idleSec = 0;
         int n = recv(client, chunk, sizeof(chunk), 0);
         if (n == 0) {
             writeLog("waitForAuthCode: peer closed before request complete");
