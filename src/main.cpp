@@ -5784,11 +5784,42 @@ int wmain() {
         writeLog("warning: failed to create job object");
     }
 
-    // 例外時の後始末（NIC 監視解除・スレッド join）を catch 節でも行えるよう try の外で宣言する
+    // 後始末を正常終了と例外時で共有するため、スレッド・NIC 監視ハンドル・後始末ラムダを try の外で宣言する
     std::thread notifyThread;
     std::thread pollThread;
     std::thread updateThread;
     HANDLE hNetNotify = nullptr;
+
+    // 終了時の後始末（正常終了とメッセージループ前後の例外の両方から呼ぶ）
+    // 順序：停止フラグ → NIC 監視解除 → スレッド合流 → トレイアイコンとウィンドウの破棄。
+    // 停止フラグは g_mtx の保持下で立てる。通知スレッドは条件変数の述語でこのフラグを見るため、
+    // ロックなしで立てると述語評価と待機列登録の間に割り込んだ通知を取り逃し、join が返らなくなる。
+    // NIC 変化監視はスレッド停止より先に解除する（コールバック発火を先に止める）。
+    // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）。
+    // joinable なスレッドを残したまま破棄すると std::terminate になるため、起動済みのスレッドはすべて合流させる。
+    // 対話認証スレッドの認証コード待ちはシャットダウン要求を 1 秒以内に検知して脱出する。
+    // 更新チェックスレッドは通常起動後数秒で完了済みだが、最悪ケースは GitHub への HTTP タイムアウト待ちで
+    // 終了が数十秒遅れる。
+    // トレイアイコンとウィンドウは g_hWnd が生成済みのときだけ破棄する（例外時は未生成の可能性がある。
+    // アイコン未登録・セッション通知未登録でも各 API は失敗を返すだけで害はない）
+    auto shutdownAll = [&]() {
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_shutdownRequested = true;
+        }
+        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
+        // 通知スレッドは条件変数で待機中の可能性があるため notify_one で起こす
+        g_cv.notify_one();
+        if (pollThread.joinable()) pollThread.join();
+        if (notifyThread.joinable()) notifyThread.join();
+        if (g_authThread.joinable()) g_authThread.join();
+        if (updateThread.joinable()) updateThread.join();
+        if (g_hWnd) {
+            WTSUnRegisterSessionNotification(g_hWnd);
+            removeTrayIcon(g_hWnd);
+            DestroyWindow(g_hWnd);
+        }
+    };
 
     try {
         winrt::init_apartment();
@@ -5882,53 +5913,13 @@ int wmain() {
             DispatchMessageW(&msg);
         }
 
-        // メッセージループ終了 → シャットダウン処理開始
-        // 停止フラグは g_mtx の保持下で立てる。通知スレッドは条件変数の述語でこのフラグを見るため、
-        // ロックなしで立てると述語評価と待機列登録の間に割り込んだ通知を取り逃し、join が返らなくなる
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_shutdownRequested = true;
-        }
-
-        // NIC 変化監視を解除してからスレッドを停止（コールバック発火を先に止める）
-        // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
-        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
-
-        // バックグラウンドスレッドを停止
-        // 通知スレッドは条件変数で待機中の可能性があるため notify_one で起こす
-        g_cv.notify_one();
-        pollThread.join();
-        notifyThread.join();
-
-        // 対話認証スレッドが残っていれば合流（認証コード待ちはシャットダウン要求を 1 秒以内に検知して脱出する）
-        if (g_authThread.joinable()) g_authThread.join();
-
-        // 更新チェックスレッドが残っていれば合流（通常は起動後数秒で完了済み。
-        // 最悪ケースは GitHub への HTTP タイムアウト待ちで終了が数十秒遅れる）
-        if (updateThread.joinable()) updateThread.join();
-
-        // ループ終了後のクリーンアップ
-        WTSUnRegisterSessionNotification(g_hWnd);
-        removeTrayIcon(g_hWnd);
-        DestroyWindow(g_hWnd);
-
+        // メッセージループ終了 → シャットダウン処理
+        shutdownAll();
         writeLog("shutdown");
     }
     catch (...) {
         writeLog("unexpected initialization error");
-        // joinable なスレッドを残したまま破棄すると std::terminate になるため、
-        // 停止要求を立ててから合流させ、NIC 監視コールバックも解除してから戻る
-        // 停止フラグは正常終了経路と同じく g_mtx の保持下で立てる（通知取りこぼし防止）
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_shutdownRequested = true;
-        }
-        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
-        g_cv.notify_one();
-        if (pollThread.joinable()) pollThread.join();
-        if (notifyThread.joinable()) notifyThread.join();
-        if (g_authThread.joinable()) g_authThread.join();
-        if (updateThread.joinable()) updateThread.join();
+        shutdownAll();
         return 2;
     }
 
