@@ -359,12 +359,13 @@ static std::atomic<ULONGLONG> g_lastAuthToastTime{0};
 // 起動・再代入・合流はすべて UI（メイン）スレッドで行うため排他は不要
 static std::thread g_authThread;
 
-// 前方宣言（OAuth フロー内で Toast 通知・レジストリ操作を使用するため）
+// 前方宣言
+// refresh_token のレジストリ読み書きは、定義より前の OAuth フローで使うため宣言する。
+// showToast は既定引数 silent をこの宣言にだけ置くため、定義より前に残す。
 static void showToast(const std::wstring& line1, const std::wstring& title,
                       const std::wstring& permalink, bool silent = true);
 static std::wstring readRefreshToken();
 static void writeRefreshToken(const std::wstring& value);
-static void notifyAuthRequired();
 
 // ==================== データ構造 ====================
 
