@@ -35,7 +35,7 @@ tasks:
       - cp src/sound.wav out/
       - cp src/app.ico out/
       # 開発者ローカルの上書き設定（gcalntfy.local.toml 等、.gitignore 対象）を out/ へ持ち込み、そのまま実行できるようにする
-      # 該当ファイルがない環境（CI やクリーンな clone）ではグロブが一致せず cp が失敗するため、エラーを無視する
+      # 該当ファイルがない環境（クリーンな clone など）ではグロブが一致せず cp が失敗するため、エラーを無視する
       - cmd: cp -f *.local.* out/
         ignore_error: true
 
