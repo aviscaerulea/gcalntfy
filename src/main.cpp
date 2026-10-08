@@ -238,7 +238,7 @@ static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 // 開始からこの時間以内は進行中の可能性が高く、急な追加・日時変更の告知価値があるため通知する
 static constexpr long long CHANGE_NOTIFY_GRACE_HNS = 60LL * 60 * 10'000'000;
 
-// 予定なし時の表示文言（ツールチップ・左クリック一覧で共用）
+// 予定なし時の表示文言（一覧ポップアップの 0 件行と「今すぐ更新」の完了通知で共用）
 static constexpr wchar_t NO_UPCOMING_EVENTS[] = L"本日の以降予定：なし";
 
 // Google OAuth 2.0
