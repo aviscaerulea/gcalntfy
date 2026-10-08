@@ -3422,7 +3422,7 @@ static int countUpcomingTodayEvents(const std::vector<CalendarEvent>& events) {
 }
 
 // 当日の以降予定件数の表示文言を組み立てる
-// 0 件は NO_UPCOMING_EVENTS の文言に落とす（一覧のフッターと完了通知で表記を揃える）。
+// 0 件は NO_UPCOMING_EVENTS の文言に落とす（一覧ポップアップの 0 件行と完了通知で表記を揃える）。
 // 件数ツールチップの全廃により、現在の利用先は「今すぐ更新」の完了通知のみ。
 static std::wstring upcomingCountText(int count) {
     if (count <= 0) return NO_UPCOMING_EVENTS;
