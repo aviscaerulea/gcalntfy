@@ -317,7 +317,8 @@ static HWND g_hWnd = nullptr;
 static std::atomic<bool> g_popupShowing{false};
 
 // スリープ復帰・ロック解除・ネットワーク復帰など自動契機の即時ポーリングフラグ
-// （FORCE_POLL_COOLDOWN_MS のクールダウン対象）
+// （FORCE_POLL_COOLDOWN_MS のクールダウン対象。対話認証の成功時だけは g_lastPollTick を 0 に
+// 戻してから立てるため、クールダウンにかからず即時に取得する）
 static std::atomic<bool> g_forcePoll{false};
 
 // トレイメニュー「今すぐ更新」による即時ポーリング要求フラグ
@@ -328,6 +329,8 @@ static std::atomic<bool> g_pollNowRequested{false};
 // 前回ポーリング試行の開始時刻（GetTickCount64、連続ポーリング抑制・古さ判定用）
 // 成否を問わず試行の開始時点で更新する。成功時のみの更新にすると、失敗が 1 時間続いた時点で
 // 古さ判定が毎周回成立し、クールダウンとリトライ待ちがともに効かなくなるためだ
+// 0 は「試行なし」を表し、クールダウンと古さ判定の両方を成立させない。対話認証の成功時は
+// 認証要求中の試行で進んだ値を 0 に戻し、認証直後の即時取得がクールダウンで先送りされないようにする
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
 // 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。ポーリング成功時に 0 リセット）
@@ -1334,7 +1337,8 @@ static RefreshResult tryRefreshAccessToken() {
 // ループバックサーバを起動し、ブラウザで Google 認証画面を開いて authorization code を待ち受ける。
 // code 受信後のブラウザへの応答は、トークン交換の成否を見てからここで送る（交換失敗を画面へ反映するため）。
 // 二重起動は起動側（launchInteractiveAuth）の CAS で防止する。別スレッドで実行される想定。
-// 成功時：g_authRequired をクリアし、g_forcePoll をセットして即時ポーリングを誘発する
+// 成功時：g_authRequired をクリアし、g_lastPollTick を 0 に戻してから g_forcePoll をセットして
+// 即時ポーリングを誘発する（クールダウンの対象外とするため。順序は逆にしない）
 static void startInteractiveAuth() {
     // 専用スレッドで動作するため、ここで COM/WinRT アパートメントを初期化する。
     // ShellExecuteA（ブラウザ起動）と applyTokenResponse 経由の WinRT JSON 解析が COM に依存するため、
@@ -1395,7 +1399,10 @@ static void startInteractiveAuth() {
 
     if (succeeded) {
         g_authRequired.store(false);
-        g_forcePoll.store(true);  // 認証成功直後に即時ポーリングを誘発
+        // 認証成功直後に即時ポーリングを誘発する。認証要求中の 60 秒間隔の試行で進んだ
+        // g_lastPollTick を先に 0 へ戻し、クールダウンで最大 60 秒先送りされないようにする
+        g_lastPollTick.store(0);
+        g_forcePoll.store(true);
     }
     if (comInitialized) winrt::uninit_apartment();
     g_authInProgress.store(false);
@@ -5593,6 +5600,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 // クールダウン中の即時ポーリング要求は先送りし、残り時間の経過後に再評価する
                 // （ここでポーリング本体へ進むとクールダウンが機能しない）。
                 // 手動更新要求はユーザの明示操作のため、先送りの対象から外す。
+                // 対話認証の成功直後は g_lastPollTick が 0 のため lastTick > 0 で外れ、先送りしない。
                 // 即時ポーリング要求の再確認は形式上は冗長だ。要求が偽なら外側条件から古さ判定が真であり、
                 // 経過は古さ判定のしきい値（1 時間）以上でクールダウン期間（60 秒）未満と排他になるためだ。
                 // 条件の意図を読み取りやすくするため、判定にはそのまま残す。
