@@ -5634,9 +5634,14 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 auto rr = tryRefreshAccessToken();
                 if (rr == RefreshResult::NetworkError) {
                     // ネットワーク不通は接続エラー扱い。認証 Toast は出さない。
-                    // 後段の Calendar API 呼び出しでも失敗するため、そちらの「接続エラー」Toast に任せる。
-                    // ただし「今すぐ更新」の応答待ちはここで打ち切られ後段に届かないため、個別に応答する
-                    answerPollNowFailure(pollNowPending, L"ネットワークに接続できません");
+                    // ここで周回を終えて後段の Calendar API 呼び出しへ進まないため、「接続エラー」Toast は
+                    // ここで出す（オフライン起動やトークン期限切れ後の通信断で更新が止まった事実を無言にしない）。
+                    // 「今すぐ更新」の応答待ちも後段に届かないため個別に応答し、応答した場合は
+                    // 同内容の接続エラー Toast を重ねない
+                    const wchar_t* reason = L"ネットワークに接続できません";
+                    if (!answerPollNowFailure(pollNowPending, reason)) {
+                        showErrorToast(L"接続エラー", reason);
+                    }
                     waitInterruptible(RETRY_WAIT_MS);
                     continue;
                 }
