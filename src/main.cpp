@@ -5327,7 +5327,7 @@ static std::wstring buildCalendarQueryParams(const SYSTEMTIME& utcNow) {
 // primary と ext_calendar_ids の各カレンダーに対して Calendar API を呼び、
 // 取得したイベントを events に追加する。401 を検出した場合は
 // アクセストークンをクリアしてリフレッシュ後に 1 回だけリトライする。
-// outAnySuccess: 1 件以上取得できれば true。
+// outAnySuccess: 1 つ以上のカレンダーの取得に成功すれば true（予定 0 件の正常応答も成功に含む）。
 // outAllSuccess: 全カレンダーの取得に成功した場合のみ true（部分失敗の検出用）。
 // outAuthFailed: 全カレンダーが認証起因の失敗（リフレッシュ拒否・401 継続）に終わった場合のみ true。
 // 一部カレンダーのみの 401 は該当カレンダーをスキップする。共有解除等の個別権限問題を
