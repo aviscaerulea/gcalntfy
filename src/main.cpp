@@ -5674,7 +5674,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (g_shutdownRequested) break;
 
             if (authFailed) {
-                // notifyAuthRequired で認証 Toast、または NetworkError 扱いで通知済み
+                // 全カレンダーが認証起因で失敗したため、取得処理内の notifyAuthRequired で認証 Toast を通知済み
                 // 認証 Toast は抑制されうるため、「今すぐ更新」への応答は別に返す
                 answerPollNowFailure(pollNowPending, L"Google 認証が必要です");
                 waitInterruptible(RETRY_WAIT_MS);
