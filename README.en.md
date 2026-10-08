@@ -40,7 +40,7 @@ Right-clicking the tray icon opens the tray menu, which provides various setting
 
 | Timing | Windows notification | Sound notification | Condition |
 |---|:---:|:---:|---|
-| Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event |
+| Before an event starts (default 5 minutes) | Yes | Yes | Notified for every event except all-day events and events whose notifications have been stopped |
 | Just before an event starts (default 60 seconds ahead) | Yes | Yes | Only when "Imminent notification" is ON in the tray menu (OFF by default; the lead time can be adjusted to 0-60 seconds and the sound can be turned off in the configuration). While the sub-item "Remote meetings only" is ON (default), limited to events with a Meet, Teams, or Zoom URL |
 | At the notification time set in Google Calendar | Yes | Yes | Only when the individual event has a popup notification set (calendar-wide default notifications are not covered) |
 | When a change, cancellation, or addition is found | Yes | No | When an event's start time differs from the previous check, or an event was added or removed (changes affecting only events more than one hour past their start time are not notified) |
