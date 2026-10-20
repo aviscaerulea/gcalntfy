@@ -12,7 +12,7 @@
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
- *   1  - トレイ用ウィンドウの生成失敗
+ *   1  - 起床用イベントまたはトレイ用ウィンドウの生成失敗
  *   2  - 予期しない初期化エラー
  *
  * 依存ライブラリ：本ファイルの #pragma comment(lib, ...) 群と build.ps1 のリンク行を正とする。
@@ -260,6 +260,7 @@ static constexpr size_t OAUTH_STATE_BYTES = 32;
 static constexpr const wchar_t* REG_REFRESH_TOKEN = L"RefreshToken";
 
 // シャットダウンフラグ（メインスレッド・WndProc・通知スレッドから参照）
+// ポーリングスレッドは shutdownAll の wakePollThread で起きて検知する
 static std::atomic<bool> g_shutdownRequested{false};
 
 // 音声通知の有効/無効フラグ（レジストリで永続化、トレイメニューの親項目）
@@ -318,12 +319,14 @@ static std::atomic<bool> g_popupShowing{false};
 
 // スリープ復帰・ロック解除・ネットワーク復帰など自動契機の即時ポーリングフラグ
 // （FORCE_POLL_COOLDOWN_MS のクールダウン対象。対話認証の成功時だけは g_lastPollTick を 0 に
-// 戻してから立てるため、クールダウンにかからず即時に取得する）
+// 戻してから立てるため、クールダウンにかからず即時に取得する）。
+// 立てる側は requestForcePoll で立て、同時にポーリングスレッドを起こす
 static std::atomic<bool> g_forcePoll{false};
 
 // トレイメニュー「今すぐ更新」による即時ポーリング要求フラグ
 // ユーザの明示操作のため g_forcePoll と異なりクールダウンを適用せず即時に取得する。
-// 要求を消費したポーリングは、完了時点が分かるよう成否を Toast で応答する
+// 要求を消費したポーリングは、完了時点が分かるよう成否を Toast で応答する。
+// 立てる側は直後に wakePollThread でポーリングスレッドを起こす
 static std::atomic<bool> g_pollNowRequested{false};
 
 // 前回ポーリング試行の開始時刻（GetTickCount64、連続ポーリング抑制・古さ判定用）
@@ -337,6 +340,25 @@ static std::atomic<ULONGLONG> g_lastPollTick{0};
 // 0 は「未表示」を表す番兵であり、経過時間としては解釈しない（GetTickCount64 は OS 起動基準
 // のため、0 を時刻として引き算するとクールダウン判定が OS 起動からの経過時間になってしまう）。
 static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
+
+// ポーリングスレッドの起床用イベント（自動リセット。wmain が生成し、プロセス常駐のため明示解放しない）
+// 即時ポーリング要求・「今すぐ更新」・終了要求・対話認証の完了を立てた側が合図し、
+// ポーリングスレッドの待機（waitInterruptible と認証完了待ち）を即時に解く。
+// 正はフラグ（g_forcePoll、g_pollNowRequested、g_shutdownRequested、g_authInProgress）であり、
+// イベントは起床の合図に過ぎない。余分な合図は待機側がフラグを見直して読み捨てる。
+// 自動リセットのため、待機前に届いた合図も次の待機で 1 回だけ消費され、取りこぼさない
+static HANDLE g_pollWakeEvent = nullptr;
+
+// ポーリングスレッドを起こす（フラグを立てた直後に呼ぶ。イベント未生成なら何もしない）
+static void wakePollThread() {
+    if (g_pollWakeEvent) SetEvent(g_pollWakeEvent);
+}
+
+// 自動契機の即時ポーリングを要求し、ポーリングスレッドを起こす
+static void requestForcePoll() {
+    g_forcePoll.store(true);
+    wakePollThread();
+}
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
@@ -1351,6 +1373,7 @@ static void startInteractiveAuth() {
     catch (...) {
         writeLog("interactive auth: winrt::init_apartment failed, abort");
         g_authInProgress.store(false);
+        wakePollThread();
         return;
     }
 
@@ -1402,10 +1425,11 @@ static void startInteractiveAuth() {
         // 認証成功直後に即時ポーリングを誘発する。認証要求中の 60 秒間隔の試行で進んだ
         // g_lastPollTick を先に 0 へ戻し、クールダウンで最大 60 秒先送りされないようにする
         g_lastPollTick.store(0);
-        g_forcePoll.store(true);
+        requestForcePoll();
     }
     if (comInitialized) winrt::uninit_apartment();
     g_authInProgress.store(false);
+    wakePollThread();
 }
 
 // ==================== Calendar イベント処理 ====================
@@ -3190,19 +3214,18 @@ static void notifyAuthRequired() {
 
 // ==================== トレイアイコン ====================
 
-// バックグラウンドスレッド用の中断可能 Sleep
+// ポーリングスレッド用の中断可能な待機
 //
 // メッセージは処理しない（呼び出し元がメインスレッドではないため）。
 // g_shutdownRequested・g_forcePoll・g_pollNowRequested のいずれかが true になった時点で即座にリターンする。
-// 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
+// 各フラグを立てた側が g_pollWakeEvent で起こすため、待機中に CPU を起こさない。
+// 余分な合図で起きたときはフラグを見直して待機を続ける（残り時間は期限から求め直す）
 static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
     while (!g_shutdownRequested && !g_forcePoll.load() && !g_pollNowRequested.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
-        ULONGLONG remain = end - now;
-        DWORD chunk = static_cast<DWORD>((std::min)(remain, static_cast<ULONGLONG>(100)));
-        Sleep(chunk);
+        WaitForSingleObject(g_pollWakeEvent, static_cast<DWORD>(end - now));
     }
 }
 
@@ -4433,7 +4456,7 @@ static void showTrayContextMenu(HWND hWnd) {
 
 // 対話認証スレッドの起動
 // CAS で二重起動を防ぎ、終了済みの前回スレッドを合流してから新スレッドを開始する。
-// スレッド生成に失敗した場合は実行中フラグを戻して次回の起動を可能にする。
+// スレッド生成に失敗した場合は実行中フラグを戻して次回の起動を可能にし、ポーリングスレッドを起こす。
 static void launchInteractiveAuth() {
     bool expected = false;
     if (!g_authInProgress.compare_exchange_strong(expected, true)) {
@@ -4448,6 +4471,7 @@ static void launchInteractiveAuth() {
     catch (const std::system_error& e) {
         writeLog(std::string("failed to start auth thread: ") + e.what());
         g_authInProgress.store(false);
+        wakePollThread();  // 認証待ちに入ったポーリングスレッドを取り残さない
     }
 }
 
@@ -4592,6 +4616,7 @@ static void handleTrayCommand(UINT id) {
         // 非活性化と同条件の再確認（メニュー表示中に認証状態が変わった場合の保険）
         if (g_authRequired.load() || g_authInProgress.load()) return;
         g_pollNowRequested.store(true);
+        wakePollThread();
         return;
     }
     if (id == IDM_OPEN_GITHUB) {
@@ -4657,7 +4682,7 @@ static void toggleScheduleItemMute(size_t itemIndex) {
         g_eventsUpdated = true;
     }
     g_cv.notify_one();
-    g_forcePoll.store(true);
+    requestForcePoll();
     writeLog(std::string("muted: ") + (nowMuted ? "added " : "removed ") + item.key);
 }
 
@@ -4790,7 +4815,7 @@ static LRESULT trayWndProcImpl(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     // 開始前通知が遅れるか開始済みとして消えるため、ここで直接起こして現在時刻で再計算させる。
     if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
         (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
-        g_forcePoll.store(true);
+        requestForcePoll();
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             g_eventsUpdated = true;
@@ -5268,7 +5293,7 @@ static void notifyThreadFunc() {
             fireNotificationGroup(group, targetDatetime, targetLeadMs, allowSound,
                 localConfig, notifiedSet);
             lastFiredUtc = reminderBaseUtc;
-            g_forcePoll.store(true);
+            requestForcePoll();
             writeLog("notification fired, requesting poll");
         }
     }
@@ -5298,10 +5323,10 @@ static void notifyThreadFunc() {
 // MibParameterNotification はルーティング変更等でも頻発するが、60 秒クールダウン期間中の
 // トリガーはポーリングループでスキップされる（クールダウン後に 1 回ポーリングが走る）。
 // MibDeleteInstance（切断）は無視する。後続の MibAddInstance で対応されるため不要。
-// ※ システムスレッドプールから呼ばれるため、ここでは atomic 操作のみ行う。
+// ※ システムスレッドプールから呼ばれるため、ここでは atomic 操作と SetEvent だけを行う。
 static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE type) {
     if (type != MibAddInstance && type != MibParameterNotification) return;
-    g_forcePoll.store(true);
+    requestForcePoll();
 }
 
 // Calendar API クエリパラメータの構築
@@ -5536,7 +5561,7 @@ static bool answerPollNowFailure(bool& pending, const std::wstring& reason) {
 // メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：トークンリフレッシュ → Calendar API ポーリング → 結果を通知スレッドへ受け渡し。
-// 中断は g_shutdownRequested の atomic フラグ経由。waitInterruptible が 100 ms 単位で監視する
+// 中断は g_shutdownRequested の atomic フラグ経由。waitInterruptible がイベント起床で検知する
 // ほか、カレンダー取得中（fetchAllCalendarEvents 内）と取得直後にも確認して打ち切る。
 // 取得可否は schedule に条件づけられず、起動直後も schedule と無関係に 1 回取得する。
 // 認証フロー実行中の待機、クールダウンによる先送り、失敗時のリトライでは、その 1 周を取得なしで終える。
@@ -5581,8 +5606,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (g_authInProgress.load()) {
                 // 認証完了（成功・失敗とも）かシャットダウンまで待つ。waitInterruptible は
                 // 即時ポーリング要求フラグで即時リターンするため、要求が保留中だと busy loop になり
-                // ここでは使えない。要求は破棄せず保持し、認証完了後のループ再評価で消費する
-                while (g_authInProgress.load() && !g_shutdownRequested) Sleep(100);
+                // ここでは使えない。要求は破棄せず保持し、認証完了後のループ再評価で消費する。
+                // 認証スレッドは g_authInProgress を下ろした直後に wakePollThread で起こし、
+                // shutdownAll も終了フラグの後に起こすため、無期限待ちで取り残されない
+                while (g_authInProgress.load() && !g_shutdownRequested)
+                    WaitForSingleObject(g_pollWakeEvent, INFINITE);
                 continue;
             }
 
@@ -5763,7 +5791,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
 // アプリのエントリポイント
 // 旧インスタンスを Job Object で終了させて多重起動を防ぎ、トレイ常駐・通知・ポーリング・更新チェックの各スレッドを起動してメッセージループを回す。
-// トレイ用ウィンドウの生成に失敗した場合は、スレッド起動前のため後始末せずに 1 を返す。
+// 起床用イベントまたはトレイ用ウィンドウの生成に失敗した場合は、スレッド起動前のため後始末せずに 1 を返す。
 // WM_QUIT でループを抜けると後始末（停止要求・全スレッドの join・トレイアイコンとウィンドウの破棄）を行い 0 を返す。
 // 処理中に予期しない例外が発生した場合は、同じ後始末を行ったうえで 2 を返す。
 int wmain() {
@@ -5831,7 +5859,8 @@ int wmain() {
     HANDLE hNetNotify = nullptr;
 
     // 終了時の後始末（正常終了とメッセージループ前後の例外の両方から呼ぶ）
-    // 順序：停止フラグ → NIC 監視解除 → スレッド合流 → トレイアイコンとウィンドウの破棄。
+    // 順序：停止フラグ → NIC 監視解除 → 通知スレッドとポーリングスレッドの起床 → スレッド合流 →
+    // トレイアイコンとウィンドウの破棄。
     // 停止フラグは g_mtx の保持下で立てる。通知スレッドは条件変数の述語でこのフラグを見るため、
     // ロックなしで立てると述語評価と待機列登録の間に割り込んだ通知を取り逃し、join が返らなくなる。
     // NIC 変化監視はスレッド停止より先に解除する（コールバック発火を先に止める）。
@@ -5850,6 +5879,8 @@ int wmain() {
         if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
         // 通知スレッドは条件変数で待機中の可能性があるため notify_one で起こす
         g_cv.notify_one();
+        // ポーリングスレッドはイベント待機中の可能性があるため起こす
+        wakePollThread();
         if (pollThread.joinable()) pollThread.join();
         if (notifyThread.joinable()) notifyThread.join();
         if (g_authThread.joinable()) g_authThread.join();
@@ -5866,6 +5897,13 @@ int wmain() {
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
+        // ポーリングスレッドの起床用イベント。スレッド起動前に生成する。
+        // 生成できなければ待機が busy loop になるため、トレイウィンドウの生成失敗と同じく起動を中止する
+        g_pollWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_pollWakeEvent) {
+            writeLog("CreateEventW failed: " + std::to_string(GetLastError()));
+            return 1;
+        }
         g_hWnd = createTrayWindow();
         // トレイ用ウィンドウがなければ終了手段のない不可視プロセスになるため起動を中止する。
         // この時点ではスレッド未起動・トレイ未登録のため後始末は不要（戻り値 1 は例外時の 2 と区別する）
