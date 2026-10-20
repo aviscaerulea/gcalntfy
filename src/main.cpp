@@ -360,6 +360,13 @@ static void requestForcePoll() {
     wakePollThread();
 }
 
+// プロセスで共有する WinHTTP セッション（wmain が生成し、shutdownAll が全スレッド合流後に閉じる）
+// WinHTTP の keep-alive 接続プールはセッション単位のため、リクエストごとにセッションを作ると
+// 接続の再利用が効かず毎回 TLS ハンドシェイクをやり直す。1 本を共有して接続を使い回す。
+// セッションハンドルは複数スレッド（ポーリング・対話認証・更新チェック）から同時に使ってよい。
+// 生成失敗時は nullptr のままとし、httpRequest は失敗（空文字列）を返す
+static HINTERNET g_httpSession = nullptr;
+
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
 
@@ -757,6 +764,8 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 // ==================== HTTP ====================
 
 // WinHTTP で HTTPS リクエストを実行する
+// 共有セッション g_httpSession 上に接続ハンドルとリクエストハンドルを作り、終了時に両方を閉じる
+// （セッションは閉じない）。セッション未生成なら失敗扱いで空文字列を返す。
 // method: L"GET" or L"POST"
 // authHeader: 空でなければ Authorization: Bearer ヘッダとして付与
 // outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む（失敗時は 0）
@@ -765,11 +774,8 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
 {
     if (outStatusCode) *outStatusCode = 0;
-    HINTERNET hSession = WinHttpOpen(L"gcalntfy/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hSession = g_httpSession;
     if (!hSession) return "";
-    WinHttpSetTimeouts(hSession, 15000, 15000, 30000, 30000);
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
@@ -778,20 +784,16 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     uc.dwHostNameLength = _countof(host);
     uc.lpszUrlPath      = path;
     uc.dwUrlPathLength  = _countof(path);
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return "";
 
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+    if (!hConnect) return "";
 
     DWORD reqFlags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         return "";
     }
 
@@ -810,7 +812,6 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     if (!ok) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         return "";
     }
 
@@ -843,7 +844,6 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
     if (readFailed) {
         if (outStatusCode) *outStatusCode = 0;
         return "";
@@ -5860,7 +5860,7 @@ int wmain() {
 
     // 終了時の後始末（正常終了とメッセージループ前後の例外の両方から呼ぶ）
     // 順序：停止フラグ → NIC 監視解除 → 通知スレッドとポーリングスレッドの起床 → スレッド合流 →
-    // トレイアイコンとウィンドウの破棄。
+    // トレイアイコンとウィンドウの破棄 → WinHTTP セッションの解放。
     // 停止フラグは g_mtx の保持下で立てる。通知スレッドは条件変数の述語でこのフラグを見るため、
     // ロックなしで立てると述語評価と待機列登録の間に割り込んだ通知を取り逃し、join が返らなくなる。
     // NIC 変化監視はスレッド停止より先に解除する（コールバック発火を先に止める）。
@@ -5890,6 +5890,11 @@ int wmain() {
             removeTrayIcon(g_hWnd);
             DestroyWindow(g_hWnd);
         }
+        // HTTP を使う 3 スレッドの合流後にセッションを閉じる
+        if (g_httpSession) {
+            WinHttpCloseHandle(g_httpSession);
+            g_httpSession = nullptr;
+        }
     };
 
     try {
@@ -5903,6 +5908,17 @@ int wmain() {
         if (!g_pollWakeEvent) {
             writeLog("CreateEventW failed: " + std::to_string(GetLastError()));
             return 1;
+        }
+        // 共有 WinHTTP セッション。スレッド起動前に生成し、タイムアウトは従来の httpRequest と同じ値。
+        // 生成失敗でも起動は続ける（HTTP が全件失敗する状態は既存の接続エラー経路が Toast で伝える）
+        g_httpSession = WinHttpOpen(L"gcalntfy/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (g_httpSession) {
+            WinHttpSetTimeouts(g_httpSession, 15000, 15000, 30000, 30000);
+        }
+        else {
+            writeLog("WinHttpOpen failed: " + std::to_string(GetLastError()));
         }
         g_hWnd = createTrayWindow();
         // トレイ用ウィンドウがなければ終了手段のない不可視プロセスになるため起動を中止する。
