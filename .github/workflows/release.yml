@@ -12,9 +12,10 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
       # タグ名はリリース作成者が自由に付けられる値のため、run に ${{ }} で直接埋め込まず env 経由で渡す（式インジェクション対策）。
       # 以降のステップの TAG、VERSION も同じ理由で env 経由とする。
