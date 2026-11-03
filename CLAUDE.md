@@ -21,4 +21,4 @@ GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxx
 
 ## 参考
 
-@README.md
+- README.md
