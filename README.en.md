@@ -125,6 +125,6 @@ Recurring tasks never appear in the Google Calendar API's event list, so they ca
 
 ### Events not handled
 
-- All-day events: not shown in the event list and not announced before they start (only additions of today's all-day events and changes that move an event to an all-day event today are notified as changes; cancellations are not)
+- All-day events: not shown in the event list and not announced before they start (additions of today's all-day events and time changes that move an event to or from today are notified as changes; cancellations are not)
 - Events you declined: excluded at the retrieval stage
 - Cancelled events: excluded at the retrieval stage
