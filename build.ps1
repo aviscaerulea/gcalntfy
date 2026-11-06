@@ -4,7 +4,8 @@
 param([string]$Version = "0.0.0", [switch]$Release)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-# リリースワークフローはタグ名由来の値を渡すため、先頭の v を落として数値表記へ正規化する
+# 先頭に v が付いたタグ名（git describe の生の出力や手動で渡した値）を受けても数値表記にそろえる。
+# 現在の呼び出し元（Taskfile とリリースワークフロー）は渡す前に v を除いており、ここは防御として残す。
 $Version = $Version -replace '^v', ''
 
 # vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シムの優先順）
