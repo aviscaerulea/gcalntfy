@@ -1061,8 +1061,8 @@ static std::string waitForAuthCode(SOCKET serverSocket, const std::string& expec
     outClient = INVALID_SOCKET;
     // accept のタイムアウトは select() で実現する（SO_RCVTIMEO は accept に効かない）。
     // 1 秒ごとに g_shutdownRequested を確認し、必要なら早期に脱出する。
-    // タイムアウトは「ちょうど AUTH_CODE_TIMEOUT_SEC 経過後」の判定で打ち切る
-    // （厳密には 1 ループ分早く打ち切られる可能性があるが許容差）。
+    // タイムアウトは select の 1 秒タイムアウトが AUTH_CODE_TIMEOUT_SEC 回に達した時点で打ち切る
+    // （ループ処理のオーバーヘッド分だけ AUTH_CODE_TIMEOUT_SEC 秒よりわずかに遅れうるが許容差）。
     int waited = 0;
     while (true) {
         if (waited >= AUTH_CODE_TIMEOUT_SEC) return {};
